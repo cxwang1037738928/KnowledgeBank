@@ -8,8 +8,10 @@ Scoring model:
                     falls back to corpus-wide discriminative terms when
                     data/categories.json hasn't been generated yet.
   connectivity_score — normalised in-degree + out-degree in the citation
-                    graph built by matching Grobid-extracted references against
-                    titles/authors in data/doclings.json.
+                    graph built by sending each document's docling-extracted
+                    reference strings to Phi-4 (via Ollama) for structured
+                    parsing, then matching against titles/authors in
+                    data/doclings.json.
 
 Writes data/heuristic_output.json with:
   top_k       : [{docId, filename, finalScore, bm25Score, connectivityScore}]
@@ -17,6 +19,7 @@ Writes data/heuristic_output.json with:
 """
 
 import json
+import os
 import re
 import sys
 import math
@@ -34,7 +37,8 @@ DOCLINGS_PATH = ROOT / "data" / "doclings.json"
 CATEGORIES_PATH = ROOT / "data" / "categories.json"
 OUTPUT_PATH   = ROOT / "data" / "heuristic_output.json"
 
-GROBID_URL    = "http://localhost:8070/api/processReferences"
+OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+CITATION_MODEL = os.environ.get("CITATION_MODEL", "phi4")
 K             = 5
 ALPHA         = 0.25   # weight between BM-25 and connectivity
 BM25_K1       = 1.5
@@ -110,42 +114,43 @@ def top_terms(bm25: BM25, n: int = 20) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Grobid citation extraction
+# Phi-4 citation parsing
 # ---------------------------------------------------------------------------
 
-def extract_references_grobid(text: str) -> list[str]:
+_PARSE_PROMPT = """You are a citation parser. Given the list of bibliographic reference strings below, extract each one's title and author names.
+Return ONLY a JSON array with no explanation or markdown fences:
+[{{"title": "...", "authors": ["Last, First", ...]}}, ...]
+
+If a field cannot be determined, use an empty string or empty list.
+
+References:
+{refs}"""
+
+
+def parse_references_phi4(raw_refs: list[str]) -> list[dict]:
     """
-    POST the document text to Grobid's processReferences endpoint.
-    Returns a list of extracted reference strings.
-    Falls back to [] on any error (caller handles missing Grobid gracefully).
+    Sends docling-extracted reference strings to Phi-4 via Ollama and returns
+    a list of structured {title, authors} dicts for downstream matching.
+    Falls back to [] on any error so the rest of the pipeline still runs.
     """
+    if not raw_refs:
+        return []
     try:
+        prompt = _PARSE_PROMPT.format(refs="\n".join(f"- {r}" for r in raw_refs[:50]))
         resp = requests.post(
-            GROBID_URL,
-            data={"citations": text, "consolidateCitations": "0"},
-            timeout=30,
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": CITATION_MODEL, "prompt": prompt, "stream": False,
+                  "options": {"temperature": 0}},
+            timeout=120,
         )
         if resp.status_code != 200:
             return []
-        # Grobid returns TEI XML; extract <title> and <author> text as a quick
-        # bag-of-words match target — full TEI parsing would need lxml.
-        from xml.etree import ElementTree as ET
-        root = ET.fromstring(resp.text)
-        refs = []
-        for bibl in root.iter("{http://www.tei-c.org/ns/1.0}biblStruct"):
-            title_el = bibl.find(".//{http://www.tei-c.org/ns/1.0}title")
-            title = (title_el.text or "").strip() if title_el is not None else ""
-            authors = [
-                " ".join(filter(None, [
-                    (n.findtext("{http://www.tei-c.org/ns/1.0}forename") or "").strip(),
-                    (n.findtext("{http://www.tei-c.org/ns/1.0}surname")  or "").strip(),
-                ]))
-                for n in bibl.findall(".//{http://www.tei-c.org/ns/1.0}persName")
-            ]
-            combined = " ".join(filter(None, [title] + authors))
-            if combined:
-                refs.append(combined)
-        return refs
+        raw = resp.json().get("response", "").strip()
+        # Strip markdown fences if the model wrapped the JSON
+        match = re.search(r"\[.*\]", raw, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return json.loads(raw)
     except Exception:
         return []
 
@@ -156,11 +161,12 @@ def extract_references_grobid(text: str) -> list[str]:
 
 def build_connectivity(doclings: dict) -> dict[str, set[str]]:
     """
-    For each document, extract citations (via Grobid) and match them against
-    the title/authors of every other document using exact substring matching.
+    For each document, parse its docling-extracted reference strings with
+    Phi-4 into structured {title, authors} form, then match against the
+    known titles/authors of every other document in the corpus.
     Returns adjacency dict: source_docId → set of target_docIds it cites.
     """
-    # Pre-build a lookup: lowercased title/author strings → docId
+    # Pre-build a lookup: lowercased title/author string → docId
     lookup: dict[str, str] = {}
     for doc_id, entry in doclings.items():
         meta = entry.get("metadata", {})
@@ -175,16 +181,18 @@ def build_connectivity(doclings: dict) -> dict[str, set[str]]:
     adjacency: dict[str, set[str]] = {doc_id: set() for doc_id in doclings}
 
     for doc_id, entry in doclings.items():
-        # Use raw references from docling first; enrich with Grobid if available
         raw_refs = entry.get("references", [])
-        grobid_refs = extract_references_grobid(entry.get("text", "")[:50_000])
-        all_refs = raw_refs + grobid_refs
+        parsed   = parse_references_phi4(raw_refs)
 
-        for ref in all_refs:
-            ref_lower = ref.lower()
-            for key, target_id in lookup.items():
-                if target_id != doc_id and key and key in ref_lower:
-                    adjacency[doc_id].add(target_id)
+        for ref in parsed:
+            candidates = [ref.get("title", "")] + ref.get("authors", [])
+            for candidate in candidates:
+                c = candidate.strip().lower()
+                if not c:
+                    continue
+                for key, target_id in lookup.items():
+                    if target_id != doc_id and key and key in c:
+                        adjacency[doc_id].add(target_id)
 
     return adjacency
 
