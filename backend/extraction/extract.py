@@ -1,5 +1,5 @@
 """
-extract.py — Stage 1 extraction
+extract.py
 
 Converts every PDF tracked in data/documents.json into a structured
 DoclingDocument.  Digital PDFs go through docling's standard pipeline;
@@ -131,15 +131,18 @@ def _extract_references(doc) -> list[str]:
 
 
 def _extract_metadata(doc) -> dict:
-    meta = {}
-    try:
-        info = doc.description
-        meta["title"]    = getattr(info, "title", None)
-        meta["authors"]  = [str(a) for a in getattr(info, "authors", []) or []]
-        meta["abstract"] = getattr(info, "abstract", None)
-        meta["keywords"] = list(getattr(info, "keywords", []) or [])
-    except Exception:
-        pass
+    meta = {"title": None, "authors": [], "abstract": None, "keywords": []}
+    for item, _ in doc.iterate_items():
+        label = getattr(item, "label", None)
+        text  = (getattr(item, "text", "") or "").strip()
+        if not text:
+            continue
+        if meta["title"] is None and label == DocItemLabel.TITLE:
+            meta["title"] = text
+        elif label == DocItemLabel.SECTION_HEADER and text.lower().startswith("abstract"):
+            meta["abstract"] = ""  # next text items belong to the abstract
+        elif meta["abstract"] == "":
+            meta["abstract"] = text
     return meta
 
 

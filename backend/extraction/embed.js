@@ -1,7 +1,7 @@
 /**
- * embed.js — Stage 4 (part 1): embed all documents
+ * embed.js  embed all documents
  *
- * Reads data/doclings.json, chunks each document's text, generates 768-dim
+ * Reads data/doclings.json, chunks each document's text, generates 384-dim
  * embeddings with Xenova/all-MiniLM-L12-v2, and writes the results to
  * data/embeddings.json (overwrites — this is the authoritative embedding
  * store for the whole pipeline).
@@ -14,14 +14,14 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pipeline } from '@xenova/transformers';
-import { chunkText } from '../../src/ingestion/chunker.js';
+import { chunkDocument } from './chunker.js';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DOCLINGS_PATH  = path.join(ROOT, 'data', 'doclings.json');
 const EMBEDDINGS_OUT = path.join(ROOT, 'data', 'embeddings.json');
 
 const MODEL      = 'Xenova/all-MiniLM-L12-v2';
-const DIMENSIONS = 768;
+const DIMENSIONS = 384; // all-MiniLM-L12-v2 outputs 384-dim vectors
 const CHUNK_SIZE    = parseInt(process.env.CHUNK_SIZE    || '500',  10);
 const CHUNK_OVERLAP = parseInt(process.env.CHUNK_OVERLAP || '50',   10);
 const BATCH_SIZE    = 32;
@@ -97,23 +97,32 @@ export async function embedAll({ force = false } = {}) {
       continue;
     }
 
-    const rawChunks = chunkText(text, CHUNK_SIZE, CHUNK_OVERLAP);
+    // Structure-aware chunking: respects section boundaries, prefixes
+    // headings, emits tables whole. Falls back to plain sliding-window
+    // internally when the entry has no sections.
+    const rawChunks = chunkDocument(entry, {
+      chunkSize: CHUNK_SIZE,
+      overlap:   CHUNK_OVERLAP,
+    });
     const embeddings = [];
     for (let i = 0; i < rawChunks.length; i += BATCH_SIZE) {
-      const batch = rawChunks.slice(i, i + BATCH_SIZE);
+      const batch = rawChunks.slice(i, i + BATCH_SIZE).map((c) => c.text);
       embeddings.push(...await embedBatch(batch));
     }
 
-    rawChunks.forEach((chunkText_, i) => {
+    rawChunks.forEach((chunk, i) => {
       newChunks.push({
-        id:         `${docId}_${i}`,
+        id:           `${docId}_${i}`,
         docId,
-        filename:   entry.filename,
-        pageNumber: null,
-        chunkIndex: i,
-        text:       chunkText_,
-        embedding:  embeddings[i],
-        ingestedAt: new Date().toISOString(),
+        filename:     entry.filename,
+        pageNumber:   null,
+        chunkIndex:   i,
+        heading:      chunk.heading,
+        sectionIndex: chunk.sectionIndex,
+        chunkType:    chunk.type,
+        text:         chunk.text,
+        embedding:    embeddings[i],
+        ingestedAt:   new Date().toISOString(),
       });
     });
 

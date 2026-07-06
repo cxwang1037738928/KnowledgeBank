@@ -1,5 +1,5 @@
 /**
- * build_graph.js — Stage 3: knowledge graph for the top-k documents
+ * build_graph.js knowledge graph for the top-k documents
  *
  * Reads:
  *   data/doclings.json          — extracted document content

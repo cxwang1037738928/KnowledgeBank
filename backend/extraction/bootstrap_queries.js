@@ -1,28 +1,48 @@
 /**
  * bootstrap_queries.js — synthesize plausible user queries per category
+ * (Azure-hosted model edition — targets Ministral 3B via Azure AI)
  *
  * For every cluster in data/categories.json, assembles a context pack and
- * prompts Phi-4 (via Ollama) to generate the kinds of questions a user
- * might actually ask against that slice of the corpus. Output is used to
- * pre-warm/evaluate retrieval and to seed query-parsing tests.
+ * prompts the model to generate the kinds of questions a user might ask
+ * against that slice of the corpus.
  *
  * Context pack per category (all computed locally, no LLM needed):
  *   - top BM25-IDF keywords   (same summed-IDF-over-members logic as heuristic.py)
  *   - member titles           (metadata.title, falling back to filename)
  *   - abstracts               (metadata.abstract, falling back to the first
- *                              non-trivial section — usually the abstract in
- *                              academic papers)
- *   - distinctive headings    (section headings that recur across members or
- *                              are unusually specific — skips boilerplate like
- *                              "Introduction"/"References")
- *   - medoid excerpt          (the chunk whose embedding is closest to the
- *                              category centroid — the single most
- *                              "representative" passage of the cluster)
+ *                              non-trivial section)
+ *   - distinctive headings    (recurring/specific, boilerplate filtered)
+ *   - medoid excerpt          (chunk closest to the category centroid)
+ *
+ * ---------------------------------------------------------------------------
+ * Azure configuration (.env):
+ *   AZURE_CHAT_ENDPOINT  full URL of the chat completions route, e.g.
+ *     serverless (Azure AI Foundry / Models-as-a-Service):
+ *       https://<deployment>.<region>.models.ai.azure.com/chat/completions
+ *     Azure OpenAI-style resource:
+ *       https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=2024-06-01
+ *   AZURE_API_KEY        key for the deployment (sent as BOTH `api-key` and
+ *                        `Authorization: Bearer` — Azure's two auth styles;
+ *                        the extra header is ignored by whichever flavor
+ *                        you're on)
+ *   BOOTSTRAP_MODEL      model name field, default "ministral-3b" (serverless
+ *                        endpoints often ignore this — the deployment IS the
+ *                        model — but Azure OpenAI-style routes may not)
+ *   BOOTSTRAP_MAX_TOKENS output cap per call        (default 2000)
+ *   BOOTSTRAP_INPUT_BUDGET prompt budget in tokens  (default 6000)
+ *
+ * Context-length safety: prompt size is estimated (~4 chars/token) and the
+ * context pack is trimmed in stages until it fits BOOTSTRAP_INPUT_BUDGET:
+ *   1. drop the medoid excerpt
+ *   2. shrink abstracts (fewer docs, fewer words each)
+ *   3. shrink headings + keywords + title list
+ * Ministral 3B advertises a 128K window, but a small model reasons better
+ * over a lean prompt anyway, so the default budget is deliberately modest.
  *
  * Reads:  data/categories.json, data/doclings.json, data/embeddings.json (optional)
  * Writes: data/bootstrap_queries.json
  *
- * Run: node backend/extraction/bootstrap_queries.js --per-category 8 --model phi4
+ * Run: node backend/extraction/bootstrap_queries.js --per-category 8
  */
 
 import 'dotenv/config';
@@ -36,15 +56,14 @@ const DOCLINGS_PATH   = path.join(ROOT, 'data', 'doclings.json');
 const EMBEDDINGS_PATH = path.join(ROOT, 'data', 'embeddings.json');
 const OUTPUT_PATH     = path.join(ROOT, 'data', 'bootstrap_queries.json');
 
-const OLLAMA_URL   = process.env.OLLAMA_URL || 'http://localhost:11434';
-const MODEL        = process.env.BOOTSTRAP_MODEL || 'phi4';
-const PER_CATEGORY = 8;
-const KEYWORDS_N   = 15;
+const AZURE_ENDPOINT = process.env.AZURE_CHAT_ENDPOINT || '';
+const AZURE_API_KEY  = process.env.AZURE_API_KEY || '';
+const MODEL          = process.env.BOOTSTRAP_MODEL || 'ministral-3b';
+const MAX_TOKENS     = parseInt(process.env.BOOTSTRAP_MAX_TOKENS || '2000', 10);
+const INPUT_BUDGET   = parseInt(process.env.BOOTSTRAP_INPUT_BUDGET || '6000', 10);
+const PER_CATEGORY   = 8;
+const KEYWORDS_N     = 15;
 
-// Query types we ask Phi-4 to cover. Mirrors how real users interrogate a
-// document corpus and gives the retrieval evaluator labeled difficulty tiers:
-// factual/definition hit single chunks, comparison/synthesis require
-// multi-doc retrieval, methodology exercises section-level structure.
 const QUERY_TYPES = ['factual', 'definition', 'comparison', 'synthesis', 'methodology'];
 
 const BOILERPLATE_HEADINGS = new Set([
@@ -53,7 +72,18 @@ const BOILERPLATE_HEADINGS = new Set([
 ]);
 
 // ---------------------------------------------------------------------------
-// Tokenisation + IDF (mirrors heuristic.py so keywords agree across languages)
+// Token estimation (~4 chars/token for English — coarse but adequate for
+// budget enforcement; err low on the budget, not high on the estimate)
+// ---------------------------------------------------------------------------
+
+const estTokens = (s) => Math.ceil((s || '').length / 4);
+const capWords  = (s, n) => {
+  const words = (s || '').split(/\s+/);
+  return words.length > n ? words.slice(0, n).join(' ') + ' …' : (s || '');
+};
+
+// ---------------------------------------------------------------------------
+// Tokenisation + IDF (mirrors heuristic.py so keywords agree across stages)
 // ---------------------------------------------------------------------------
 
 const STOPWORDS = new Set([
@@ -69,7 +99,6 @@ function tokenise(text) {
   return tokens.filter((t) => !STOPWORDS.has(t) && t.length > 2);
 }
 
-/** Corpus-wide document frequency + IDF, identical formula to heuristic.py. */
 function buildIdf(tokenisedDocs) {
   const N = tokenisedDocs.length;
   const df = new Map();
@@ -82,7 +111,6 @@ function buildIdf(tokenisedDocs) {
   };
 }
 
-/** Per-cluster keywords: summed IDF over members' unique terms (heuristic.py port). */
 function clusterKeywords(memberTokens, idf, n = KEYWORDS_N) {
   const scores = new Map();
   for (const tokens of memberTokens) {
@@ -92,7 +120,7 @@ function clusterKeywords(memberTokens, idf, n = KEYWORDS_N) {
 }
 
 // ---------------------------------------------------------------------------
-// Context assembly helpers
+// Context assembly
 // ---------------------------------------------------------------------------
 
 function docTitle(entry) {
@@ -102,12 +130,10 @@ function docTitle(entry) {
 function docAbstract(entry, maxWords = 120) {
   let abs = entry?.metadata?.abstract?.trim();
   if (!abs) {
-    // Fall back: first section with a real body — in papers that's the abstract
     const sec = (entry?.sections || []).find((s) => (s.text || '').trim().length > 200);
     abs = sec?.text?.trim() || '';
   }
-  const words = abs.split(/\s+/);
-  return words.length > maxWords ? words.slice(0, maxWords).join(' ') + ' …' : abs;
+  return capWords(abs, maxWords);
 }
 
 function distinctiveHeadings(entries, maxHeadings = 8) {
@@ -116,23 +142,17 @@ function distinctiveHeadings(entries, maxHeadings = 8) {
     for (const sec of entry?.sections || []) {
       const h = (sec.heading || '').trim();
       if (!h) continue;
-      const key = h.toLowerCase().replace(/^[0-9.\s]+/, ''); // strip "3.1 " numbering
+      const key = h.toLowerCase().replace(/^[0-9.\s]+/, '');
       if (!key || BOILERPLATE_HEADINGS.has(key) || key.length < 4) continue;
       counts.set(h, (counts.get(h) || 0) + 1);
     }
   }
-  // Prefer headings shared by multiple members, then longer/more specific ones
   return [...counts.entries()]
     .sort((a, b) => (b[1] - a[1]) || (b[0].length - a[0].length))
     .slice(0, maxHeadings)
     .map(([h]) => h);
 }
 
-/**
- * Medoid excerpt: among all chunks belonging to the category's members,
- * find the one closest to the centroid of member doc vectors. Embeddings
- * are L2-normalised, so dot product = cosine similarity.
- */
 function medoidExcerpt(memberIds, embedStore, maxWords = 150) {
   if (!embedStore) return null;
   const memberSet = new Set(memberIds);
@@ -152,15 +172,14 @@ function medoidExcerpt(memberIds, embedStore, maxWords = 150) {
     for (let i = 0; i < dim; i++) sim += c.embedding[i] * (centroid[i] / mag);
     if (sim > bestSim) { bestSim = sim; best = c; }
   }
-  const words = (best.text || '').split(/\s+/);
-  return words.length > maxWords ? words.slice(0, maxWords).join(' ') + ' …' : best.text;
+  return capWords(best.text, maxWords);
 }
 
 // ---------------------------------------------------------------------------
-// Phi-4 prompt + call
+// Prompt building with staged truncation to fit the input budget
 // ---------------------------------------------------------------------------
 
-function buildPrompt(ctx, perCategory) {
+function renderPrompt(ctx, perCategory) {
   const titles    = ctx.titles.map((t) => `- ${t}`).join('\n');
   const abstracts = ctx.abstracts.filter(Boolean).map((a, i) => `[${i + 1}] ${a}`).join('\n');
   const headings  = ctx.headings.length ? ctx.headings.join('; ') : '(none)';
@@ -188,42 +207,155 @@ Generate exactly ${perCategory} diverse queries. Cover a mix of these types:
 Rules:
 - Phrase them like real user queries (mixed style: some keyword-ish, some full questions).
 - Ground every query in the context above; do not invent papers or topics not present.
-- Return ONLY a JSON array, no explanation, no markdown fences:
-[{"query": "...", "type": "factual|definition|comparison|synthesis|methodology"}, ...]`;
+- Respond in JSON only. Return a single JSON object of this exact shape, with no other text:
+{"queries": [{"query": "...", "type": "factual|definition|comparison|synthesis|methodology"}]}`;
 }
 
-async function generateQueries(prompt, model) {
-  const resp = await fetch(`${OLLAMA_URL}/api/generate`, {
+/**
+ * Build the prompt, then — if it overshoots the token budget — trim the
+ * context pack in stages, cheapest information first:
+ *   1. drop the medoid excerpt
+ *   2. shrink abstracts (cap at 3 docs × 60 words, then 2 × 40)
+ *   3. shrink headings→4, keywords→10, titles→10
+ * Returns { prompt, trimmed } where trimmed lists the stages applied.
+ */
+function buildPromptWithinBudget(ctx, perCategory, budget = INPUT_BUDGET) {
+  const trimmed = [];
+  let working = { ...ctx };
+  let prompt = renderPrompt(working, perCategory);
+  if (estTokens(prompt) <= budget) return { prompt, trimmed };
+
+  // Stage 1 — drop excerpt
+  working = { ...working, excerpt: null };
+  trimmed.push('excerpt');
+  prompt = renderPrompt(working, perCategory);
+  if (estTokens(prompt) <= budget) return { prompt, trimmed };
+
+  // Stage 2 — shrink abstracts progressively
+  for (const [count, words] of [[3, 60], [2, 40], [1, 30]]) {
+    working = { ...working, abstracts: working.abstracts.slice(0, count).map((a) => capWords(a, words)) };
+    trimmed.push(`abstracts→${count}x${words}w`);
+    prompt = renderPrompt(working, perCategory);
+    if (estTokens(prompt) <= budget) return { prompt, trimmed };
+  }
+
+  // Stage 3 — shrink lists
+  working = {
+    ...working,
+    headings: working.headings.slice(0, 4),
+    keywords: working.keywords.slice(0, 10),
+    titles:   working.titles.slice(0, 10),
+  };
+  trimmed.push('lists');
+  prompt = renderPrompt(working, perCategory);
+  return { prompt, trimmed }; // send even if still over — Azure will 400 loudly
+}
+
+// ---------------------------------------------------------------------------
+// Azure chat completions call
+// ---------------------------------------------------------------------------
+
+async function azureChat(prompt, { jsonMode = true, retries = 2 } = {}) {
+  if (!AZURE_ENDPOINT || !AZURE_API_KEY) {
+    throw new Error('AZURE_CHAT_ENDPOINT and AZURE_API_KEY must be set in .env');
+  }
+
+  const body = {
+    model: MODEL,
+    messages: [
+      { role: 'system', content: 'You are a precise assistant that responds only with valid JSON.' },
+      { role: 'user', content: prompt },
+    ],
+    max_tokens: MAX_TOKENS,
+    temperature: 0.8,
+  };
+  // JSON mode guarantees syntactically valid JSON (NOT schema conformance —
+  // shape is validated separately below). Some deployments reject the field;
+  // we retry without it on a 400 that mentions response_format.
+  if (jsonMode) body.response_format = { type: 'json_object' };
+
+  const resp = await fetch(AZURE_ENDPOINT, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      prompt,
-      stream: false,
-      options: { temperature: 0.8 }, // want diversity, unlike citation parsing
-    }),
+    headers: {
+      'Content-Type': 'application/json',
+      // Both Azure auth styles — the irrelevant one is ignored:
+      'api-key': AZURE_API_KEY,
+      'Authorization': `Bearer ${AZURE_API_KEY}`,
+    },
+    body: JSON.stringify(body),
   });
-  if (!resp.ok) throw new Error(`Ollama HTTP ${resp.status}`);
-  const raw = ((await resp.json()).response || '').trim();
 
-  // Same defensive parse as heuristic.py: grab the outermost JSON array
-  const match = raw.match(/\[[\s\S]*\]/);
-  const parsed = JSON.parse(match ? match[0] : raw);
-  if (!Array.isArray(parsed)) throw new Error('model did not return a JSON array');
+  if (resp.status === 429 && retries > 0) {
+    const wait = parseInt(resp.headers.get('retry-after') || '5', 10) * 1000;
+    console.warn(`[bootstrap]   429 rate-limited — retrying in ${wait / 1000}s`);
+    await new Promise((r) => setTimeout(r, wait));
+    return azureChat(prompt, { jsonMode, retries: retries - 1 });
+  }
 
-  return parsed
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '');
+    if (resp.status === 400 && jsonMode && /response_format/i.test(errText)) {
+      console.warn('[bootstrap]   deployment rejected response_format — retrying without JSON mode');
+      return azureChat(prompt, { jsonMode: false, retries });
+    }
+    throw new Error(`Azure HTTP ${resp.status}: ${errText.slice(0, 300)}`);
+  }
+
+  const data = await resp.json();
+  const choice = data.choices?.[0];
+  if (choice?.finish_reason === 'length') {
+    console.warn(`[bootstrap]   WARNING: output hit max_tokens=${MAX_TOKENS} — JSON may be cut off; raise BOOTSTRAP_MAX_TOKENS or lower --per-category`);
+  }
+  return choice?.message?.content || '';
+}
+
+// ---------------------------------------------------------------------------
+// Output parsing + shape validation
+// ---------------------------------------------------------------------------
+
+function parseQueries(raw) {
+  const text = (raw || '').trim();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Fallbacks: fenced block, then outermost object/array
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    const blob   = fenced?.[1] || text.match(/\{[\s\S]*\}|\[[\s\S]*\]/)?.[0];
+    if (!blob) throw new Error('no JSON found in model output');
+    parsed = JSON.parse(blob);
+  }
+
+  const arr = Array.isArray(parsed) ? parsed : parsed?.queries;
+  if (!Array.isArray(arr)) throw new Error('output JSON has no "queries" array');
+
+  const queries = arr
     .filter((q) => q && typeof q.query === 'string' && q.query.trim())
     .map((q) => ({
       query: q.query.trim(),
       type: QUERY_TYPES.includes(q.type) ? q.type : 'factual',
     }));
+  if (queries.length === 0) throw new Error('queries array was empty or malformed');
+  return queries;
+}
+
+async function generateQueries(prompt) {
+  try {
+    return parseQueries(await azureChat(prompt));
+  } catch (err) {
+    // One shape-retry: small models occasionally wrap or narrate; a stricter
+    // nudge usually fixes it.
+    console.warn(`[bootstrap]   parse failed (${err.message}) — retrying once with stricter instruction`);
+    const strict = prompt + '\n\nIMPORTANT: Your previous attempt was invalid. Output ONLY the JSON object, starting with { and ending with }.';
+    return parseQueries(await azureChat(strict));
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
-export async function bootstrapQueries({ perCategory = PER_CATEGORY, model = MODEL } = {}) {
+export async function bootstrapQueries({ perCategory = PER_CATEGORY } = {}) {
   let categories, doclings, embedStore = null;
 
   try {
@@ -242,7 +374,6 @@ export async function bootstrapQueries({ perCategory = PER_CATEGORY, model = MOD
     console.warn('[bootstrap] embeddings.json not found — skipping medoid excerpts');
   }
 
-  // Corpus-wide IDF once; reused for every cluster (same as heuristic.py)
   const docIds = Object.keys(doclings);
   const tokenised = new Map(docIds.map((d) => [d, tokenise(doclings[d].text || '')]));
   const idf = buildIdf([...tokenised.values()]);
@@ -260,18 +391,20 @@ export async function bootstrapQueries({ perCategory = PER_CATEGORY, model = MOD
     const ctx = {
       keywords:  clusterKeywords(memberIds.map((d) => tokenised.get(d) || []), idf),
       titles:    entries.map(docTitle),
-      abstracts: entries.map((e) => docAbstract(e)).slice(0, 5), // cap prompt size
+      abstracts: entries.map((e) => docAbstract(e)).slice(0, 5),
       headings:  distinctiveHeadings(entries),
       excerpt:   medoidExcerpt(memberIds, embedStore),
     };
 
-    console.log(`[bootstrap] Category ${ci + 1}/${cats.length} (${memberIds.length} docs): ${ctx.keywords.slice(0, 5).join(', ')} ...`);
+    const { prompt, trimmed } = buildPromptWithinBudget(ctx, perCategory);
+    const trimNote = trimmed.length ? ` [trimmed: ${trimmed.join(', ')}]` : '';
+    console.log(`[bootstrap] Category ${ci + 1}/${cats.length} (${memberIds.length} docs, ~${estTokens(prompt)} tok${trimNote}): ${ctx.keywords.slice(0, 5).join(', ')} ...`);
 
     let queries = [];
     try {
-      queries = await generateQueries(buildPrompt(ctx, perCategory), model);
+      queries = await generateQueries(prompt);
     } catch (err) {
-      console.error(`[bootstrap]   Phi-4 generation failed: ${err.message} — skipping category`);
+      console.error(`[bootstrap]   generation failed: ${err.message} — skipping category`);
     }
 
     results.push({
@@ -284,7 +417,7 @@ export async function bootstrapQueries({ perCategory = PER_CATEGORY, model = MOD
 
   const output = {
     generatedAt: new Date().toISOString(),
-    model,
+    model: MODEL,
     perCategory,
     threshold: categories.threshold ?? null,
     categories: results,
@@ -298,7 +431,7 @@ export async function bootstrapQueries({ perCategory = PER_CATEGORY, model = MOD
   return output;
 }
 
-// Run directly: node backend/extraction/bootstrap_queries.js --per-category 8 --model phi4
+// Run directly: node backend/extraction/bootstrap_queries.js --per-category 8
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const argv = process.argv;
   const flag = (name, fallback) => {
@@ -307,7 +440,6 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   };
   bootstrapQueries({
     perCategory: parseInt(flag('--per-category', PER_CATEGORY), 10),
-    model: flag('--model', MODEL),
   }).catch((err) => {
     console.error('[bootstrap]', err.message);
     process.exit(1);

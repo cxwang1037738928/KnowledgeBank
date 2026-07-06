@@ -23,7 +23,7 @@
  */
 
 const DEFAULTS = {
-  chunkSize: 200,     // target words per chunk
+  chunkSize: 180,     // target words per chunk
   overlap: 30,        // words of overlap between consecutive chunks of the same section
   minSectionMerge: 60, // sections shorter than this (words) get merged with neighbors
   maxTableWords: 300, // tables longer than this are truncated, not split
