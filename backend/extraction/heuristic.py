@@ -35,7 +35,6 @@ Writes data/heuristic_output.json:
 Dependencies: networkx, requests (pip install networkx requests).
 """
 
-from concurrent.futures import process
 import json
 import os
 import sys
@@ -75,7 +74,7 @@ NOVELTY_WEIGHT = 0.3    # within BM25 term: 0 = pure representativeness, 1 = pur
 BM25_K1        = 1.5    # term-frequency saturation
 BM25_B         = 0.75   # length normalization strength
 
-CHUNK_WORDS         = process.env.CHUNK_SIZE   # window size (tokens) for chunk-level scoring —
+CHUNK_WORDS         = 180   # window size (tokens) for chunk-level scoring —
                             # matches the embedding pipeline's CHUNK_SIZE
 TOP_M_CHUNKS        = 5     # how many best chunks define representativeness
 PER_DOC_KEYWORD_CAP = 50    # max terms each cluster member contributes to the

@@ -7,14 +7,14 @@
  *   5. heuristic.py        — BM25 (representativeness + novelty) + citation
  *                            PageRank top-k selection. Needs Ollama running
  *                            (Phi-4 parses reference strings).
- *   6. bootstrap_queries.js — per-category synthetic queries via Phi-4.
+ *   6. bootstrap_queries.js — per-category synthetic queries via Ministral-3b.
  *   7. build_graph.js       — knowledge graph over the top-k documents.
  *
  * Run:  node tests/test_downstream.js [--k 5] [--per-category 8] [--skip-bootstrap]
  *
  * Prerequisite: run test_categories.js first (needs data/doclings.json,
  * data/embeddings.json, data/categories.json). Ollama must be serving the
- * model named in CITATION_MODEL / BOOTSTRAP_MODEL (default phi4).
+ * model named in CITATION_MODEL (default phi4) and BOOTSTRAP_MODEL (default ministral:3b).
  *
  * Outputs (copies in tests/test-output/):
  *   heuristic_output.json, bootstrap_queries.json, graph.json
@@ -82,7 +82,7 @@ await copyOut('heuristic_output.json');
 if (skipBootstrap) {
   console.log('\n[test_downstream] Skipping bootstrap queries (--skip-bootstrap).');
 } else {
-  console.log('\n[test_downstream] Generating bootstrap queries (one Phi-4 call per category) ...\n');
+  console.log('\n[test_downstream] Generating bootstrap queries (one Ministral-3b call per category) ...\n');
   const { bootstrapQueries } = await import('../backend/extraction/bootstrap_queries.js');
   const boot = await bootstrapQueries({ perCategory });
 

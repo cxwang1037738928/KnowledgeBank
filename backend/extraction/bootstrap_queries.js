@@ -1,6 +1,6 @@
 /**
  * bootstrap_queries.js — synthesize plausible user queries per category
- * (Azure-hosted model edition — targets Ministral 3B via Azure AI)
+ * (Ollama edition — targets Ministral 3B via local Ollama)
  *
  * For every cluster in data/categories.json, assembles a context pack and
  * prompts the model to generate the kinds of questions a user might ask
@@ -15,28 +15,18 @@
  *   - medoid excerpt          (chunk closest to the category centroid)
  *
  * ---------------------------------------------------------------------------
- * Azure configuration (.env):
- *   AZURE_CHAT_ENDPOINT  full URL of the chat completions route, e.g.
- *     serverless (Azure AI Foundry / Models-as-a-Service):
- *       https://<deployment>.<region>.models.ai.azure.com/chat/completions
- *     Azure OpenAI-style resource:
- *       https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=2024-06-01
- *   AZURE_API_KEY        key for the deployment (sent as BOTH `api-key` and
- *                        `Authorization: Bearer` — Azure's two auth styles;
- *                        the extra header is ignored by whichever flavor
- *                        you're on)
- *   BOOTSTRAP_MODEL      model name field, default "ministral-3b" (serverless
- *                        endpoints often ignore this — the deployment IS the
- *                        model — but Azure OpenAI-style routes may not)
- *   BOOTSTRAP_MAX_TOKENS output cap per call        (default 2000)
- *   BOOTSTRAP_INPUT_BUDGET prompt budget in tokens  (default 6000)
+ * Ollama configuration (.env):
+ *   OLLAMA_URL           Ollama base URL (default http://localhost:11434)
+ *   BOOTSTRAP_MODEL      Ollama model tag (default ministral:3b)
+ *   BOOTSTRAP_MAX_TOKENS output cap per call — passed as num_predict (default 2000)
+ *   BOOTSTRAP_INPUT_BUDGET prompt budget in tokens (default 6000)
  *
  * Context-length safety: prompt size is estimated (~4 chars/token) and the
  * context pack is trimmed in stages until it fits BOOTSTRAP_INPUT_BUDGET:
  *   1. drop the medoid excerpt
  *   2. shrink abstracts (fewer docs, fewer words each)
  *   3. shrink headings + keywords + title list
- * Ministral 3B advertises a 128K window, but a small model reasons better
+ * Ministral 3B has a 128K context window, but a small model reasons better
  * over a lean prompt anyway, so the default budget is deliberately modest.
  *
  * Reads:  data/categories.json, data/doclings.json, data/embeddings.json (optional)
@@ -56,9 +46,8 @@ const DOCLINGS_PATH   = path.join(ROOT, 'data', 'doclings.json');
 const EMBEDDINGS_PATH = path.join(ROOT, 'data', 'embeddings.json');
 const OUTPUT_PATH     = path.join(ROOT, 'data', 'bootstrap_queries.json');
 
-const AZURE_ENDPOINT = process.env.AZURE_CHAT_ENDPOINT || '';
-const AZURE_API_KEY  = process.env.AZURE_API_KEY || '';
-const MODEL          = process.env.BOOTSTRAP_MODEL || 'ministral-3b';
+const OLLAMA_URL     = process.env.OLLAMA_URL || 'http://localhost:11434';
+const MODEL          = process.env.BOOTSTRAP_MODEL || 'ministral:3b';
 const MAX_TOKENS     = parseInt(process.env.BOOTSTRAP_MAX_TOKENS || '2000', 10);
 const INPUT_BUDGET   = parseInt(process.env.BOOTSTRAP_INPUT_BUDGET || '6000', 10);
 const PER_CATEGORY   = 8;
@@ -248,65 +237,32 @@ function buildPromptWithinBudget(ctx, perCategory, budget = INPUT_BUDGET) {
   };
   trimmed.push('lists');
   prompt = renderPrompt(working, perCategory);
-  return { prompt, trimmed }; // send even if still over — Azure will 400 loudly
+  return { prompt, trimmed }; // send even if still over budget
 }
 
 // ---------------------------------------------------------------------------
-// Azure chat completions call
+// Ollama generate call
 // ---------------------------------------------------------------------------
 
-async function azureChat(prompt, { jsonMode = true, retries = 2 } = {}) {
-  if (!AZURE_ENDPOINT || !AZURE_API_KEY) {
-    throw new Error('AZURE_CHAT_ENDPOINT and AZURE_API_KEY must be set in .env');
-  }
-
-  const body = {
-    model: MODEL,
-    messages: [
-      { role: 'system', content: 'You are a precise assistant that responds only with valid JSON.' },
-      { role: 'user', content: prompt },
-    ],
-    max_tokens: MAX_TOKENS,
-    temperature: 0.8,
-  };
-  // JSON mode guarantees syntactically valid JSON (NOT schema conformance —
-  // shape is validated separately below). Some deployments reject the field;
-  // we retry without it on a 400 that mentions response_format.
-  if (jsonMode) body.response_format = { type: 'json_object' };
-
-  const resp = await fetch(AZURE_ENDPOINT, {
+async function ollamaGenerate(prompt) {
+  const resp = await fetch(`${OLLAMA_URL}/api/generate`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      // Both Azure auth styles — the irrelevant one is ignored:
-      'api-key': AZURE_API_KEY,
-      'Authorization': `Bearer ${AZURE_API_KEY}`,
-    },
-    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model:   MODEL,
+      system:  'You are a precise assistant that responds only with valid JSON.',
+      prompt,
+      stream:  false,
+      options: { temperature: 0.8, num_predict: MAX_TOKENS },
+    }),
   });
-
-  if (resp.status === 429 && retries > 0) {
-    const wait = parseInt(resp.headers.get('retry-after') || '5', 10) * 1000;
-    console.warn(`[bootstrap]   429 rate-limited — retrying in ${wait / 1000}s`);
-    await new Promise((r) => setTimeout(r, wait));
-    return azureChat(prompt, { jsonMode, retries: retries - 1 });
-  }
 
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '');
-    if (resp.status === 400 && jsonMode && /response_format/i.test(errText)) {
-      console.warn('[bootstrap]   deployment rejected response_format — retrying without JSON mode');
-      return azureChat(prompt, { jsonMode: false, retries });
-    }
-    throw new Error(`Azure HTTP ${resp.status}: ${errText.slice(0, 300)}`);
+    throw new Error(`Ollama HTTP ${resp.status}: ${errText.slice(0, 300)}`);
   }
 
-  const data = await resp.json();
-  const choice = data.choices?.[0];
-  if (choice?.finish_reason === 'length') {
-    console.warn(`[bootstrap]   WARNING: output hit max_tokens=${MAX_TOKENS} — JSON may be cut off; raise BOOTSTRAP_MAX_TOKENS or lower --per-category`);
-  }
-  return choice?.message?.content || '';
+  return ((await resp.json()).response || '').trim();
 }
 
 // ---------------------------------------------------------------------------
@@ -341,13 +297,13 @@ function parseQueries(raw) {
 
 async function generateQueries(prompt) {
   try {
-    return parseQueries(await azureChat(prompt));
+    return parseQueries(await ollamaGenerate(prompt));
   } catch (err) {
     // One shape-retry: small models occasionally wrap or narrate; a stricter
     // nudge usually fixes it.
     console.warn(`[bootstrap]   parse failed (${err.message}) — retrying once with stricter instruction`);
     const strict = prompt + '\n\nIMPORTANT: Your previous attempt was invalid. Output ONLY the JSON object, starting with { and ending with }.';
-    return parseQueries(await azureChat(strict));
+    return parseQueries(await ollamaGenerate(strict));
   }
 }
 
