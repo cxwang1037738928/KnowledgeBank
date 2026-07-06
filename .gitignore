@@ -3,3 +3,5 @@ uploads/
 .env
 # Transformers.js caches downloaded model weights
 .cache/
+/tests/test-input
+/tests/test-output
