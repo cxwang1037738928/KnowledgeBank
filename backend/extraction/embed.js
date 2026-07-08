@@ -17,13 +17,14 @@ import { pipeline } from '@xenova/transformers';
 import { chunkDocument } from './chunker.js';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const DOCLINGS_PATH  = path.join(ROOT, 'data', 'doclings.json');
-const EMBEDDINGS_OUT = path.join(ROOT, 'data', 'embeddings.json');
+const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
+const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
+const EMBEDDINGS_OUT = path.join(DATA_DIR, 'embeddings.json');
 
 const MODEL      = 'Xenova/all-MiniLM-L12-v2';
 const DIMENSIONS = 384; // all-MiniLM-L12-v2 outputs 384-dim vectors
-const CHUNK_SIZE    = parseInt(process.env.CHUNK_SIZE    || '500',  10);
-const CHUNK_OVERLAP = parseInt(process.env.CHUNK_OVERLAP || '50',   10);
+const CHUNK_SIZE    = parseInt(process.env.CHUNK_SIZE    || '180', 10);
+const CHUNK_OVERLAP = parseInt(process.env.CHUNK_OVERLAP || '30',  10);
 const BATCH_SIZE    = 32;
 
 // ---------------------------------------------------------------------------
