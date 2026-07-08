@@ -16,18 +16,34 @@ Output: data/doclings.json  — dict keyed by docId, each entry holds:
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from datetime import datetime, timezone
+
+import requests
 
 # ---------------------------------------------------------------------------
 # Paths (resolve relative to project root — two levels up from this file)
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parents[2]
-DOCUMENTS_META = ROOT / "data" / "documents.json"
-DOCLINGS_OUT   = ROOT / "data" / "doclings.json"
-ENHANCED_DIR   = ROOT / "data" / "enhanced"
+ROOT         = Path(__file__).resolve().parents[2]
+DATA_DIR     = ROOT / os.environ.get("DATA_DIR", "data")
+DOCUMENTS_META = DATA_DIR / "documents.json"
+DOCLINGS_OUT   = DATA_DIR / "doclings.json"
+ENHANCED_DIR   = Path(os.environ.get("ENHANCED_DIR", str(DATA_DIR / "enhanced")))
+
+# OCR_PATH: directory containing the Tesseract binary (e.g. C:\Program Files\Tesseract-OCR\).
+# When unset, assumes "tesseract" is already on the system PATH (Linux/Docker).
+_ocr_dir = os.environ.get("OCR_PATH", "").strip()
+if _ocr_dir:
+    _exe = "tesseract.exe" if os.name == "nt" else "tesseract"
+    TESSERACT_CMD = str(Path(_ocr_dir) / _exe)
+else:
+    TESSERACT_CMD = "tesseract"
+
+OLLAMA_URL       = os.environ.get("OLLAMA_URL",       "http://localhost:11434")
+EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "ministral:3b")
 
 # ---------------------------------------------------------------------------
 # docling imports
@@ -36,7 +52,7 @@ ENHANCED_DIR   = ROOT / "data" / "enhanced"
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
-from docling_core.types.doc import DocItemLabel
+from docling_core.types.doc.labels import DocItemLabel
 
 # ---------------------------------------------------------------------------
 # Converters (built once, reused across documents)
@@ -46,7 +62,7 @@ def _make_converter(ocr: bool) -> DocumentConverter:
     opts = PdfPipelineOptions()
     opts.do_ocr = ocr
     if ocr:
-        opts.ocr_options = TesseractCliOcrOptions(force_full_page_ocr=False)
+        opts.ocr_options = TesseractCliOcrOptions(force_full_page_ocr=False, tesseract_cmd=TESSERACT_CMD)
     return DocumentConverter(
         format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
     )
@@ -120,28 +136,135 @@ def _extract_tables(doc) -> list[str]:
     return tables
 
 
+_REF_SECTION_HEADINGS = frozenset({"references", "bibliography", "works cited", "literature cited", "citations"})
+_CODE_FENCE = re.compile(r'^```(?:json)?\s*|\s*```$', re.MULTILINE)
+
+# ---------------------------------------------------------------------------
+# LLM extraction via Ollama
+# ---------------------------------------------------------------------------
+
+def _llm_call(prompt: str) -> str | None:
+    """POST a prompt to Ollama; return the response text or None on any error."""
+    try:
+        resp = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": EXTRACTION_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0}},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "").strip() or None
+    except Exception:
+        return None
+
+
+def _parse_json(raw: str):
+    """Strip markdown fences and parse JSON; return None on failure."""
+    try:
+        return json.loads(_CODE_FENCE.sub("", raw).strip())
+    except Exception:
+        return None
+
+
+def _llm_extract_metadata(full_text: str) -> dict | None:
+    """Ask the LLM to extract title, authors, abstract from the paper's opening text."""
+    snippet = " ".join(full_text.split()[:800])
+    prompt = (
+        "Extract the title, author names, and abstract from this academic paper excerpt.\n"
+        'Return ONLY a JSON object with keys "title" (string or null), '
+        '"authors" (array of name strings), "abstract" (string or null).\n'
+        "No explanation, no extra text.\n\n"
+        f"Paper excerpt:\n{snippet}"
+    )
+    raw = _llm_call(prompt)
+    if not raw:
+        return None
+    result = _parse_json(raw)
+    if not isinstance(result, dict):
+        return None
+    return {
+        "title":    result.get("title") or None,
+        "authors":  result.get("authors") if isinstance(result.get("authors"), list) else [],
+        "abstract": result.get("abstract") or None,
+    }
+
+
+def _llm_extract_references(ref_section_text: str) -> list[str] | None:
+    """Ask the LLM to split a references section blob into individual entries."""
+    snippet = " ".join(ref_section_text.split()[:2000])
+    prompt = (
+        "Split the following references section into individual reference entries.\n"
+        "Return ONLY a JSON array of strings, one string per reference.\n"
+        "No explanation, no extra text.\n\n"
+        f"References section:\n{snippet}"
+    )
+    raw = _llm_call(prompt)
+    if not raw:
+        return None
+    result = _parse_json(raw)
+    return result if isinstance(result, list) else None
+
+
+# ---------------------------------------------------------------------------
+# Docling-label fallbacks (used when Ollama is unavailable)
+# ---------------------------------------------------------------------------
+
 def _extract_references(doc) -> list[str]:
-    refs = []
-    for item, _ in doc.iterate_items():
-        if getattr(item, "label", None) == DocItemLabel.REFERENCE:
-            text = getattr(item, "text", "").strip()
-            if text:
-                refs.append(text)
-    return refs
-
-
-def _extract_metadata(doc) -> dict:
-    meta = {"title": None, "authors": [], "abstract": None, "keywords": []}
+    """Collect ref strings from REFERENCE-labelled items; if none, collect text
+    items inside the References/Bibliography section."""
+    raw = []
+    in_ref_section = False
     for item, _ in doc.iterate_items():
         label = getattr(item, "label", None)
         text  = (getattr(item, "text", "") or "").strip()
         if not text:
             continue
-        if meta["title"] is None and label == DocItemLabel.TITLE:
+        if label == DocItemLabel.REFERENCE:
+            raw.append(text)
+            continue
+        if label in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
+            in_ref_section = text.lower().strip() in _REF_SECTION_HEADINGS
+            continue
+        if in_ref_section:
+            raw.append(text)
+    # Split any blob entries by numbered markers or newlines
+    result = []
+    for entry in raw:
+        lines = [ln.strip() for ln in entry.splitlines() if ln.strip()]
+        result.extend(lines if len(lines) > 1 else [entry])
+    return result
+
+
+def _extract_metadata(doc) -> dict:
+    """Extract title/authors/abstract from docling item labels with header fallbacks."""
+    meta = {"title": None, "authors": [], "abstract": None}
+    section_count = 0
+    _SKIP = frozenset({
+        "abstract", "introduction", "background", "methods", "results",
+        "discussion", "conclusion", "conclusions", "references", "bibliography",
+        "acknowledgements", "acknowledgments", "appendix", "supplementary",
+        "related work", "future work", "limitations", "orcid", "license",
+        "terms", "funding", "keywords", "overview", "notation", "summary",
+    })
+    for item, _ in doc.iterate_items():
+        label = getattr(item, "label", None)
+        text  = (getattr(item, "text", "") or "").strip()
+        if not text:
+            continue
+        if label == DocItemLabel.TITLE and meta["title"] is None:
             meta["title"] = text
-        elif label == DocItemLabel.SECTION_HEADER and text.lower().startswith("abstract"):
-            meta["abstract"] = ""  # next text items belong to the abstract
-        elif meta["abstract"] == "":
+        if label == DocItemLabel.SECTION_HEADER:
+            section_count += 1
+            lower = text.lower().strip()
+            if meta["title"] is None and lower not in _SKIP and len(text.split()) <= 15:
+                meta["title"] = text
+            elif (section_count <= 6 and not meta["authors"]
+                  and 1 <= len(text.split()) <= 5
+                  and lower not in _SKIP
+                  and all(re.match(r'^[A-Z][a-zA-Z\-\.]*$', w) for w in text.split())):
+                meta["authors"].append(text)
+            if lower.startswith("abstract"):
+                meta["abstract"] = ""
+        elif meta["abstract"] == "" and label not in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
             meta["abstract"] = text
     return meta
 
@@ -159,17 +282,34 @@ def convert_document(doc_meta: dict) -> dict:
     result = converter.convert(file_path)
     doc = result.document
 
+    full_text = doc.export_to_text()
+    sections  = _extract_sections(doc)
+
+    # Find the references section text to pass to the LLM
+    ref_section_text = next(
+        (s["text"] for s in reversed(sections)
+         if s.get("heading", "").lower().strip() in _REF_SECTION_HEADINGS),
+        None,
+    )
+
+    # LLM extraction — falls back to docling-label heuristics if Ollama is down
+    metadata = _llm_extract_metadata(full_text) or _extract_metadata(doc)
+    refs = (
+        (_llm_extract_references(ref_section_text) if ref_section_text else None)
+        or _extract_references(doc)
+    )
+
     return {
         "docId":       doc_meta["docId"],
         "filename":    doc_meta["filename"],
         "filePath":    file_path,
         "extractedAt": datetime.now(timezone.utc).isoformat(),
-        "text":        doc.export_to_text(),
+        "text":        full_text,
         "markdown":    doc.export_to_markdown(),
-        "sections":    _extract_sections(doc),
+        "sections":    sections,
         "tables":      _extract_tables(doc),
-        "references":  _extract_references(doc),
-        "metadata":    _extract_metadata(doc),
+        "references":  refs,
+        "metadata":    metadata,
     }
 
 
@@ -185,7 +325,10 @@ def run(force: bool = False) -> None:
 
     existing: dict = {}
     if DOCLINGS_OUT.exists():
-        existing = json.loads(DOCLINGS_OUT.read_text())
+        try:
+            existing = json.loads(DOCLINGS_OUT.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, ValueError):
+            existing = {}
 
     results = dict(existing)
     errors  = []
@@ -209,7 +352,7 @@ def run(force: bool = False) -> None:
             errors.append({"docId": doc_id, "filename": meta.get("filename"), "error": str(exc)})
 
     DOCLINGS_OUT.parent.mkdir(parents=True, exist_ok=True)
-    DOCLINGS_OUT.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    DOCLINGS_OUT.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f"[extract] Wrote {len(results)} documents to {DOCLINGS_OUT}")
 
     if errors:
