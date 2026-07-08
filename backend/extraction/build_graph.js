@@ -17,9 +17,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const DOCLINGS_PATH  = path.join(ROOT, 'data', 'doclings.json');
-const HEURISTIC_PATH = path.join(ROOT, 'data', 'heuristic_output.json');
-const GRAPH_PATH     = path.join(ROOT, 'data', 'graph.json');
+const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
+const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
+const HEURISTIC_PATH = path.join(DATA_DIR, 'heuristic_output.json');
+const GRAPH_PATH     = path.join(DATA_DIR, 'graph.json');
 
 // ---------------------------------------------------------------------------
 // Node / edge builders

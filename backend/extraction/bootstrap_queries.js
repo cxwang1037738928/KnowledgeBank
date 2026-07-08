@@ -41,10 +41,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const ROOT            = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const CATEGORIES_PATH = path.join(ROOT, 'data', 'categories.json');
-const DOCLINGS_PATH   = path.join(ROOT, 'data', 'doclings.json');
-const EMBEDDINGS_PATH = path.join(ROOT, 'data', 'embeddings.json');
-const OUTPUT_PATH     = path.join(ROOT, 'data', 'bootstrap_queries.json');
+const DATA_DIR        = path.resolve(ROOT, process.env.DATA_DIR || 'data');
+const CATEGORIES_PATH = path.join(DATA_DIR, 'categories.json');
+const DOCLINGS_PATH   = path.join(DATA_DIR, 'doclings.json');
+const EMBEDDINGS_PATH = path.join(DATA_DIR, 'embeddings.json');
+const OUTPUT_PATH     = path.join(DATA_DIR, 'bootstrap_queries.json');
 
 const OLLAMA_URL     = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MODEL          = process.env.BOOTSTRAP_MODEL || 'ministral:3b';
