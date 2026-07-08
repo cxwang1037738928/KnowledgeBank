@@ -18,6 +18,9 @@ const REDIS_CONN = {
   host: process.env.REDIS_HOST || '127.0.0.1',
   port: parseInt(process.env.REDIS_PORT || '6379', 10),
   ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}),
+  // Don't retry — fail fast so the catch block in ingestDocument can close the
+  // queue before ioredis spams ECONNREFUSED errors across all subsequent docs.
+  retryStrategy: () => null,
 };
 
 // Status values a document moves through
@@ -190,7 +193,7 @@ export async function extractPDFMeta(filePath) {
  * @param {string} filePath - absolute path to the PDF
  * @returns {Promise<{ docId: string, status: string } | { error: string }>}
  */
-export async function ingestDocument(filePath) {
+export async function ingestDocument(filePath, { enqueue = true } = {}) {
   // 1. Validate
   const validation = await validatePDF(filePath);
   if (!validation.valid) {
@@ -229,12 +232,15 @@ export async function ingestDocument(filePath) {
   store.documents[docId] = record;
   await writeMeta(store);
 
-  // 5. Enqueue — if Redis is unavailable we log a warning but don't fail ingestion
-  try {
-    const queue = getPDFQueue();
-    await queue.add('parse', { docId, filePath }, { jobId: docId, removeOnComplete: 100, removeOnFail: 200 });
-  } catch (err) {
-    console.warn(`[clean_pdf] Could not enqueue doc_id="${docId}": ${err.message}. Is Redis running?`);
+  // 5. Enqueue — skipped when enqueue:false (e.g. tests driving the pipeline directly)
+  if (enqueue) {
+    try {
+      const queue = getPDFQueue();
+      await queue.add('parse', { docId, filePath }, { jobId: docId, removeOnComplete: 100, removeOnFail: 200 });
+    } catch (err) {
+      console.warn(`[clean_pdf] Could not enqueue doc_id="${docId}": ${err.message}. Is Redis running?`);
+      if (_queue) { await _queue.close().catch(() => {}); _queue = null; }
+    }
   }
 
   return { docId, status: STATUS.PENDING };

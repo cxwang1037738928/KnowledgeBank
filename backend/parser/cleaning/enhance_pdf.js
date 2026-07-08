@@ -48,6 +48,7 @@ export async function loadDocument(pdfPath) {
     standardFontDataUrl: STANDARD_FONT_DATA_URL,
     cMapUrl: CMAP_URL,
     cMapPacked: true,
+    verbosity: pdfjsLib.VerbosityLevel.ERRORS,
   }).promise;
 }
 
@@ -242,6 +243,9 @@ export async function estimateSkewAngle(buffer, { maxAngle = 10, coarseStep = 1,
     }
   }
 
+  // No ink content (blank/fully-white page) — nothing to align.
+  if (bestVariance <= 0) return 0;
+
   for (let a = bestAngle - coarseStep; a <= bestAngle + coarseStep; a += fineStep) {
     const v = await varianceAtAngle(a);
     if (v > bestVariance) {
@@ -307,9 +311,20 @@ export async function enhancePage(buffer, opts = {}) {
  * @param {number} pageNumber
  * @param {{ dpi?: number, saveDir?: string|null }} [opts]
  */
+/**
+ * Returns true if the buffer is >99% white pixels — indicates pdfjs failed
+ * to decode the page content (most commonly: JBig2-compressed images).
+ */
+async function isBlankPage(buffer) {
+  const { data, info } = await sharp(buffer).grayscale().raw().toBuffer({ resolveWithObject: true });
+  const white = data.reduce((n, v) => n + (v > 250 ? 1 : 0), 0);
+  return white / (info.width * info.height) > 0.99;
+}
+
 export async function processPage(doc, pageNumber, { dpi = DEFAULT_DPI, saveDir = null } = {}) {
   const pageType = await classifyPageType(doc, pageNumber);
   const { buffer: colorBuffer, width, height } = await rasterizePage(doc, pageNumber, dpi);
+  const blank = await isBlankPage(colorBuffer);
   const enhanced = await enhancePage(colorBuffer);
 
   if (saveDir) {
@@ -323,6 +338,7 @@ export async function processPage(doc, pageNumber, { dpi = DEFAULT_DPI, saveDir 
     textDensity: pageType.textDensity,
     dimensions: { width, height, dpi },
     enhancement: { deskewAngle: enhanced.angle, binarizationThreshold: enhanced.threshold },
+    blank,
   };
 }
 
@@ -344,6 +360,15 @@ export async function processDocument(pdfPath, { docId, dpi = DEFAULT_DPI } = {}
   }
 
   const report = { docId: docId ?? null, pdfPath, numPages: doc.numPages, dpi, processedAt: new Date().toISOString(), pages };
+
+  const blankPages = pages.filter(p => p.blank).map(p => p.pageNumber);
+  if (blankPages.length > 0) {
+    console.warn(
+      `[enhance] ${path.basename(pdfPath)}: ${blankPages.length}/${doc.numPages} page(s) rendered blank` +
+      ` (pages ${blankPages.join(', ')}) — likely JBig2-compressed images pdfjs cannot decode.` +
+      ` docling will extract these pages directly from the PDF.`
+    );
+  }
 
   if (docId) {
     await fs.mkdir(ENHANCED_DIR, { recursive: true });
