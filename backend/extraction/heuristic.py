@@ -60,9 +60,10 @@ from heuristic_utils import (
 # ---------------------------------------------------------------------------
 
 ROOT            = Path(__file__).resolve().parents[2]
-DOCLINGS_PATH   = ROOT / "data" / "doclings.json"
-CATEGORIES_PATH = ROOT / "data" / "categories.json"
-OUTPUT_PATH     = ROOT / "data" / "heuristic_output.json"
+DATA_DIR        = ROOT / os.environ.get("DATA_DIR", "data")
+DOCLINGS_PATH   = DATA_DIR / "doclings.json"
+CATEGORIES_PATH = DATA_DIR / "categories.json"
+OUTPUT_PATH     = DATA_DIR / "heuristic_output.json"
 
 OLLAMA_URL     = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 CITATION_MODEL = os.environ.get("CITATION_MODEL", "phi4")
@@ -95,7 +96,7 @@ def run(k: int = K) -> None:
         print(f"[heuristic] {DOCLINGS_PATH} not found — run extract.py first.", file=sys.stderr)
         sys.exit(1)
 
-    doclings: dict = json.loads(DOCLINGS_PATH.read_text())
+    doclings: dict = json.loads(DOCLINGS_PATH.read_text(encoding='utf-8'))
     if not doclings:
         print("[heuristic] doclings.json is empty — nothing to score.")
         return
@@ -110,7 +111,7 @@ def run(k: int = K) -> None:
     fallback_kws = top_terms(bm25, n=KEYWORDS_N)
     doc_keywords: dict[str, list[str]] = {}
     if CATEGORIES_PATH.exists():
-        categories = json.loads(CATEGORIES_PATH.read_text())
+        categories = json.loads(CATEGORIES_PATH.read_text(encoding='utf-8'))
         for cat in categories.get("categories", []):
             member_ids = [m["docId"] for m in cat.get("members", []) if m["docId"] in tokenised]
             if not member_ids:
@@ -180,7 +181,7 @@ def run(k: int = K) -> None:
     }
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    OUTPUT_PATH.write_text(json.dumps(output, indent=2))
+    OUTPUT_PATH.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f"[heuristic] Top-{k} documents:")
     for entry in top_k:
         print(f"  {entry['filename']}  (score={entry['finalScore']})")
