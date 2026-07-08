@@ -2,7 +2,7 @@
  * test_downstream.js — pipeline stages 5–7: heuristic ranking → bootstrap
  * queries → knowledge graph
  *
- * The old test suite stopped at clustering; these stages had no coverage.
+ * All outputs go to tests/test-output/ — no writes to data/.
  *
  *   5. heuristic.py        — BM25 (representativeness + novelty) + citation
  *                            PageRank top-k selection. Needs Ollama running
@@ -12,11 +12,11 @@
  *
  * Run:  node tests/test_downstream.js [--k 5] [--per-category 8] [--skip-bootstrap]
  *
- * Prerequisite: run test_categories.js first (needs data/doclings.json,
- * data/embeddings.json, data/categories.json). Ollama must be serving the
+ * Prerequisite: run test_categories.js first (needs tests/test-output/doclings.json,
+ * embeddings.json, categories.json). Ollama must be serving the
  * model named in CITATION_MODEL (default phi4) and BOOTSTRAP_MODEL (default ministral:3b).
  *
- * Outputs (copies in tests/test-output/):
+ * Outputs (all in tests/test-output/):
  *   heuristic_output.json, bootstrap_queries.json, graph.json
  */
 
@@ -26,12 +26,16 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 
-const ROOT         = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const TEST_OUTPUT  = path.join(ROOT, 'tests', 'test-output');
-const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'heuristic.py');
-const DATA         = (f) => path.join(ROOT, 'data', f);
+const ROOT      = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const TEST_DATA = path.join(ROOT, 'tests', 'test-output');
 
-await fs.mkdir(TEST_OUTPUT, { recursive: true });
+// Must be set before imports and before spawning Python — all pipeline modules
+// read DATA_DIR at load time.
+process.env.DATA_DIR = TEST_DATA;
+
+const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'heuristic.py');
+
+await fs.mkdir(TEST_DATA, { recursive: true });
 
 const argv = process.argv;
 const flag = (name, fallback) => {
@@ -42,24 +46,21 @@ const k             = flag('--k', '5');
 const perCategory   = parseInt(flag('--per-category', '8'), 10);
 const skipBootstrap = argv.includes('--skip-bootstrap');
 
-const copyOut = async (name) => {
-  await fs.copyFile(DATA(name), path.join(TEST_OUTPUT, name));
-  console.log(`  ${name} → tests/test-output/${name}`);
-};
+const PYTHON = process.env.PYTHON || 'python';
 
 // ---- 5. heuristic.py ---------------------------------------------------------
 
-console.log(`[test_downstream] Spawning heuristic.py --k ${k} (Phi-4 citation parsing — needs Ollama) ...\n`);
+console.log(`[test_downstream] Spawning heuristic.py --k ${k} (${PYTHON}, Phi-4 citation parsing — needs Ollama) ...\n`);
 
 await new Promise((resolve, reject) => {
-  const proc = spawn('python', [HEURISTIC_PY, '--k', k], { stdio: 'inherit', cwd: ROOT });
+  const proc = spawn(PYTHON, [HEURISTIC_PY, '--k', k], { stdio: 'inherit', cwd: ROOT });
   proc.on('close', (code) => code !== 0
     ? reject(new Error(`heuristic.py exited with code ${code}`))
     : resolve());
   proc.on('error', (err) => reject(new Error(`Failed to spawn heuristic.py: ${err.message}`)));
 });
 
-const heuristic = JSON.parse(await fs.readFile(DATA('heuristic_output.json'), 'utf-8'));
+const heuristic = JSON.parse(await fs.readFile(path.join(TEST_DATA, 'heuristic_output.json'), 'utf-8'));
 
 console.log('\n[test_downstream] Top-k breakdown (final = 0.25·bm25 + 0.75·pagerank):');
 for (const d of heuristic.topK) {
@@ -75,7 +76,6 @@ if (heuristic.edges.length === 0) {
   console.warn('           authors (see test_extract.js coverage summary), empty');
   console.warn('           references arrays, or Phi-4 parsing failures.');
 }
-await copyOut('heuristic_output.json');
 
 // ---- 6. bootstrap_queries.js ---------------------------------------------------
 
@@ -94,7 +94,6 @@ if (skipBootstrap) {
     if (cat.queries.length > 3) console.log(`    ... ${cat.queries.length - 3} more`);
     if (cat.queries.length === 0) console.warn('    WARNING: no queries generated for this category');
   }
-  await copyOut('bootstrap_queries.json');
 }
 
 // ---- 7. build_graph.js ---------------------------------------------------------
@@ -111,6 +110,5 @@ const sectionEdges = graph.edges.filter((e) => e.type === 'has_section').length;
 console.log('[test_downstream] Graph summary:');
 console.log(`  nodes: ${docNodes} document, ${sectionNodes} section`);
 console.log(`  edges: ${citeEdges} cites, ${sectionEdges} has_section`);
-await copyOut('graph.json');
 
-console.log('\nDone. Full pipeline artifacts are in data/, copies in tests/test-output/.');
+console.log('\nDone. All outputs in tests/test-output/.');

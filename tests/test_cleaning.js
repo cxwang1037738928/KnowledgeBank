@@ -2,20 +2,14 @@
  * test_cleaning.js — pipeline stage 1: ingest + enhance
  *
  * Exercises clean_pdf.js and enhance_pdf.js on every PDF in tests/test-input/.
+ * All outputs go to tests/test-output/ — no writes to data/.
+ *
  * Run: node tests/test_cleaning.js
  *
- * CHANGED to match the current pipeline: enhancement output now goes to
- * data/enhanced/ — NOT tests/test-output/enhanced/. extract.py's
- * _choose_converter() reads data/enhanced/<docId>.json to decide between
- * the digital and OCR converters; when the reports lived under
- * tests/test-output/, extract.py never found them and silently routed every
- * document through the (much slower) OCR pipeline. The per-doc JSON reports
- * are additionally COPIED into tests/test-output/enhanced/ for inspection.
- *
  * Outputs:
- *   data/documents.json                     — ingest metadata (needed by extract.py)
- *   data/enhanced/<docId>.json + page PNGs  — pipeline artifacts (read by extract.py)
- *   tests/test-output/enhanced/<docId>.json — report copies for inspection
+ *   tests/test-output/documents.json          — ingest metadata (read by test_extract.js)
+ *   tests/test-output/enhanced/<docId>.json   — page-type report (read by extract.py)
+ *   tests/test-output/enhanced/<docId>/page_*.png
  */
 
 import 'dotenv/config';
@@ -23,20 +17,20 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const ROOT         = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const TEST_INPUT   = path.join(ROOT, 'tests', 'test-input');
-const TEST_OUTPUT  = path.join(ROOT, 'tests', 'test-output');
-const ENHANCED_DIR = path.join(ROOT, 'data', 'enhanced');
+const ROOT      = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const TEST_DATA = path.join(ROOT, 'tests', 'test-output');
+const TEST_INPUT = path.join(ROOT, 'tests', 'test-input');
 
-// Must be set before enhance_pdf.js is imported — it reads ENHANCED_DIR at
-// module load time. Points at data/enhanced/ so extract.py can find reports.
-process.env.ENHANCED_DIR = ENHANCED_DIR;
+// Must be set before imports — clean_pdf.js and enhance_pdf.js read these at
+// module load time.
+process.env.DATA_DIR           = TEST_DATA;
+process.env.DOCUMENTS_META_PATH = path.join(TEST_DATA, 'documents.json');
+process.env.ENHANCED_DIR        = path.join(TEST_DATA, 'enhanced');
 
 const { ingestDocument }  = await import('../backend/parser/cleaning/clean_pdf.js');
 const { processDocument } = await import('../backend/parser/cleaning/enhance_pdf.js');
 
-await fs.mkdir(ENHANCED_DIR, { recursive: true });
-await fs.mkdir(path.join(TEST_OUTPUT, 'enhanced'), { recursive: true });
+await fs.mkdir(path.join(TEST_DATA, 'enhanced'), { recursive: true });
 
 // ---- Find input PDFs -------------------------------------------------------
 
@@ -63,7 +57,7 @@ for (const filename of pdfs) {
   console.log(`=== ${filename} ===`);
 
   // 1. Ingest
-  const ingestResult = await ingestDocument(filePath);
+  const ingestResult = await ingestDocument(filePath, { enqueue: false });
 
   let docId;
   if (ingestResult.error) {
@@ -101,15 +95,8 @@ for (const filename of pdfs) {
       );
     }
 
-    // Copy the JSON report into test-output for inspection; the original
-    // stays in data/enhanced/ where extract.py expects it.
-    const reportSrc = path.join(ENHANCED_DIR, `${docId}.json`);
-    try {
-      await fs.copyFile(reportSrc, path.join(TEST_OUTPUT, 'enhanced', `${docId}.json`));
-    } catch { /* report path may differ if enhance_pdf writes elsewhere */ }
-
-    console.log(`  [enhance] Report  → data/enhanced/${docId}.json (copy in tests/test-output/enhanced/)`);
-    console.log(`  [enhance] Images  → data/enhanced/${docId}/page_*.png`);
+    console.log(`  [enhance] Report  → tests/test-output/enhanced/${docId}.json`);
+    console.log(`  [enhance] Images  → tests/test-output/enhanced/${docId}/page_*.png`);
   } catch (err) {
     console.log(`  [enhance] ERROR: ${err.message}`);
   }

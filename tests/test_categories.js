@@ -2,28 +2,16 @@
  * test_categories.js — pipeline stages 3+4: embed (structural chunking) + cluster
  *
  * Embeds all documents then clusters them into categories at the given
- * cosine similarity threshold. Copies the resulting categories.json into
- * tests/test-output/ and prints chunking stats + a cluster summary.
+ * cosine similarity threshold. All outputs go to tests/test-output/.
  *
  * Run:  node tests/test_categories.js [--threshold 0.75]
  *
- * Prerequisite: run test_extract.js first so data/doclings.json is populated.
- *
- * CHANGED to match the current pipeline: embed.js now uses chunkDocument()
- * (structure-aware — section boundaries, heading prefixes, standalone table
- * chunks) instead of flat chunkText(), and stores heading / sectionIndex /
- * chunkType per chunk. This test inspects those fields:
- *   - chunk type breakdown (text vs table)
- *   - heading coverage — % of chunks that carry a section heading; low
- *     coverage means docling found little structure and most docs fell
- *     back to sliding-window chunking
- *   - oversized-chunk warning — all-MiniLM-L12-v2 truncates ~256 word-piece
- *     tokens (~200 words); chunks beyond that embed only their head
+ * Prerequisite: run test_extract.js first so tests/test-output/doclings.json
+ * is populated.
  *
  * Outputs:
- *   data/embeddings.json                — full embedding store (pipeline artifact)
- *   data/categories.json                — categories (pipeline artifact)
- *   tests/test-output/categories.json   — copy for inspection
+ *   tests/test-output/embeddings.json   — full embedding store
+ *   tests/test-output/categories.json   — categories with cluster descriptions
  */
 
 import 'dotenv/config';
@@ -31,10 +19,14 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-const ROOT        = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const TEST_OUTPUT = path.join(ROOT, 'tests', 'test-output');
+const ROOT      = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const TEST_DATA = path.join(ROOT, 'tests', 'test-output');
 
-await fs.mkdir(TEST_OUTPUT, { recursive: true });
+// Must be set before imports — embed.js and generate_categories.js read DATA_DIR
+// at module load time.
+process.env.DATA_DIR = TEST_DATA;
+
+await fs.mkdir(TEST_DATA, { recursive: true });
 
 const { embedAll }           = await import('../backend/extraction/embed.js');
 const { generateCategories } = await import('../backend/extraction/generate_categories.js');
@@ -51,7 +43,7 @@ await embedAll({ force: true });
 
 // ---- Chunking stats ----------------------------------------------------------
 
-const store  = JSON.parse(await fs.readFile(path.join(ROOT, 'data', 'embeddings.json'), 'utf-8'));
+const store  = JSON.parse(await fs.readFile(path.join(TEST_DATA, 'embeddings.json'), 'utf-8'));
 const chunks = store.chunks || [];
 
 const byDoc = new Map();
@@ -84,18 +76,13 @@ if (oversized > 0) {
 console.log('\n[test_categories] Clustering at threshold=' + threshold + ' ...\n');
 const result = await generateCategories(threshold);
 
-// ---- Copy to test-output ---------------------------------------------------
-
-const dest = path.join(TEST_OUTPUT, 'categories.json');
-await fs.copyFile(path.join(ROOT, 'data', 'categories.json'), dest);
-console.log('\n[test_categories] categories.json → tests/test-output/categories.json');
-
 // ---- Print summary ---------------------------------------------------------
 
 console.log(`\n${result.categories.length} cluster(s) at threshold=${threshold}:\n`);
 for (const [i, cat] of result.categories.entries()) {
-  const members  = cat.members.map((m) => m.filename).join(', ');
-  console.log(`  Cluster ${i + 1} (${cat.members.length} doc${cat.members.length !== 1 ? 's' : ''}): ${members}`);
+  const members = cat.members.map((m) => m.filename).join(', ');
+  const desc    = cat.description ? `\n    "${cat.description}"` : '';
+  console.log(`  Cluster ${i + 1} (${cat.members.length} doc${cat.members.length !== 1 ? 's' : ''}): ${members}${desc}`);
 }
 
 console.log('\nDone. Run test_downstream.js next.');

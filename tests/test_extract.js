@@ -32,18 +32,26 @@ import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 
 const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const TEST_OUTPUT   = path.join(ROOT, 'tests', 'test-output', 'text');
-const DOCLINGS_PATH = path.join(ROOT, 'data', 'doclings.json');
+const TEST_DATA     = path.join(ROOT, 'tests', 'test-output');
+const TEST_OUTPUT   = path.join(TEST_DATA, 'text');
+const DOCLINGS_PATH = path.join(TEST_DATA, 'doclings.json');
 const EXTRACT_PY    = path.join(ROOT, 'backend', 'extraction', 'extract.py');
+
+// Redirect all pipeline I/O to tests/test-output/ — must be set before
+// the Python subprocess inherits process.env.
+process.env.DATA_DIR            = TEST_DATA;
+process.env.DOCUMENTS_META_PATH = path.join(TEST_DATA, 'documents.json');
+process.env.ENHANCED_DIR        = path.join(TEST_DATA, 'enhanced');
 
 await fs.mkdir(TEST_OUTPUT, { recursive: true });
 
 // ---- Run extract.py --------------------------------------------------------
 
-console.log('[test_extract] Spawning extract.py --force ...\n');
+const PYTHON = process.env.PYTHON || 'python';
+console.log(`[test_extract] Spawning extract.py --force (${PYTHON}) ...\n`);
 
 await new Promise((resolve, reject) => {
-  const proc = spawn('python', [EXTRACT_PY, '--force'], {
+  const proc = spawn(PYTHON, [EXTRACT_PY, '--force'], {
     stdio: 'inherit',
     cwd: ROOT,
   });
@@ -82,6 +90,10 @@ for (const entry of entries) {
     .map((s, i) => `  [${i}] ${s.heading || '(no heading)'} — ${(s.text || '').split(/\s+/).length} words`)
     .join('\n');
 
+  const refList = (entry.references || [])
+    .map((r, i) => `  [${i + 1}] ${r}`)
+    .join('\n');
+
   const lines = [
     `File:       ${entry.filename}`,
     `DocId:      ${entry.docId}`,
@@ -95,6 +107,9 @@ for (const entry of entries) {
     '',
     'Section outline:',
     outline || '  (none — chunker will fall back to plain sliding-window chunking)',
+    '',
+    'Raw reference strings (resolved → heuristic_output.json edges after heuristic.py):',
+    refList || '  (none extracted)',
     '',
     '='.repeat(72),
     '',
