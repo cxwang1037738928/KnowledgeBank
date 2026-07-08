@@ -101,6 +101,10 @@ export function chunkText(text, chunkSize = DEFAULTS.chunkSize, overlap = DEFAUL
       continue;
     }
     if (currentWords + w > chunkSize && currentWords > 0) flush();
+    // After flush the carry is kept as overlap; if overlap + sentence still
+    // overflows (large sentence near the chunk limit), drop the carry so the
+    // final chunk stays within chunkSize.
+    if (currentWords + w > chunkSize) { current = []; currentWords = 0; }
     current.push(sentence);
     currentWords += w;
   }
