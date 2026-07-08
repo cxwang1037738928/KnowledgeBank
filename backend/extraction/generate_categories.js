@@ -30,8 +30,9 @@ import { fileURLToPath } from 'url';
 import { pipeline } from '@xenova/transformers';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const DOCLINGS_PATH  = path.join(ROOT, 'data', 'doclings.json');
-const CATEGORIES_OUT = path.join(ROOT, 'data', 'categories.json');
+const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
+const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
+const CATEGORIES_OUT = path.join(DATA_DIR, 'categories.json');
 
 const EMBED_MODEL          = 'Xenova/all-MiniLM-L12-v2';
 const BATCH_SIZE           = 32;
@@ -160,7 +161,15 @@ export async function generateCategories(threshold) {
 
   // Embed title+abstract for every document
   console.log(`[generate_categories] Embedding title+abstract for ${docIds.length} doc(s) ...`);
-  const texts   = docIds.map(id => metaText(doclings[id]));
+  const texts = docIds.map(id => {
+    const entry    = doclings[id];
+    const title    = (entry.metadata?.title    || '').trim();
+    const abstract = (entry.metadata?.abstract || '').trim();
+    if (!title && !abstract) {
+      console.warn(`[generate_categories]   no title/abstract: ${entry.filename || id} — falling back to first 200 words of body text`);
+    }
+    return metaText(entry);
+  });
   const vectors = {};
   for (let i = 0; i < docIds.length; i += BATCH_SIZE) {
     const batchIds   = docIds.slice(i, i + BATCH_SIZE);
