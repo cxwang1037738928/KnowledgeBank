@@ -62,6 +62,11 @@ await new Promise((resolve, reject) => {
   proc.on('error', (err) => reject(new Error(`Failed to spawn extract.py: ${err.message}`)));
 });
 
+// ---- Stamp DOIs (regex over each document head) ------------------------------
+
+const { annotateDois } = await import('../backend/extraction/doi_regex.js');
+await annotateDois();
+
 // ---- Write per-doc .txt files ----------------------------------------------
 
 let doclings;
@@ -101,6 +106,7 @@ for (const entry of entries) {
     `Title:      ${meta.title || '(MISSING — citation matching cannot target this doc)'}`,
     `Authors:    ${(meta.authors || []).join('; ') || '(MISSING — citation matching cannot target this doc)'}`,
     `Abstract:   ${meta.abstract ? `${meta.abstract.split(/\s+/).length} words` : '(missing)'}`,
+    `DOI:        ${meta.doi || '(none found)'}`,
     `Sections:   ${entry.sections.length}`,
     `Tables:     ${entry.tables.length}`,
     `References: ${entry.references.length}`,
