@@ -70,7 +70,7 @@ CITATION_MODEL = os.environ.get("CITATION_MODEL", "phi4")
 
 K              = 2      # top-k documents to select
 ALPHA          = 0.25   # weight of the BM25 component vs. PageRank
-NOVELTY_WEIGHT = 0.3    # within BM25 term: 0 = pure representativeness, 1 = pure novelty
+NOVELTY_WEIGHT = 0.2    # how much a document's rare vocabulary boosts its final ranking score
 
 BM25_K1        = 1.5    # term-frequency saturation
 BM25_B         = 0.75   # length normalization strength
@@ -80,10 +80,15 @@ CHUNK_WORDS         = 180   # window size (tokens) for chunk-level scoring —
 TOP_M_CHUNKS        = 5     # how many best chunks define representativeness
 PER_DOC_KEYWORD_CAP = 50    # max terms each cluster member contributes to the
                             # keyword pool (None = uncapped, old behavior)
-KEYWORDS_N          = 20    # keywords per cluster / corpus fallback
+KEYWORDS_N          = int(os.environ.get("KEYWORDS_N", "20"))
+
+_REF_HEADINGS = frozenset({"references", "bibliography", "works cited", "literature cited", "citations"})
 
 MIN_KEY_LENGTH   = 4    # skip title/author match keys shorter than this, short author last names causes over matching
-REF_BATCH_SIZE   = 50   # references per LLM parsing call (batched losslessly)
+REF_BATCH_SIZE   = 10   # references per LLM parsing call — small on purpose: a
+                        # 3b model given 50 refs at once overflows both the
+                        # context window and the output budget, truncating the
+                        # JSON and silently zeroing the batch
 PAGERANK_DAMPING = 0.85
 
 
@@ -103,7 +108,17 @@ def run(k: int = K) -> None:
 
     doc_ids   = list(doclings.keys())
     filenames = {d: doclings[d]["filename"] for d in doc_ids}
-    tokenised = {d: tokenise(doclings[d].get("text", "")) for d in doc_ids}
+
+    # Tokenize body text only — exclude reference sections so author names and
+    # cited-paper titles don't inflate keyword scores.
+    def _body_text(entry: dict) -> str:
+        sections = entry.get("sections", [])
+        body = [s["text"] for s in sections
+                if s.get("heading", "").lower().strip() not in _REF_HEADINGS
+                and (s.get("text") or "").strip()]
+        return " ".join(body) if body else entry.get("text", "")
+
+    tokenised = {d: tokenise(_body_text(doclings[d])) for d in doc_ids}
 
     bm25 = BM25([tokenised[d] for d in doc_ids], k1=BM25_K1, b=BM25_B)
 

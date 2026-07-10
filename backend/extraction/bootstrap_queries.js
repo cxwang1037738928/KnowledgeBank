@@ -8,9 +8,10 @@
  *
  * Context pack per category (all computed locally, no LLM needed):
  *   - top BM25-IDF keywords   (same summed-IDF-over-members logic as heuristic.py)
- *   - member titles           (metadata.title, falling back to filename)
- *   - abstracts               (metadata.abstract, falling back to the first
- *                              non-trivial section)
+ *   - member titles           (GROBID metadata.title, falling back to filename)
+ *   - abstracts               (GROBID metadata.abstract paired with its title;
+ *                              docs with real abstracts are preferred, first
+ *                              non-trivial section as last resort)
  *   - distinctive headings    (recurring/specific, boilerplate filtered)
  *   - medoid excerpt          (chunk closest to the category centroid)
  *
@@ -51,8 +52,8 @@ const OLLAMA_URL     = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MODEL          = process.env.BOOTSTRAP_MODEL || 'ministral:3b';
 const MAX_TOKENS     = parseInt(process.env.BOOTSTRAP_MAX_TOKENS || '2000', 10);
 const INPUT_BUDGET   = parseInt(process.env.BOOTSTRAP_INPUT_BUDGET || '6000', 10);
-const PER_CATEGORY   = 8;
-const KEYWORDS_N     = 15;
+const PER_CATEGORY   = parseInt(process.env.BOOTSTRAP_PER_CATEGORY || '8', 10);
+const KEYWORDS_N     = parseInt(process.env.KEYWORDS_N || '20', 10);
 
 const QUERY_TYPES = ['factual', 'definition', 'comparison', 'synthesis', 'methodology'];
 
@@ -84,9 +85,18 @@ const STOPWORDS = new Set([
   'she','they','their','our','us','not','no','so','if','than','then',
 ]);
 
+const REF_HEADINGS = new Set(['references', 'bibliography', 'works cited', 'literature cited', 'citations']);
+
 function tokenise(text) {
   const tokens = (text.toLowerCase().match(/[a-z]+/g) || []);
   return tokens.filter((t) => !STOPWORDS.has(t) && t.length > 2);
+}
+
+function bodyText(entry) {
+  const sections = (entry?.sections || []).filter(
+    (s) => !REF_HEADINGS.has((s.heading || '').toLowerCase().trim()) && (s.text || '').trim()
+  );
+  return sections.length ? sections.map((s) => s.text).join(' ') : (entry?.text || '');
 }
 
 function buildIdf(tokenisedDocs) {
@@ -113,6 +123,9 @@ function clusterKeywords(memberTokens, idf, n = KEYWORDS_N) {
 // Context assembly
 // ---------------------------------------------------------------------------
 
+// metadata.title / metadata.abstract are produced by GROBID's CRF header
+// model at extraction time (extract.py) — clean, reliable fields. The
+// fallbacks below only fire for docs extracted while GROBID was down.
 function docTitle(entry) {
   return entry?.metadata?.title?.trim() || entry?.filename || 'untitled';
 }
@@ -124,6 +137,21 @@ function docAbstract(entry, maxWords = 120) {
     abs = sec?.text?.trim() || '';
   }
   return capWords(abs, maxWords);
+}
+
+/**
+ * Pick up to `max` {title, text} abstract entries for the context pack.
+ * Docs with a real GROBID abstract are preferred over section-text
+ * fallbacks, so the prompt is grounded in actual paper summaries whenever
+ * the cluster has them.
+ */
+function abstractEntries(entries, max = 5) {
+  const withReal = entries.filter((e) => e?.metadata?.abstract?.trim());
+  const without  = entries.filter((e) => !e?.metadata?.abstract?.trim());
+  return [...withReal, ...without]
+    .slice(0, max)
+    .map((e) => ({ title: docTitle(e), text: docAbstract(e) }))
+    .filter((a) => a.text);
 }
 
 function distinctiveHeadings(entries, maxHeadings = 8) {
@@ -171,7 +199,9 @@ function medoidExcerpt(memberIds, embedStore, maxWords = 150) {
 
 function renderPrompt(ctx, perCategory) {
   const titles    = ctx.titles.map((t) => `- ${t}`).join('\n');
-  const abstracts = ctx.abstracts.filter(Boolean).map((a, i) => `[${i + 1}] ${a}`).join('\n');
+  const abstracts = ctx.abstracts
+    .map((a) => `"${a.title}":\n${a.text}`)
+    .join('\n\n');
   const headings  = ctx.headings.length ? ctx.headings.join('; ') : '(none)';
   const excerpt   = ctx.excerpt ? `\nRepresentative excerpt:\n"""${ctx.excerpt}"""\n` : '';
 
@@ -223,7 +253,12 @@ function buildPromptWithinBudget(ctx, perCategory, budget = INPUT_BUDGET) {
 
   // Stage 2 — shrink abstracts progressively
   for (const [count, words] of [[3, 60], [2, 40], [1, 30]]) {
-    working = { ...working, abstracts: working.abstracts.slice(0, count).map((a) => capWords(a, words)) };
+    working = {
+      ...working,
+      abstracts: working.abstracts
+        .slice(0, count)
+        .map((a) => ({ ...a, text: capWords(a.text, words) })),
+    };
     trimmed.push(`abstracts→${count}x${words}w`);
     prompt = renderPrompt(working, perCategory);
     if (estTokens(prompt) <= budget) return { prompt, trimmed };
@@ -332,7 +367,7 @@ export async function bootstrapQueries({ perCategory = PER_CATEGORY } = {}) {
   }
 
   const docIds = Object.keys(doclings);
-  const tokenised = new Map(docIds.map((d) => [d, tokenise(doclings[d].text || '')]));
+  const tokenised = new Map(docIds.map((d) => [d, tokenise(bodyText(doclings[d]))]));
   const idf = buildIdf([...tokenised.values()]);
 
   const results = [];
@@ -348,7 +383,7 @@ export async function bootstrapQueries({ perCategory = PER_CATEGORY } = {}) {
     const ctx = {
       keywords:  clusterKeywords(memberIds.map((d) => tokenised.get(d) || []), idf),
       titles:    entries.map(docTitle),
-      abstracts: entries.map((e) => docAbstract(e)).slice(0, 5),
+      abstracts: abstractEntries(entries),
       headings:  distinctiveHeadings(entries),
       excerpt:   medoidExcerpt(memberIds, embedStore),
     };

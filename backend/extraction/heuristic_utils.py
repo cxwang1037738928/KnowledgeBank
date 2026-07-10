@@ -19,6 +19,7 @@ import json
 import math
 import re
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import networkx as nx
@@ -228,16 +229,35 @@ References:
 {refs}"""
 
 
+def _salvage_ref_objects(raw: str) -> list[dict]:
+    """Recover complete {title, authors} objects from a truncated or
+    malformed JSON array. Entry objects contain no nested braces, so each
+    non-greedy {...} block is parseable on its own; a cut-off final entry
+    is simply skipped instead of poisoning the whole batch."""
+    objects = []
+    for m in re.finditer(r"\{.*?\}", raw, re.DOTALL):
+        try:
+            obj = json.loads(m.group())
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except json.JSONDecodeError:
+            continue
+    return objects
+
+
 def parse_references_ollama(raw_refs: list[str], ollama_url: str, model: str,
-                            batch_size: int = 50, timeout: int = 120) -> list[dict]:
+                            batch_size: int = 10, timeout: int = 120) -> list[dict]:
     """
     Parses reference strings into structured {title, authors} dicts via an
     Ollama-hosted model. References are independent of one another, so
     long lists are split into batches of `batch_size` and the parsed
-    arrays concatenated — losslessly avoiding context-length issues on
-    reference-heavy surveys (the old version silently dropped everything
-    past the first 50 refs). A failed batch contributes [] and the run
-    continues.
+    arrays concatenated. Batches must stay small: a 3b model given 50
+    refs at once blows past both the context window (input truncation)
+    and the output token budget (done_reason=length, JSON cut mid-entry),
+    which silently zeroed every batch. num_ctx/num_predict are raised
+    explicitly so Ollama's defaults (4096 ctx, capped output) don't
+    truncate; a batch whose JSON still arrives damaged is salvaged
+    object-by-object rather than dropped whole.
     """
     parsed: list[dict] = []
     for i in range(0, len(raw_refs), batch_size):
@@ -247,14 +267,19 @@ def parse_references_ollama(raw_refs: list[str], ollama_url: str, model: str,
             resp = requests.post(
                 f"{ollama_url}/api/generate",
                 json={"model": model, "prompt": prompt, "stream": False,
-                      "options": {"temperature": 0}},
+                      "options": {"temperature": 0,
+                                  "num_ctx": 8192,
+                                  "num_predict": -1}},
                 timeout=timeout,
             )
             if resp.status_code != 200:
                 continue
             raw = resp.json().get("response", "").strip()
             match = re.search(r"\[.*\]", raw, re.DOTALL)
-            batch_parsed = json.loads(match.group() if match else raw)
+            try:
+                batch_parsed = json.loads(match.group() if match else raw)
+            except json.JSONDecodeError:
+                batch_parsed = _salvage_ref_objects(raw)
             if isinstance(batch_parsed, list):
                 parsed.extend(p for p in batch_parsed if isinstance(p, dict))
         except Exception:
@@ -262,13 +287,28 @@ def parse_references_ollama(raw_refs: list[str], ollama_url: str, model: str,
     return parsed
 
 
+
+
+def _surname(name: str) -> str:
+    """Normalized surname for author matching. Handles both citation-style
+    'Last, First' (surname before the comma) and corpus-style 'First Last'
+    (surname is the final token). Initials and punctuation are stripped so
+    'Gomez, Aidan N.' and 'Aidan N. Gomez' both yield 'gomez'."""
+    name = name.strip().lower()
+    if "," in name:
+        name = name.split(",", 1)[0]
+    tokens = re.findall(r"[a-zà-öø-ÿ'\-]{2,}", name)
+    return tokens[-1] if tokens else ""
+
+
 def build_connectivity(doclings: dict, parse_fn, min_key_length: int) -> dict[str, set[str]]:
     """
     Directed citation adjacency: source_docId -> set of target_docIds it
     cites. An edge requires the parsed reference's title AND at least one
-    author to match the same target document (fuzzy containment on
-    lowercased strings); keys shorter than `min_key_length` are skipped
-    as too ambiguous to match on.
+    author surname to match the same target document. Surname matching
+    (via _surname) bridges the format gap between parsed references
+    ('Last, First') and corpus metadata ('First Last'); keys shorter than
+    `min_key_length` are skipped as too ambiguous to match on.
 
     `parse_fn` is injected (raw_refs -> [{title, authors}]) so the LLM
     transport (Ollama today, Azure later) is swappable and the matching
@@ -289,9 +329,36 @@ def build_connectivity(doclings: dict, parse_fn, min_key_length: int) -> dict[st
 
     adjacency: dict[str, set[str]] = {doc_id: set() for doc_id in doclings}
 
+    # GROBID (extract.py) already ships structured {title, authors} refs in
+    # parsedReferences — use them directly. Only docs missing them (extracted
+    # before the GROBID integration, or while the server was down) go through
+    # the LLM parse, fired in parallel since each call is independent I/O.
+    parsed_map: dict[str, list[dict]] = {}
+    needs_llm: dict[str, list[str]] = {}
     for doc_id, entry in doclings.items():
-        parsed = parse_fn(entry.get("references", []))
+        pre_parsed = entry.get("parsedReferences") or []
+        raw_refs   = entry.get("references") or []
+        if pre_parsed:
+            parsed_map[doc_id] = pre_parsed
+        elif raw_refs:
+            needs_llm[doc_id] = raw_refs
+        else:
+            parsed_map[doc_id] = []
 
+    if needs_llm:
+        with ThreadPoolExecutor() as executor:
+            futures = {
+                executor.submit(parse_fn, refs): doc_id
+                for doc_id, refs in needs_llm.items()
+            }
+            for future in as_completed(futures):
+                doc_id = futures[future]
+                try:
+                    parsed_map[doc_id] = future.result()
+                except Exception:
+                    parsed_map[doc_id] = []
+
+    for doc_id, parsed in parsed_map.items():
         for ref in parsed:
             ref_title = (ref.get("title") or "").strip().lower()
             ref_authors = [a.strip().lower() for a in ref.get("authors", []) if a.strip()]
@@ -306,13 +373,19 @@ def build_connectivity(doclings: dict, parse_fn, min_key_length: int) -> dict[st
             if not title_candidates:
                 continue
 
+            ref_surnames = {s for s in (_surname(a) for a in ref_authors) if s}
+
             for target_id in title_candidates:
                 target_authors = {a for a, ids in author_lookup.items() if target_id in ids}
-                if not target_authors:
-                    continue
-                if any(ra == ta or ra in ta or ta in ra
-                       for ra in ref_authors for ta in target_authors):
-                    adjacency[doc_id].add(target_id)
+                target_surnames = {s for s in (_surname(a) for a in target_authors) if s}
+                # If the corpus doc has no extracted authors we can't verify via
+                # author matching — accept the title match alone rather than
+                # silently dropping the edge. If both sides have authors,
+                # require at least one surname in common.
+                if target_surnames and ref_surnames:
+                    if not (ref_surnames & target_surnames):
+                        continue
+                adjacency[doc_id].add(target_id)
 
     return adjacency
 
