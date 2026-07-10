@@ -1,0 +1,57 @@
+/**
+ * test_chunking.js — inspect chunking quality from an existing embedding store
+ *
+ * Reads tests/test-output/embeddings.json and prints per-chunk statistics.
+ * Does NOT re-embed — run test_embed.js first.
+ *
+ * Run:  node tests/test_chunking.js
+ *
+ * Prerequisite: tests/test-output/embeddings.json (produced by test_embed.js)
+ */
+
+import 'dotenv/config';
+import fs from 'fs/promises';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const ROOT      = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const TEST_DATA = path.join(ROOT, 'tests', 'test-output');
+
+const start = Date.now();
+
+const store  = JSON.parse(await fs.readFile(path.join(TEST_DATA, 'embeddings.json'), 'utf-8'));
+const chunks = store.chunks || [];
+
+const byDoc = new Map();
+for (const c of chunks) {
+  if (!byDoc.has(c.docId)) byDoc.set(c.docId, []);
+  byDoc.get(c.docId).push(c);
+}
+
+const wordCounts  = chunks.map((c) => (c.text.match(/\S+/g) || []).length);
+const avgWords    = wordCounts.reduce((s, w) => s + w, 0) / Math.max(chunks.length, 1);
+const oversized   = wordCounts.filter((w) => w > 220).length;
+const tableChunks = chunks.filter((c) => c.chunkType === 'table').length;
+const withHeading = chunks.filter((c) => c.heading && c.heading !== 'Table').length;
+
+console.log('[test_chunking] Chunking stats:');
+console.log(`  ${chunks.length} chunks across ${byDoc.size} docs (model ${store.metadata.model}, ${store.metadata.dimensions}-dim)`);
+console.log(`  types: ${chunks.length - tableChunks} text, ${tableChunks} table`);
+console.log(`  heading coverage: ${withHeading}/${chunks.length} (${(100 * withHeading / Math.max(chunks.length, 1)).toFixed(0)}%)`);
+console.log(`  avg ${avgWords.toFixed(0)} words/chunk`);
+for (const [, docChunks] of byDoc) {
+  console.log(`    ${docChunks[0].filename}: ${docChunks.length} chunks`);
+}
+if (oversized > 0) {
+  console.warn(`  WARNING: ${oversized} chunk(s) exceed ~220 words — MiniLM truncates ~256 word-piece`);
+  console.warn('           tokens, so their tails are NOT embedded. Lower CHUNK_SIZE (~200) in .env.');
+}
+
+const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+await fs.appendFile(
+  path.join(ROOT, 'tests', 'test_log.txt'),
+  `[${ts}] test_chunking            : ${elapsed}s\n`,
+  'utf-8',
+);
+console.log(`\nDone in ${elapsed}s.`);
