@@ -23,10 +23,10 @@
  */
 
 const DEFAULTS = {
-  chunkSize: 180,     // target words per chunk
-  overlap: 30,        // words of overlap between consecutive chunks of the same section
-  minSectionMerge: 60, // sections shorter than this (words) get merged with neighbors
-  maxTableWords: 300, // tables longer than this are truncated, not split
+  chunkSize: process.env.CHUNK_SIZE ? parseInt(process.env.CHUNK_SIZE) : 180,
+  overlap:   process.env.CHUNK_OVERLAP ? parseInt(process.env.CHUNK_OVERLAP) : 20,
+  minSectionMerge: 60,
+  maxTableWords: 300
 };
 
 // ---------------------------------------------------------------------------

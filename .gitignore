@@ -4,4 +4,5 @@ uploads/
 # Transformers.js caches downloaded model weights
 .cache/
 /tests/test-input
-/tests/test-output
+/tests/test-output.venv/
+__pycache__/

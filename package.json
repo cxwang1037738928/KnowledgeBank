@@ -2,11 +2,21 @@
   "name": "bookwyrm",
   "version": "1.0.0",
   "description": "Intelligent document retrieval with RAG and cosine similarity search",
-  "main": "src/server.js",
+  "main": "backend/server.js",
   "type": "module",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "start": "node backend/server.js",
+    "dev": "node --watch backend/server.js",
+    "install:py": ".venv\\Scripts\\python.exe -m pip install -r backend/extraction/requirements.txt",
+    "test:clean": "node tests/test_cleaning.js",
+    "test:extract": "node tests/test_extract.js",
+    "test:embed": "node tests/test_embed.js",
+    "test:chunking": "node tests/test_chunking.js",
+    "test:generate-categories": "node tests/test_generate_categories.js",
+    "test:heuristic": "node tests/test_heuristic.js",
+    "test:bootstrap": "node tests/test_bootstrap.js",
+    "test:build-graph": "node tests/test_build_graph.js",
+    "test:pipeline": "node tests/test_extract.js && node tests/test_embed.js && node tests/test_generate_categories.js && node tests/test_heuristic.js && node tests/test_bootstrap.js && node tests/test_build_graph.js"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.2",
