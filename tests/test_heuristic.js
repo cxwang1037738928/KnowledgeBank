@@ -35,7 +35,7 @@ const i    = argv.indexOf('--k');
 const k    = i !== -1 ? argv[i + 1] : '5';
 
 const start = Date.now();
-console.log(`[test_heuristic] Spawning heuristic.py --k ${k} (${PYTHON}, citation parsing via Ollama) ...\n`);
+console.log(`[test_heuristic] Spawning heuristic.py --k ${k} (${PYTHON}; GROBID parsedReferences, Ollama only as legacy fallback) ...\n`);
 
 await new Promise((resolve, reject) => {
   const proc = spawn(PYTHON, [HEURISTIC_PY, '--k', k], { stdio: 'inherit', cwd: ROOT });

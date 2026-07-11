@@ -45,6 +45,8 @@ process.env.ENHANCED_DIR        = path.join(TEST_DATA, 'enhanced');
 
 await fs.mkdir(TEST_OUTPUT, { recursive: true });
 
+const start = Date.now();
+
 // ---- Run extract.py --------------------------------------------------------
 
 const PYTHON = process.env.PYTHON || 'python';
@@ -66,6 +68,15 @@ await new Promise((resolve, reject) => {
 
 const { annotateDois } = await import('../backend/extraction/doi_regex.js');
 await annotateDois();
+
+// ---- Overlay Crossref metadata for DOI'd docs (network; never fatal) ---------
+
+const { enrichDoclings } = await import('../backend/extraction/search_doi.js');
+try {
+  await enrichDoclings();
+} catch (err) {
+  console.warn(`[test_extract] Crossref enrichment skipped: ${err.message}`);
+}
 
 // ---- Write per-doc .txt files ----------------------------------------------
 
@@ -144,4 +155,12 @@ if (withTitle < entries.length || withAuthors < entries.length) {
   console.warn('           PageRank degrades toward uniform. Check _extract_metadata in extract.py.');
 }
 
-console.log('\nDone. Run test_categories.js next.');
+const elapsed = ((Date.now() - start) / 1000).toFixed(2);
+const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+await fs.appendFile(
+  path.join(ROOT, 'tests', 'test_log.txt'),
+  `[${ts}] test_extract             : ${elapsed}s\n`,
+  'utf-8',
+);
+
+console.log(`\nDone in ${elapsed}s. Run test_embed.js next.`);
