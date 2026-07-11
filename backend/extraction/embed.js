@@ -79,8 +79,21 @@ export async function embedAll({ force = false } = {}) {
     } catch { /* first run */ }
   }
 
-  const existingDocIds = new Set(existing.chunks.map((c) => c.docId));
-  const toProcess = force ? docIds : docIds.filter((id) => !existingDocIds.has(id));
+  // A doc is "already embedded" only if its chunks are NEWER than its
+  // extraction — a re-extract (force) followed by a non-force embed used to
+  // silently keep embeddings of the old text. Compare timestamps, not just
+  // presence.
+  const newestChunkAt = new Map();
+  for (const c of existing.chunks) {
+    const t = Date.parse(c.ingestedAt) || 0;
+    if (t > (newestChunkAt.get(c.docId) || 0)) newestChunkAt.set(c.docId, t);
+  }
+  const isFresh = (id) => {
+    if (!newestChunkAt.has(id)) return false;
+    const extractedAt = Date.parse(doclings[id].extractedAt) || 0;
+    return newestChunkAt.get(id) >= extractedAt;
+  };
+  const toProcess = force ? docIds : docIds.filter((id) => !isFresh(id));
 
   if (toProcess.length === 0) {
     console.log('[embed] All documents already embedded. Use --force to re-embed.');

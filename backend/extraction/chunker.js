@@ -24,7 +24,9 @@
 
 const DEFAULTS = {
   chunkSize: process.env.CHUNK_SIZE ? parseInt(process.env.CHUNK_SIZE) : 180,
-  overlap:   process.env.CHUNK_OVERLAP ? parseInt(process.env.CHUNK_OVERLAP) : 20,
+  // 30 matches embed.js's fallback — the two defaults silently disagreed
+  // (20 vs 30), masked only because .env sets CHUNK_OVERLAP explicitly.
+  overlap:   process.env.CHUNK_OVERLAP ? parseInt(process.env.CHUNK_OVERLAP) : 30,
   minSectionMerge: 60,
   maxTableWords: 300
 };
