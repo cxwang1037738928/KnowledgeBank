@@ -37,6 +37,7 @@ Dependencies: networkx, requests (pip install networkx requests).
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from functools import partial
@@ -84,7 +85,11 @@ KEYWORDS_N          = int(os.environ.get("KEYWORDS_N", "20"))
 
 _REF_HEADINGS = frozenset({"references", "bibliography", "works cited", "literature cited", "citations"})
 
-MIN_KEY_LENGTH   = 4    # skip title/author match keys shorter than this, short author last names causes over matching
+MIN_KEY_LENGTH      = 4   # skip title/author match keys shorter than this, short author last names causes over matching
+MIN_CONTAINED_TITLE = 15  # proper title containment (one inside the other) only
+                          # counts when the contained title has at least this many
+                          # chars — blocks short generic titles ('networks') from
+                          # matching every longer title that mentions the word
 REF_BATCH_SIZE   = 10   # references per LLM parsing call — small on purpose: a
                         # 3b model given 50 refs at once overflows both the
                         # context window and the output budget, truncating the
@@ -110,11 +115,19 @@ def run(k: int = K) -> None:
     filenames = {d: doclings[d]["filename"] for d in doc_ids}
 
     # Tokenize body text only — exclude reference sections so author names and
-    # cited-paper titles don't inflate keyword scores.
+    # cited-paper titles don't inflate keyword scores. Headings are normalized
+    # first ('7. References', 'REFERENCES.' → 'references') — an exact-string
+    # check silently let numbered bibliography headings through, leaking
+    # rare-author-name tokens into BM25 novelty and cluster keywords.
+    def _norm_heading(text: str) -> str:
+        t = text.lower().strip()
+        t = re.sub(r'^[\divxlc]+[\.\)]?\s+', '', t)   # '7. ' / 'vii. ' / '7) '
+        return t.rstrip(' .:')
+
     def _body_text(entry: dict) -> str:
         sections = entry.get("sections", [])
         body = [s["text"] for s in sections
-                if s.get("heading", "").lower().strip() not in _REF_HEADINGS
+                if _norm_heading(s.get("heading", "")) not in _REF_HEADINGS
                 and (s.get("text") or "").strip()]
         return " ".join(body) if body else entry.get("text", "")
 
@@ -163,7 +176,8 @@ def run(k: int = K) -> None:
         parse_references_ollama,
         ollama_url=OLLAMA_URL, model=CITATION_MODEL, batch_size=REF_BATCH_SIZE,
     )
-    adjacency = build_connectivity(doclings, parse_fn, min_key_length=MIN_KEY_LENGTH)
+    adjacency = build_connectivity(doclings, parse_fn, min_key_length=MIN_KEY_LENGTH,
+                                   min_contained_length=MIN_CONTAINED_TITLE)
 
     edges = [{"source": src, "target": tgt}
              for src, targets in adjacency.items() for tgt in targets]

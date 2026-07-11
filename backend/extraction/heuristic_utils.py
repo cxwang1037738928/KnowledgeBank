@@ -18,6 +18,7 @@ Contents:
 import json
 import math
 import re
+import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -100,7 +101,9 @@ def top_terms(bm25: BM25, n: int) -> list[str]:
     for tf in bm25.tf_per_doc:
         for term in tf.keys():
             term_scores[term] += bm25.idf(term)
-    return [t for t, _ in sorted(term_scores.items(), key=lambda x: -x[1])[:n]]
+    # Secondary alphabetical key so ties at the top-n cutoff resolve the same
+    # way every run (dict/set iteration order is hash-seed dependent).
+    return [t for t, _ in sorted(term_scores.items(), key=lambda x: (-x[1], x[0]))[:n]]
 
 
 def cluster_keywords(member_token_lists: list[list[str]], bm25: BM25,
@@ -119,10 +122,14 @@ def cluster_keywords(member_token_lists: list[list[str]], bm25: BM25,
     for tokens in member_token_lists:
         unique = set(tokens)
         if per_doc_cap is not None and len(unique) > per_doc_cap:
-            unique = set(sorted(unique, key=lambda t: -bm25.idf(t))[:per_doc_cap])
+            # (-idf, term): the term tiebreak makes the per-doc cap pick the
+            # same terms every run when several share an IDF at the cutoff.
+            unique = set(sorted(unique, key=lambda t: (-bm25.idf(t), t))[:per_doc_cap])
         for term in unique:
             scores[term] += bm25.idf(term)
-    return [t for t, _ in sorted(scores.items(), key=lambda x: -x[1])[:n]]
+    # Alphabetical tiebreak on the final cutoff too — without it the keyword
+    # set (and thus representativeness) varies run-to-run on IDF ties.
+    return [t for t, _ in sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:n]]
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +212,13 @@ def percentile_normalize(scores: dict[str, float]) -> dict[str, float]:
     max-normalization because heavy-tailed signals (PageRank especially)
     compress everyone but the top outlier toward zero under score/max,
     erasing the blend weights for the bulk of the corpus.
+
+    Tied raw scores receive the AVERAGE of the ranks they span (fractional
+    ranking). Without this, docs tied at PageRank's teleport floor were
+    spread across 0..k/(n-1) by dict insertion order — an arbitrary and
+    ranking-distorting tiebreak at 75% blend weight. Values are compared
+    after rounding to 12 decimals so float noise from iterative solvers
+    doesn't split a genuine tie.
     """
     if not scores:
         return {}
@@ -212,7 +226,18 @@ def percentile_normalize(scores: dict[str, float]) -> dict[str, float]:
     n = len(ordered)
     if n == 1:
         return {ordered[0][0]: 1.0}
-    return {doc_id: i / (n - 1) for i, (doc_id, _) in enumerate(ordered)}
+
+    out: dict[str, float] = {}
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and round(ordered[j + 1][1], 12) == round(ordered[i][1], 12):
+            j += 1
+        avg_rank = (i + j) / 2
+        for k in range(i, j + 1):
+            out[ordered[k][0]] = avg_rank / (n - 1)
+        i = j + 1
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -301,33 +326,106 @@ def _surname(name: str) -> str:
     return tokens[-1] if tokens else ""
 
 
-def build_connectivity(doclings: dict, parse_fn, min_key_length: int) -> dict[str, set[str]]:
+def _norm_title(s: str) -> str:
+    """Normalize a title for containment matching: lowercase, fold all
+    punctuation/hyphens to single spaces, collapse whitespace. So
+    'BERT: Pre-training…' and 'BERT Pre training …' compare equal, and
+    double-spaced OCR titles ('ON  COMPUTABLE  NUMBERS') normalize cleanly."""
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
+
+
+def _norm_doi(doi: str) -> str:
+    """Normalize a DOI for exact comparison: lowercase (DOIs are
+    case-insensitive), strip a URL / 'doi:' prefix and trailing punctuation.
+    So 'https://doi.org/10.3762/BJOC.19.8' and '10.3762/bjoc.19.8' compare
+    equal."""
+    d = doi.strip().lower()
+    d = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", d)
+    return d.strip().rstrip(".")
+
+
+def _titles_match(key: str, ref_title: str, min_contained: int) -> bool:
+    """Bidirectional title containment with a length guard on the CONTAINED
+    side. Exact equality always matches. Proper containment only matches when
+    the contained string is at least `min_contained` chars — otherwise a short
+    generic title ('networks') spuriously hits every longer title containing
+    that word. The guard is an absolute length, not a percentage: the reverse
+    direction exists to let a clean short reference title match a corpus title
+    polluted with prefixed boilerplate, where the real title may be a small
+    fraction of the stored string."""
+    if key == ref_title:
+        return True
+    if key in ref_title and len(key) >= min_contained:
+        return True
+    if ref_title in key and len(ref_title) >= min_contained:
+        return True
+    return False
+
+
+def build_connectivity(doclings: dict, parse_fn, min_key_length: int,
+                       min_contained_length: int = 15) -> dict[str, set[str]]:
     """
     Directed citation adjacency: source_docId -> set of target_docIds it
-    cites. An edge requires the parsed reference's title AND at least one
-    author surname to match the same target document. Surname matching
-    (via _surname) bridges the format gap between parsed references
-    ('Last, First') and corpus metadata ('First Last'); keys shorter than
-    `min_key_length` are skipped as too ambiguous to match on.
+    cites. Edges are found in two phases, unioned together:
 
-    `parse_fn` is injected (raw_refs -> [{title, authors}]) so the LLM
-    transport (Ollama today, Azure later) is swappable and the matching
+      Phase 1 — exact DOI match (highest confidence). Crossref reference
+        lists (search_doi.js -> crossrefReferences) carry each cited work's
+        DOI; when it equals another corpus document's DOI the edge is
+        certain, needing no title/author agreement.
+      Phase 2 — fuzzy title match (fallback). For references without a
+        resolvable DOI, the parsed reference's title must match a target by
+        bidirectional containment (via _titles_match: exact equality, or
+        proper containment where the contained side is at least
+        `min_contained_length` chars) AND — when both sides have extracted
+        authors — share at least one author surname (via _surname, which
+        bridges 'Last, First' vs 'First Last'). Keys shorter than
+        `min_key_length` are skipped as too ambiguous.
+
+    Both phases degrade gracefully: a doc with no crossrefReferences simply
+    contributes nothing in phase 1 and relies on phase 2; a doc with no DOI
+    can still be a phase-2 target. `parse_fn` is injected (raw_refs ->
+    [{title, authors}]) so the LLM transport is swappable and the matching
     logic is testable without a model.
     """
     title_lookup: dict[str, str] = {}
     author_lookup: dict[str, set[str]] = defaultdict(set)
+    doi_lookup: dict[str, str] = {}
 
     for doc_id, entry in doclings.items():
         meta = entry.get("metadata", {})
-        title = (meta.get("title") or "").strip().lower()
+        title = _norm_title(meta.get("title") or "")
         if title and len(title) >= min_key_length:
-            title_lookup[title] = doc_id
+            if title in title_lookup:
+                # Two corpus docs normalize to the same title (e.g. arXiv +
+                # published version). Keep the first deterministically; edges
+                # will only ever point at that one.
+                print(f"[heuristic] WARNING: duplicate corpus title {title!r} — "
+                      f"keeping {title_lookup[title]}, ignoring {doc_id} as a citation target",
+                      file=sys.stderr)
+            else:
+                title_lookup[title] = doc_id
         for author in (meta.get("authors") or []):
             a = author.strip().lower()
             if a and len(a) >= min_key_length:
                 author_lookup[a].add(doc_id)
+        doi = _norm_doi(meta.get("doi") or "")
+        if doi:
+            doi_lookup[doi] = doc_id
 
     adjacency: dict[str, set[str]] = {doc_id: set() for doc_id in doclings}
+
+    # --- Phase 1: exact DOI matching -----------------------------------------
+    # Crossref reference DOIs that resolve to a corpus document are certain
+    # citations. References without a resolvable DOI fall through to the fuzzy
+    # title phase below; the two edge sets are unioned in `adjacency`.
+    for doc_id, entry in doclings.items():
+        for ref in (entry.get("crossrefReferences") or []):
+            ref_doi = _norm_doi(ref.get("doi") or "")
+            if not ref_doi:
+                continue
+            target_id = doi_lookup.get(ref_doi)
+            if target_id and target_id != doc_id:
+                adjacency[doc_id].add(target_id)
 
     # GROBID (extract.py) already ships structured {title, authors} refs in
     # parsedReferences — use them directly. Only docs missing them (extracted
@@ -358,17 +456,25 @@ def build_connectivity(doclings: dict, parse_fn, min_key_length: int) -> dict[st
                 except Exception:
                     parsed_map[doc_id] = []
 
+    # --- Phase 2: fuzzy title matching (fallback) ----------------------------
     for doc_id, parsed in parsed_map.items():
         for ref in parsed:
-            ref_title = (ref.get("title") or "").strip().lower()
+            ref_title = _norm_title(ref.get("title") or "")
             ref_authors = [a.strip().lower() for a in ref.get("authors", []) if a.strip()]
 
             if not ref_title or len(ref_title) < min_key_length:
                 continue
 
+            # Bidirectional containment: match when the corpus title is inside
+            # the reference title OR vice-versa (see _titles_match). The
+            # reverse direction rescues targets whose stored title carries
+            # extra text (e.g. a copyright banner GROBID glued onto the real
+            # title); the contained-side length guard stops short generic
+            # titles ('networks') from hitting every longer title.
             title_candidates = {
                 target_id for key, target_id in title_lookup.items()
-                if target_id != doc_id and key in ref_title
+                if target_id != doc_id
+                and _titles_match(key, ref_title, min_contained_length)
             }
             if not title_candidates:
                 continue
