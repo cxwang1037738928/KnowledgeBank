@@ -18,8 +18,10 @@ Output: data/doclings.json  — dict keyed by docId, each entry holds:
   parsedReferences : [{title, authors, raw}] structured refs (GROBID CRF) —
                      lets heuristic.py skip its LLM reference-parsing pass
   metadata         : {title, authors, abstract} (GROBID header model;
-                     docling/LLM fallback), plus doi added later by
-                     doi_regex.js
+                     docling/LLM fallback; abstract falls back to the first
+                     200 words of body text as a last resort — Crossref
+                     enrichment overwrites it when a real abstract exists),
+                     plus doi added later by doi_regex.js
 """
 
 import json
@@ -784,6 +786,20 @@ def convert_document(doc_meta: dict) -> dict:
         title    = title    or fb.get("title")
         authors  = authors  or fb.get("authors") or []
         abstract = abstract or fb.get("abstract")
+
+    # Last-resort abstract: first 200 words of body text, persisted so every
+    # downstream consumer (clustering, category descriptions, bootstrap
+    # queries) sees the same fallback instead of each re-deriving it. Crossref
+    # enrichment (search_doi.js) runs later and overwrites this whenever it
+    # has a real abstract. Title deliberately gets NO body-text fallback: the
+    # citation graph matches titles by containment, and a long snippet posing
+    # as a title would fabricate edges.
+    if not abstract:
+        snippet = " ".join(full_text.split()[:200])
+        if snippet:
+            abstract = snippet
+            print("[extract]   no abstract found — using first 200 words of body text",
+                  file=sys.stderr)
 
     metadata = {"title": title, "authors": authors, "abstract": abstract}
 
