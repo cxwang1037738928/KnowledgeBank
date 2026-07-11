@@ -33,6 +33,18 @@ from datetime import datetime, timezone
 
 import requests
 
+# Force UTF-8 on our own console streams. Windows defaults stdout/stderr to
+# cp1252, so a single "→" (or any non-Latin-1 char in a title/filename) raises
+# UnicodeEncodeError mid-print. When that print sits inside the per-document
+# try/except below, the already-converted doc gets misfiled as an extraction
+# error, corrupting extract_report.json. Reconfiguring here fixes the whole
+# class of bug rather than escaping individual characters.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # Paths (resolve relative to project root — two levels up from this file)
 # ---------------------------------------------------------------------------
@@ -57,10 +69,13 @@ EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "ministral:3b")
 METADATA_MODEL   = os.environ.get("METADATA_MODEL",   "ministral:3b")
 METADATA_WORDS   = int(os.environ.get("METADATA_WORDS", "800"))
 
-# GROBID server (CRF models — run the lightweight image, e.g.
-#   docker run -d -p 8070:8070 lfoppiano/grobid:0.8.0
+# GROBID server (CRF models — run the lightweight image):
+#   docker run -d --name grobid --restart unless-stopped -p 8070:8070 \
+#     -e JDK_JAVA_OPTIONS="-XX:-UseContainerSupport" lfoppiano/grobid:0.8.0
+# The JDK flag works around a cgroup-v2 NullPointerException that crash-loops
+# the container's JVM under newer Docker Desktop/WSL2 — keep it if recreating.
 # The full grobid/grobid image swaps in deep-learning models; we
-# deliberately use the CRF-only image for speed and low memory).
+# deliberately use the CRF-only image for speed and low memory.
 GROBID_URL     = os.environ.get("GROBID_URL", "http://localhost:8070")
 GROBID_TIMEOUT = int(os.environ.get("GROBID_TIMEOUT", "120"))
 
@@ -72,6 +87,20 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions, TesseractCliOcrOptions
 from docling_core.types.doc.labels import DocItemLabel
+
+# DOCLING_PAGE_BATCH: pages docling processes concurrently (its default is 4).
+# Each in-flight page holds its rasterized image + model tensors in RAM, so on
+# memory-tight machines a large scanned PDF OOMs the C++ preprocessor
+# (std::bad_alloc). Set 1 in .env to minimize peak memory; unset to keep
+# docling's default.
+_page_batch = os.environ.get("DOCLING_PAGE_BATCH", "").strip()
+if _page_batch:
+    try:
+        from docling.datamodel.settings import settings as _docling_settings
+        _docling_settings.perf.page_batch_size = max(1, int(_page_batch))
+        print(f"[extract] docling page_batch_size={_docling_settings.perf.page_batch_size}")
+    except Exception as exc:
+        print(f"[extract] could not set DOCLING_PAGE_BATCH: {exc}", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Converters (built once, reused across documents)
@@ -100,7 +129,7 @@ def _choose_converter(doc_meta: dict) -> DocumentConverter:
     report_path = ENHANCED_DIR / f"{doc_id}.json"
     if report_path.exists():
         try:
-            report = json.loads(report_path.read_text())
+            report = json.loads(report_path.read_text(encoding='utf-8'))
             pages = report.get("pages", [])
             scanned = sum(1 for p in pages if p.get("pageType") != "digital")
             if pages and scanned / len(pages) < 0.3:
@@ -122,7 +151,7 @@ def _extract_sections(doc) -> list[dict]:
 
     for item, _ in doc.iterate_items():
         label = getattr(item, "label", None)
-        text  = getattr(item, "text", "").strip()
+        text  = (getattr(item, "text", "") or "").strip()
         if not text:
             continue
 
@@ -243,13 +272,35 @@ _NOT_TITLE_RE = re.compile(
 )
 
 
-def _llm_extract_metadata(sections: list[dict]) -> dict | None:
+def _clean_boilerplate_title(title: str) -> str | None:
+    """Strip leading copyright/publisher boilerplate sentences from a title.
+
+    GROBID's header model sometimes glues a first-page banner onto the real
+    title (the Attention Is All You Need PDF prepends 'Provided proper
+    attribution is provided, Google hereby grants permission…'). A polluted
+    title poisons everything downstream: it is prefixed into every chunk's
+    embedding, embedded into the category vector, printed in prompts, and
+    used as the citation-matching key. Split on sentence boundaries and drop
+    leading sentences that match the boilerplate patterns; only matching
+    segments are dropped, so titles that merely contain '. ' are safe.
+    Returns None when nothing survives (caller falls back to other sources).
+    """
+    parts = re.split(r'(?<=[.!?])\s+', title.strip())
+    while parts and _NOT_TITLE_RE.match(parts[0]):
+        parts.pop(0)
+    cleaned = " ".join(parts).strip()
+    return cleaned or None
+
+
+def _llm_extract_metadata(sections: list[dict], need_authors: bool = True) -> dict | None:
     """Extract title, authors, and abstract from the first few sections.
 
     Title and abstract are extracted structurally (deterministic).  Small LLMs
     are unreliable at answering "is this first heading the title?", so we don't
     ask them — we just take the first non-skip, non-publisher heading.  Authors
     are harder to separate from affiliations, so the LLM handles those alone.
+    Pass need_authors=False to skip the Ollama call when the caller already
+    has authors from a better source (GROBID) and only needs title/abstract.
     """
     if not sections:
         return None
@@ -277,12 +328,13 @@ def _llm_extract_metadata(sections: list[dict]) -> dict | None:
     # the model isn't distracted by also finding title / abstract.
     authors: list[str] = []
     candidate_parts: list[str] = []
-    for s in sections[:5]:
-        text = (s.get("text") or "").strip()
-        if text:
-            candidate_parts.append(" ".join(text.split()[:300]))
-            if len(candidate_parts) >= 2:
-                break
+    if need_authors:
+        for s in sections[:5]:
+            text = (s.get("text") or "").strip()
+            if text:
+                candidate_parts.append(" ".join(text.split()[:300]))
+                if len(candidate_parts) >= 2:
+                    break
 
     if candidate_parts:
         combined = "\n".join(candidate_parts)
@@ -602,7 +654,8 @@ def _grobid_header(pdf_path: str) -> dict | None:
     except (requests.RequestException, ET.ParseError):
         return None
 
-    title = _tei_text(root.find(".//tei:titleStmt/tei:title", _TEI_NS)) or None
+    raw_title = _tei_text(root.find(".//tei:titleStmt/tei:title", _TEI_NS))
+    title = _clean_boilerplate_title(raw_title) if raw_title else None
 
     authors = []
     for author in root.findall(
@@ -705,16 +758,32 @@ def convert_document(doc_meta: dict) -> dict:
     full_text = doc.export_to_text()
     sections  = _extract_sections(doc)
 
-    # Metadata + references: GROBID (CRF) is the primary parser; the
-    # docling/LLM heuristics only fill in when the server is down or a
-    # field/section comes back empty.
+    # Metadata: GROBID (CRF) is the primary parser, merged PER FIELD — a
+    # partial GROBID header (e.g. title but authors=[]) still gets its gaps
+    # filled by the structural/LLM path, then by docling labels. The old
+    # all-or-nothing fallback kept empty GROBID fields even when the
+    # fallbacks could recover them (Turing/Shannon authors).
     if grobid is None:
         print("[extract]   GROBID unreachable — falling back to docling/LLM parsing",
               file=sys.stderr)
 
-    metadata = (grobid or {}).get("metadata")
-    if metadata is None:
-        metadata = _llm_extract_metadata(sections) or _extract_metadata(doc)
+    grobid_meta = (grobid or {}).get("metadata") or {}
+    title    = grobid_meta.get("title")
+    authors  = grobid_meta.get("authors") or []
+    abstract = grobid_meta.get("abstract")
+
+    if not (title and authors and abstract):
+        fb = _llm_extract_metadata(sections, need_authors=not authors) or {}
+        title    = title    or fb.get("title")
+        authors  = authors  or fb.get("authors") or []
+        abstract = abstract or fb.get("abstract")
+    if not (title and authors and abstract):
+        fb = _extract_metadata(doc)
+        title    = title    or fb.get("title")
+        authors  = authors  or fb.get("authors") or []
+        abstract = abstract or fb.get("abstract")
+
+    metadata = {"title": title, "authors": authors, "abstract": abstract}
 
     refs        = (grobid or {}).get("references") or []
     parsed_refs = (grobid or {}).get("parsedReferences") or []
@@ -741,7 +810,7 @@ def run(force: bool = False) -> None:
         print(f"[extract] {DOCUMENTS_META} not found — run the ingest API first.", file=sys.stderr)
         sys.exit(1)
 
-    docs_meta = json.loads(DOCUMENTS_META.read_text()).get("documents", {})
+    docs_meta = json.loads(DOCUMENTS_META.read_text(encoding='utf-8')).get("documents", {})
     if not docs_meta:
         print("[extract] No documents in documents.json. Nothing to do.")
         return
@@ -753,21 +822,26 @@ def run(force: bool = False) -> None:
         except (json.JSONDecodeError, ValueError):
             existing = {}
 
-    results = dict(existing)
-    errors  = []
+    results   = dict(existing)
+    extracted = []
+    skipped   = 0
+    errors    = []
 
     for doc_id, meta in docs_meta.items():
         if not force and doc_id in existing:
             print(f"[extract] Skipping {meta['filename']} (already extracted)")
+            skipped += 1
             continue
 
         if meta.get("status") not in ("completed", "pending", None):
             print(f"[extract] Skipping {meta['filename']} (status={meta.get('status')})")
+            skipped += 1
             continue
 
         print(f"[extract] Processing {meta['filename']} ...")
         try:
             results[doc_id] = convert_document(meta)
+            extracted.append(doc_id)
             print(f"[extract]   → {len(results[doc_id]['sections'])} sections, "
                   f"{len(results[doc_id]['references'])} references")
         except Exception as exc:
@@ -777,6 +851,19 @@ def run(force: bool = False) -> None:
     DOCLINGS_OUT.parent.mkdir(parents=True, exist_ok=True)
     DOCLINGS_OUT.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f"[extract] Wrote {len(results)} documents to {DOCLINGS_OUT}")
+
+    # Per-run summary for the API: doclings.json can't distinguish "extracted
+    # this run" from historical entries, and failed docs never appear in it
+    # at all — the /extract route used to report errors:[] unconditionally.
+    report = {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "force":       force,
+        "extracted":   extracted,
+        "skipped":     skipped,
+        "errors":      errors,
+    }
+    (DATA_DIR / "extract_report.json").write_text(
+        json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
 
     if errors:
         print(f"[extract] {len(errors)} error(s):", file=sys.stderr)
