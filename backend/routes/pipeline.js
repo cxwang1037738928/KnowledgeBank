@@ -26,6 +26,7 @@ import { spawn }  from 'child_process';
 import { Router } from 'express';
 
 import { annotateDois }       from '../extraction/doi_regex.js';
+import { enrichDoclings }     from '../extraction/search_doi.js';
 import { embedAll }           from '../extraction/embed.js';
 import { generateCategories } from '../extraction/generate_categories.js';
 import { bootstrapQueries }   from '../extraction/bootstrap_queries.js';
@@ -224,21 +225,23 @@ pipelineRouter.post('/extract', wrap(async (req, res) => {
   // Stamp metadata.doi on every extracted document (regex over the doc head)
   await annotateDois();
 
-  // Read the written file to build the summary
-  let doclings = {};
+  // Overlay Crossref metadata for DOI'd docs (network; never fatal)
   try {
-    doclings = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'doclings.json'), 'utf-8'));
-  } catch { /* extract.py may have written nothing if no docs */ }
+    await enrichDoclings();
+  } catch (err) {
+    console.warn(`[pipeline] Crossref enrichment skipped: ${err.message}`);
+  }
 
-  const entries = Object.values(doclings);
-  const errors  = entries.filter(e => e.error).map(e => ({
-    docId: e.docId, filename: e.filename, error: e.error,
-  }));
+  // extract.py writes a per-run summary — doclings.json alone can't
+  // distinguish this run's work from historical entries, and failed docs
+  // never appear in it (the old code here reported errors: [] always).
+  const report = JSON.parse(
+    await fs.readFile(path.join(DATA_DIR, 'extract_report.json'), 'utf-8'));
 
   res.json({
-    extracted: entries.length - errors.length,
-    skipped:   0,       // extract.py logs skips to stdout; reflected in --force flag
-    errors,
+    extracted: report.extracted.length,
+    skipped:   report.skipped,
+    errors:    report.errors,
   });
 }));
 
@@ -486,7 +489,9 @@ pipelineRouter.post('/build-graph', wrap(async (req, res) => {
 
 pipelineRouter.post('/run', wrap(async (req, res) => {
   const {
-    threshold   = 0.75,
+    // Same default the tests use: CLUSTER_SIMILARITY from .env is the single
+    // source of truth, so API runs and test runs cluster identically.
+    threshold   = parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
     k           = 2,
     force       = false,
     perCategory = 8,
@@ -503,8 +508,21 @@ pipelineRouter.post('/run', wrap(async (req, res) => {
     const args = [EXTRACT_PY, ...(force ? ['--force'] : [])];
     await spawnAsync(PYTHON, args);
     await annotateDois();
-    const doclings = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'doclings.json'), 'utf-8'));
-    stages.extract = { ok: true, extracted: Object.keys(doclings).length };
+    try {
+      await enrichDoclings();
+    } catch (err) {
+      console.warn(`[pipeline] Crossref enrichment skipped: ${err.message}`);
+    }
+    const report = JSON.parse(
+      await fs.readFile(path.join(DATA_DIR, 'extract_report.json'), 'utf-8'));
+    // ok = the stage ran; per-document failures are reported in errors[]
+    // without aborting the run (the successful docs still flow downstream).
+    stages.extract = {
+      ok:        true,
+      extracted: report.extracted.length,
+      skipped:   report.skipped,
+      errors:    report.errors,
+    };
   } catch (err) {
     stages.extract = { ok: false, error: err.message };
     return res.json({ stages });
