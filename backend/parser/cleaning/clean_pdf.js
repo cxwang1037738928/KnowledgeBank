@@ -46,7 +46,11 @@ async function readMeta() {
 
 async function writeMeta(store) {
   await fs.mkdir(path.dirname(META_PATH), { recursive: true });
-  await fs.writeFile(META_PATH, JSON.stringify(store, null, 2), 'utf-8');
+  // Write-to-temp + rename: a crash mid-write can never leave a truncated
+  // documents.json behind (rename is atomic on the same volume).
+  const tmp = `${META_PATH}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(store, null, 2), 'utf-8');
+  await fs.rename(tmp, META_PATH);
 }
 
 // ---------------------------------------------------------------------------
@@ -311,15 +315,22 @@ export async function scanAndIngestDirectory() {
   const pdfs = entries.filter((f) => path.extname(f).toLowerCase() === '.pdf');
   if (pdfs.length === 0) return [];
 
-  const results = await Promise.allSettled(
-    pdfs.map((filename) => ingestDocument(path.join(DOCUMENTS_DIR, filename)))
-  );
-
-  return results.map((r, i) =>
-    r.status === 'fulfilled'
-      ? { filename: pdfs[i], ...r.value }
-      : { filename: pdfs[i], error: r.reason?.message ?? 'Unknown error' }
-  );
+  // Sequential on purpose. ingestDocument does read documents.json → add its
+  // record → write the whole file back; running these concurrently is a
+  // classic lost-update race — two ingests read the same snapshot and the
+  // second write erases the first one's record (and the duplicate-hash check
+  // races the same way). Ingestion is not a hot path: SHA-256 hashing
+  // dominates, so serializing costs little.
+  const results = [];
+  for (const filename of pdfs) {
+    try {
+      const value = await ingestDocument(path.join(DOCUMENTS_DIR, filename));
+      results.push({ filename, ...value });
+    } catch (err) {
+      results.push({ filename, error: err?.message ?? 'Unknown error' });
+    }
+  }
+  return results;
 }
 
 /**
