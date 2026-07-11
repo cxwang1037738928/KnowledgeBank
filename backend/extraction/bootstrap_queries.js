@@ -40,6 +40,7 @@ import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { tokenise, REF_HEADINGS, normHeading } from './regex_utils.js';
 
 const ROOT            = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR        = path.resolve(ROOT, process.env.DATA_DIR || 'data');
@@ -74,27 +75,15 @@ const capWords  = (s, n) => {
 };
 
 // ---------------------------------------------------------------------------
-// Tokenisation + IDF (mirrors heuristic.py so keywords agree across stages)
+// IDF over body text (tokenise/REF_HEADINGS/normHeading live in
+// regex_utils.js and mirror heuristic.py so keywords agree across stages)
 // ---------------------------------------------------------------------------
 
-const STOPWORDS = new Set([
-  'the','a','an','and','or','but','in','on','at','to','for','of','with',
-  'by','from','as','is','was','are','were','be','been','being','have',
-  'has','had','do','does','did','will','would','could','should','may',
-  'might','this','that','these','those','it','its','i','we','you','he',
-  'she','they','their','our','us','not','no','so','if','than','then',
-]);
-
-const REF_HEADINGS = new Set(['references', 'bibliography', 'works cited', 'literature cited', 'citations']);
-
-function tokenise(text) {
-  const tokens = (text.toLowerCase().match(/[a-z]+/g) || []);
-  return tokens.filter((t) => !STOPWORDS.has(t) && t.length > 2);
-}
-
 function bodyText(entry) {
+  // normHeading strips leading numbering ('7. References') so numbered
+  // bibliography headings don't leak reference text into the keyword pool.
   const sections = (entry?.sections || []).filter(
-    (s) => !REF_HEADINGS.has((s.heading || '').toLowerCase().trim()) && (s.text || '').trim()
+    (s) => !REF_HEADINGS.has(normHeading(s.heading)) && (s.text || '').trim()
   );
   return sections.length ? sections.map((s) => s.text).join(' ') : (entry?.text || '');
 }

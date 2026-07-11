@@ -1,0 +1,152 @@
+{
+  "10.3762/bjoc.19.36": {
+    "title": "Total synthesis: an enabling science",
+    "author": [
+      "Bastien Nay"
+    ],
+    "abstract": null,
+    "reference": [
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1186/1860-5397-3-29",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1186/1860-5397-3-30",
+        "raw": ""
+      },
+      {
+        "title": "The Logic of Chemical Synthesis",
+        "authors": [
+          "Corey"
+        ],
+        "doi": null,
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1021/acs.jmedchem.5b01409",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.31635/ccschem.019.20190006",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1002/anie.201007004",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1039/d0np00060d",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1039/c3np70051h",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1021/acs.orglett.6b01595",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1002/9783527634606",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1007/128_2010_79",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.19.15",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1002/anie.201911062",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.1002/9783527654628",
+        "raw": ""
+      }
+    ],
+    "citedBy": 4,
+    "fetchedAt": "2026-07-10T19:26:32.905Z"
+  },
+  "10.3762/bjoc.19.8": {
+    "title": "Organophosphorus chemistry: from model to application",
+    "author": [
+      "György Keglevich"
+    ],
+    "abstract": null,
+    "reference": [
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.18.160",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.18.123",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.18.139",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.18.154",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.18.127",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.18.157",
+        "raw": ""
+      },
+      {
+        "title": "",
+        "authors": [],
+        "doi": "10.3762/bjoc.19.4",
+        "raw": ""
+      }
+    ],
+    "citedBy": 1,
+    "fetchedAt": "2026-07-10T19:26:33.197Z"
+  }
+}

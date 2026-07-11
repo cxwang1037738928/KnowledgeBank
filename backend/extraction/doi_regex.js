@@ -9,7 +9,7 @@
  * full of OTHER papers' DOIs that must not be picked up.
  *
  * Exports:
- *   findDoi(text)   — first DOI in a string, cleaned, or null
+ *   findDoi(text)   — re-exported from regex_utils.js (pattern lives there)
  *   annotateDois()  — read doclings.json, set metadata.doi on every entry,
  *                     write it back; returns {docId: doi|null}
  *
@@ -20,31 +20,18 @@ import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { findDoi } from './regex_utils.js';
+
+export { findDoi };
 
 const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR      = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const DOCLINGS_PATH = path.join(DATA_DIR, 'doclings.json');
 
-// Crossref-recommended pattern: matches 98%+ of DOIs issued since 2000.
-// 10.<4-9 digit registrant>/<suffix of allowed characters>.
-const DOI_RE = /\b10\.\d{4,9}\/[-._;()/:a-zA-Z0-9]+/g;
-
 // How much of the document head to search. The paper's own DOI appears on
 // the first page (header, footer, or copyright block); anything deeper is
 // increasingly likely to be a cited work's DOI.
 const HEAD_CHARS = 5000;
-
-/**
- * First DOI found in `text`, or null. Trailing punctuation that regularly
- * glues onto DOIs in extracted text (sentence periods, closing parens) is
- * stripped from the match.
- */
-export function findDoi(text) {
-  if (!text) return null;
-  const match = text.match(DOI_RE);
-  if (!match) return null;
-  return match[0].replace(/[.,;)\]]+$/, '') || null;
-}
 
 /**
  * Annotate every doclings.json entry with metadata.doi (null when no DOI is
