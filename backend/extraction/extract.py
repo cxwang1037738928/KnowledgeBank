@@ -724,13 +724,21 @@ def _grobid_references(pdf_path: str) -> tuple[list[str], list[dict]] | None:
 
 
 def _grobid_extract(pdf_path: str) -> dict | None:
-    """Header + references in one call. None when the server is unreachable,
-    so convert_document can fall back to the docling/LLM path wholesale."""
+    """Header + references in one call. None when the server is unreachable
+    OR returned no usable content (e.g. an image-only scan — GROBID does not
+    OCR, so a PDF without a text layer yields an empty header and a 204 from
+    processReferences). Either way convert_document falls back to the
+    docling/LLM path wholesale."""
     if not _grobid_alive():
+        print("[extract]   GROBID server unreachable — falling back to docling/LLM parsing",
+              file=sys.stderr)
         return None
     header = _grobid_header(pdf_path)
     refs   = _grobid_references(pdf_path)
     if header is None and refs is None:
+        print("[extract]   GROBID returned no content (scanned PDF with no text "
+              "layer? GROBID does not OCR) — falling back to docling/LLM parsing",
+              file=sys.stderr)
         return None
     raw_refs, parsed = refs if refs is not None else ([], [])
     return {
@@ -767,10 +775,6 @@ def convert_document(doc_meta: dict) -> dict:
     # filled by the structural/LLM path, then by docling labels. The old
     # all-or-nothing fallback kept empty GROBID fields even when the
     # fallbacks could recover them (Turing/Shannon authors).
-    if grobid is None:
-        print("[extract]   GROBID unreachable — falling back to docling/LLM parsing",
-              file=sys.stderr)
-
     grobid_meta = (grobid or {}).get("metadata") or {}
     title    = grobid_meta.get("title")
     authors  = grobid_meta.get("authors") or []
