@@ -40,10 +40,12 @@ import requests
 # error, corrupting extract_report.json. Reconfiguring here fixes the whole
 # class of bug rather than escaping individual characters.
 for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if callable(_reconfigure):
+        try:
+            _reconfigure(encoding="utf-8")
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Paths (resolve relative to project root — two levels up from this file)
