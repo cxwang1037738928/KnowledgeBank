@@ -9,12 +9,11 @@
  *   1. enhance      — rasterize + denoise + deskew + binarize (per-document)
  *   2. extract      — docling PDF → text/sections/refs/metadata  (needs: docs + enhanced/)
  *   3. embed        — chunk + MiniLM encode                      (needs: doclings.json)
- *   4. categorize   — cosine-similarity cluster + Mistral desc   (needs: doclings.json)
+ *   4. categorize   — cosine-similarity cluster + keyword/medoid index (needs: doclings.json)
  *   5. heuristic    — BM25 + PageRank top-k                      (needs: doclings + categories)
- *   6. bootstrap    — Mistral synthetic queries per category      (needs: categories + embeddings)
- *   7. build-graph  — document/section/citation graph            (needs: doclings + heuristic_output)
+ *   6. build-graph  — document/section/citation graph            (needs: doclings + heuristic_output)
  *
- * POST /run executes stages 2–7 in order (enhancement is per-document and
+ * POST /run executes stages 2–6 in order (enhancement is per-document and
  * excluded; run it individually for each uploaded file before calling /run).
  */
 
@@ -29,7 +28,6 @@ import { annotateDois }       from '../extraction/doi_regex.js';
 import { enrichDoclings }     from '../extraction/search_doi.js';
 import { embedAll }           from '../extraction/embed.js';
 import { generateCategories } from '../extraction/generate_categories.js';
-import { bootstrapQueries }   from '../extraction/bootstrap_queries.js';
 import { buildGraph }         from '../extraction/build_graph.js';
 import { processDocument }    from '../parser/cleaning/enhance_pdf.js';
 import { getDocumentStatus }  from '../parser/cleaning/clean_pdf.js';
@@ -147,21 +145,19 @@ export const pipelineRouter = Router();
 //     embeddings: string|null,   // embeddings.json → metadata.updated
 //     categories: string|null,   // categories.json → generatedAt
 //     heuristic:  string|null,   // heuristic_output.json → generatedAt
-//     bootstrap:  string|null,   // bootstrap_queries.json → generatedAt
 //     graph:      string|null    // graph.json → createdAt
 //   }
 
 pipelineRouter.get('/status', wrap(async (req, res) => {
-  const [doclings, embeddings, categories, heuristic, bootstrap, graph] = await Promise.all([
+  const [doclings, embeddings, categories, heuristic, graph] = await Promise.all([
     doclingsTimestamp(path.join(DATA_DIR, 'doclings.json')),
     fileTimestamp(path.join(DATA_DIR, 'embeddings.json'),       o => o?.metadata?.updated),
     fileTimestamp(path.join(DATA_DIR, 'categories.json'),       o => o?.generatedAt),
     fileTimestamp(path.join(DATA_DIR, 'heuristic_output.json'), o => o?.generatedAt),
-    fileTimestamp(path.join(DATA_DIR, 'bootstrap_queries.json'),o => o?.generatedAt),
     fileTimestamp(path.join(DATA_DIR, 'graph.json'),            o => o?.createdAt),
   ]);
 
-  res.json({ doclings, embeddings, categories, heuristic, bootstrap, graph });
+  res.json({ doclings, embeddings, categories, heuristic, graph });
 }));
 
 // ── POST /api/pipeline/enhance ───────────────────────────────────────────────
@@ -287,12 +283,12 @@ pipelineRouter.post('/embed', wrap(async (req, res) => {
 //
 // Runs generate_categories.js.  Embeds each document's title + abstract (or
 // first 200 body words when both are absent), clusters with Union-Find
-// single-linkage at the given cosine similarity threshold, then calls
-// Ministral-3b via Ollama to generate a 1–2 sentence description for each
-// cluster from up to CATEGORY_ABSTRACTS_J member abstracts.
+// single-linkage at the given cosine similarity threshold, then indexes each
+// cluster with its top BM25-IDF keywords and centroid medoid (no LLM).
 //
 // Writes data/categories.json:
-//   { threshold, generatedAt, categories: [{ members, description }] }
+//   { threshold, generatedAt,
+//     categories: [{ index, members, keywords, medoid }] }
 //
 // Request body:
 //   { threshold: number }   cosine similarity in (0, 1] — required
@@ -369,51 +365,6 @@ pipelineRouter.post('/heuristic', wrap(async (req, res) => {
   });
 }));
 
-// ── POST /api/pipeline/bootstrap ─────────────────────────────────────────────
-//
-// Runs bootstrap_queries.js.  For each category in categories.json, assembles
-// a context pack (BM25 keywords, member titles, abstracts, distinctive
-// headings, medoid chunk excerpt) and prompts Ministral-3b to generate
-// perCategory diverse queries covering factual, definition, comparison,
-// synthesis, and methodology types.
-//
-// Writes data/bootstrap_queries.json:
-//   { model, perCategory, generatedAt, threshold, categories: [...] }
-//
-// Requires Ollama with BOOTSTRAP_MODEL (default ministral:3b).
-//
-// Request body:
-//   { perCategory?: number }    queries per cluster (default 8)
-//
-// Response (200):
-//   { model: string, perCategory: number, totalQueries: number, categories: number }
-//
-// Errors:
-//   503 — categories.json or doclings.json not found (run categorize first)
-
-pipelineRouter.post('/bootstrap', wrap(async (req, res) => {
-  const perCategory = parseInt(req.body?.perCategory ?? '8', 10);
-  if (!Number.isInteger(perCategory) || perCategory < 1) {
-    throw httpError(400, '"perCategory" must be a positive integer');
-  }
-
-  let result;
-  try {
-    result = await bootstrapQueries({ perCategory });
-  } catch (err) {
-    if (/not found/i.test(err.message)) throw httpError(503, err.message);
-    throw err;
-  }
-
-  const totalQueries = result.categories.reduce((n, c) => n + c.queries.length, 0);
-  res.json({
-    model:        result.model,
-    perCategory:  result.perCategory,
-    totalQueries,
-    categories:   result.categories.length,
-  });
-}));
-
 // ── POST /api/pipeline/build-graph ───────────────────────────────────────────
 //
 // Runs build_graph.js.  Creates document nodes and section sub-nodes for the
@@ -459,7 +410,7 @@ pipelineRouter.post('/build-graph', wrap(async (req, res) => {
 // ── POST /api/pipeline/run ───────────────────────────────────────────────────
 //
 // Runs the full pipeline in order: extract → embed → categorize → heuristic
-// → bootstrap → build-graph.
+// → build-graph.
 //
 // Enhancement is excluded — it is per-document and must be run individually
 // via POST /enhance before uploading documents, or via the BullMQ worker.
@@ -469,10 +420,9 @@ pipelineRouter.post('/build-graph', wrap(async (req, res) => {
 //
 // Request body:
 //   {
-//     threshold?:   number,   cosine similarity for categorize (default 0.75)
-//     k?:           number,   top-k for heuristic              (default 2)
-//     force?:       boolean,  re-extract and re-embed          (default false)
-//     perCategory?: number,   queries per cluster in bootstrap (default 8)
+//     threshold?: number,   cosine similarity for categorize (default 0.75)
+//     k?:         number,   top-k for heuristic              (default 2)
+//     force?:     boolean,  re-extract and re-embed          (default false)
 //   }
 //
 // Response (200):
@@ -482,7 +432,6 @@ pipelineRouter.post('/build-graph', wrap(async (req, res) => {
 //       embed:      { ok: boolean, chunks?: number, docs?: number, error?: string },
 //       categorize: { ok: boolean, categories?: number, error?: string },
 //       heuristic:  { ok: boolean, topK?: number, edges?: number, error?: string },
-//       bootstrap:  { ok: boolean, totalQueries?: number, error?: string },
 //       graph:      { ok: boolean, nodes?: number, edges?: number, error?: string }
 //     }
 //   }
@@ -491,10 +440,9 @@ pipelineRouter.post('/run', wrap(async (req, res) => {
   const {
     // Same default the tests use: CLUSTER_SIMILARITY from .env is the single
     // source of truth, so API runs and test runs cluster identically.
-    threshold   = parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
-    k           = 2,
-    force       = false,
-    perCategory = 8,
+    threshold = parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
+    k         = 2,
+    force     = false,
   } = req.body ?? {};
 
   if (typeof threshold !== 'number' || threshold <= 0 || threshold > 1) {
@@ -557,19 +505,7 @@ pipelineRouter.post('/run', wrap(async (req, res) => {
     return res.json({ stages });
   }
 
-  // 5 — Bootstrap
-  try {
-    const result = await bootstrapQueries({ perCategory });
-    stages.bootstrap = {
-      ok: true,
-      totalQueries: result.categories.reduce((n, c) => n + c.queries.length, 0),
-    };
-  } catch (err) {
-    stages.bootstrap = { ok: false, error: err.message };
-    return res.json({ stages });
-  }
-
-  // 6 — Build graph
+  // 5 — Build graph
   try {
     const graph = await buildGraph();
     stages.graph = { ok: true, nodes: graph.nodes.length, edges: graph.edges.length };

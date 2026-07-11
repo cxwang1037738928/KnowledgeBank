@@ -3,7 +3,7 @@
  *
  * Mounts:
  *   /api/pipeline  — pipeline control (enhance, extract, embed, categorize,
- *                    heuristic, bootstrap, build-graph, run, status)
+ *                    heuristic, build-graph, run, status)
  *
  * Routers to add later:
  *   /api/documents — upload, list, status, delete  (clean_pdf.js)

@@ -792,10 +792,10 @@ def convert_document(doc_meta: dict) -> dict:
         abstract = abstract or fb.get("abstract")
 
     # Last-resort abstract: first 200 words of body text, persisted so every
-    # downstream consumer (clustering, category descriptions, bootstrap
-    # queries) sees the same fallback instead of each re-deriving it. Crossref
-    # enrichment (search_doi.js) runs later and overwrites this whenever it
-    # has a real abstract. Title deliberately gets NO body-text fallback: the
+    # downstream consumer (clustering, cluster keywords) sees the same fallback
+    # instead of each re-deriving it. Crossref enrichment (search_doi.js) runs
+    # later and overwrites this whenever it has a real abstract. Title
+    # deliberately gets NO body-text fallback: the
     # citation graph matches titles by containment, and a long snippet posing
     # as a title would fabricate edges.
     if not abstract:

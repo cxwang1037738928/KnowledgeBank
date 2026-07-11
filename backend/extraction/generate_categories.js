@@ -2,11 +2,7 @@
  * generate_categories.js
  *
  * Clusters documents by cosine similarity of their title+abstract embeddings,
- * then calls Mistral (via Ollama) to generate a short description for each
- * cluster from its members' abstracts.
- *
- * The similarity threshold is passed at call time (e.g. from an API route)
- * so the frontend can control cluster granularity without restarting the server.
+ * then indexes each cluster with a compact, deterministic summary — no LLM.
  *
  * Title+abstract vectors capture topic better than averaged full-text chunk
  * vectors: the full-text average is pulled by methodology sections, results
@@ -15,10 +11,19 @@
  *
  * Falls back to the first 200 words of body text when both title and abstract
  * are missing (e.g. OCR-only docs where docling found no metadata).
- * If Ollama is unavailable, description is set to null and the run continues.
+ *
+ * Each category records:
+ *   index    — incremental cluster number (0, 1, 2, …)
+ *   members  — [{ docId, filename }]
+ *   keywords — top TF-IDF terms over the cluster's body text, computed with
+ *              tokenise/REF_HEADINGS/normHeading from regex_utils.js (IDF is
+ *              the same corpus statistic heuristic.py uses)
+ *   medoid   — { docId, filename }: the member whose title+abstract vector is
+ *              closest to the cluster centroid (the "file closest to the
+ *              category centroid"), reusing the vectors already embedded here
  *
  * Reads:  data/doclings.json
- * Writes: data/categories.json — { threshold, categories: [{ members, description }] }
+ * Writes: data/categories.json — { threshold, generatedAt, categories: [...] }
  *
  * Run: node backend/extraction/generate_categories.js --threshold 0.75
  */
@@ -28,17 +33,16 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pipeline } from '@xenova/transformers';
+import { tokenise, REF_HEADINGS, normHeading } from './regex_utils.js';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
 const CATEGORIES_OUT = path.join(DATA_DIR, 'categories.json');
 
-const EMBED_MODEL          = 'Xenova/all-MiniLM-L12-v2';
-const BATCH_SIZE           = 32;
-const OLLAMA_URL           = process.env.OLLAMA_URL           || 'http://localhost:11434';
-const CATEGORY_MODEL       = process.env.CATEGORY_MODEL       || 'ministral:3b';
-const CATEGORY_ABSTRACTS_J = parseInt(process.env.CATEGORY_ABSTRACTS_J || '5', 10);
+const EMBED_MODEL = 'Xenova/all-MiniLM-L12-v2';
+const BATCH_SIZE  = 32;
+const KEYWORDS_N  = parseInt(process.env.KEYWORDS_N || '20', 10);
 
 // ---------------------------------------------------------------------------
 // Embedding
@@ -72,34 +76,48 @@ function metaText(entry) {
 }
 
 // ---------------------------------------------------------------------------
-// Category description via Mistral (Ollama)
+// TF-IDF cluster keywords. heuristic.py's cluster_keywords scores by summed
+// IDF alone, which works for multi-doc clusters (shared distinctive terms
+// accumulate) but degenerates for single-doc clusters — every corpus-rare term
+// ties at max IDF, so the tiebreak surfaces noise. Weighting IDF by in-cluster
+// term frequency (what BM25 fundamentally does) surfaces readable keywords in
+// both cases: a distinctive term repeated within the cluster outranks a rare
+// term seen once. IDF is the same corpus statistic used by heuristic.py.
 // ---------------------------------------------------------------------------
 
-async function describeCategoryWithOllama(abstracts) {
-  if (abstracts.length === 0) return null;
-  try {
-    const abstractList = abstracts.map((a, i) => `[${i + 1}] ${a}`).join('\n\n');
-    const prompt =
-      `Given the following abstracts from academic papers in the same research cluster, ` +
-      `write a concise 1–2 sentence description of what this category covers.\n\n` +
-      `Abstracts:\n${abstractList}\n\n` +
-      `Return ONLY the description. No explanation, no extra text.`;
+function bodyText(entry) {
+  // normHeading strips leading numbering ('7. References') so numbered
+  // bibliography headings don't leak reference text into the keyword pool.
+  const sections = (entry?.sections || []).filter(
+    (s) => !REF_HEADINGS.has(normHeading(s.heading)) && (s.text || '').trim()
+  );
+  return sections.length ? sections.map((s) => s.text).join(' ') : (entry?.text || '');
+}
 
-    const resp = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model:   CATEGORY_MODEL,
-        prompt,
-        stream:  false,
-        options: { temperature: 0.3 },
-      }),
-    });
-    if (!resp.ok) return null;
-    return ((await resp.json()).response || '').trim() || null;
-  } catch {
-    return null;
+function buildIdf(tokenisedDocs) {
+  const N = tokenisedDocs.length;
+  const df = new Map();
+  for (const tokens of tokenisedDocs) {
+    for (const t of new Set(tokens)) df.set(t, (df.get(t) || 0) + 1);
   }
+  return (term) => {
+    const d = df.get(term) || 0;
+    return Math.log((N - d + 0.5) / (d + 0.5) + 1);
+  };
+}
+
+function clusterKeywords(memberTokens, idf, n = KEYWORDS_N) {
+  const tf = new Map();
+  for (const tokens of memberTokens) {
+    for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1);
+  }
+  const scores = new Map();
+  for (const [t, count] of tf) scores.set(t, count * idf(t));
+  // Alphabetical secondary sort key keeps ties deterministic across runs.
+  return [...scores.entries()]
+    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+    .slice(0, n)
+    .map(([t]) => t);
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +149,35 @@ function dotProduct(a, b) {
   let sum = 0;
   for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
   return sum;
+}
+
+/**
+ * The "file closest to the category centroid": the member whose title+abstract
+ * vector has the highest cosine similarity to the (L2-normalised) mean of the
+ * cluster's member vectors. Reuses the vectors already embedded for clustering
+ * — no chunk embeddings or extra file loads needed. Single-member clusters
+ * return that lone member.
+ */
+function clusterMedoid(memberIds, vectors) {
+  if (memberIds.length === 1) return memberIds[0];
+
+  const dim = vectors[memberIds[0]].length;
+  const centroid = new Float64Array(dim);
+  for (const id of memberIds) {
+    const v = vectors[id];
+    for (let i = 0; i < dim; i++) centroid[i] += v[i];
+  }
+  let mag = 0;
+  for (let i = 0; i < dim; i++) mag += centroid[i] * centroid[i];
+  mag = Math.sqrt(mag) || 1;
+  for (let i = 0; i < dim; i++) centroid[i] /= mag;
+
+  let best = memberIds[0], bestSim = -Infinity;
+  for (const id of memberIds) {
+    const sim = dotProduct(vectors[id], centroid);
+    if (sim > bestSim) { bestSim = sim; best = id; }
+  }
+  return best;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,25 +243,26 @@ export async function generateCategories(threshold) {
     clusters[root].push(docIds[i]);
   }
 
-  // Build categories sequentially — Ollama queues concurrent requests anyway
-  console.log(`[generate_categories] Generating descriptions for ${Object.keys(clusters).length} cluster(s) via ${CATEGORY_MODEL} ...`);
-  const categories = [];
-  for (const members of Object.values(clusters)) {
-    const abstracts = members
-      .map(docId => (doclings[docId]?.metadata?.abstract || '').trim())
-      .filter(Boolean)
-      .slice(0, CATEGORY_ABSTRACTS_J);
+  // Corpus-wide IDF for cluster keywords (body text, reference sections dropped)
+  const tokenised = new Map(docIds.map((d) => [d, tokenise(bodyText(doclings[d]))]));
+  const idf = buildIdf([...tokenised.values()]);
 
-    const description = await describeCategoryWithOllama(abstracts);
-
-    categories.push({
+  // Index each cluster with keywords + centroid medoid — no LLM
+  const categories = Object.values(clusters).map((members, index) => {
+    const medoidId = clusterMedoid(members, vectors);
+    return {
+      index,
       members: members.map(docId => ({
         docId,
         filename: doclings[docId]?.filename || docId,
       })),
-      description,
-    });
-  }
+      keywords: clusterKeywords(members.map(d => tokenised.get(d) || []), idf),
+      medoid: {
+        docId:    medoidId,
+        filename: doclings[medoidId]?.filename || medoidId,
+      },
+    };
+  });
 
   const output = {
     generatedAt: new Date().toISOString(),

@@ -3,9 +3,9 @@
  * them, for the JS side of the pipeline.
  *
  * Consumers:
- *   doi_regex.js          — DOI_RE / findDoi
- *   search_doi.js         — stripJats
- *   bootstrap_queries.js  — STOPWORDS / tokenise / REF_HEADINGS / normHeading
+ *   doi_regex.js            — DOI_RE / findDoi
+ *   search_doi.js           — stripJats
+ *   generate_categories.js  — STOPWORDS / tokenise / REF_HEADINGS / normHeading
  *
  * Several patterns deliberately mirror Python counterparts (extract.py /
  * heuristic_utils.py) — Python cannot import from this file, so the two

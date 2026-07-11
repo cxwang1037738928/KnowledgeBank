@@ -14,9 +14,8 @@
     "test:chunking": "node tests/test_chunking.js",
     "test:generate-categories": "node tests/test_generate_categories.js",
     "test:heuristic": "node tests/test_heuristic.js",
-    "test:bootstrap": "node tests/test_bootstrap.js",
     "test:build-graph": "node tests/test_build_graph.js",
-    "test:pipeline": "node tests/test_extract.js && node tests/test_embed.js && node tests/test_generate_categories.js && node tests/test_heuristic.js && node tests/test_bootstrap.js && node tests/test_build_graph.js"
+    "test:pipeline": "node tests/test_extract.js && node tests/test_embed.js && node tests/test_generate_categories.js && node tests/test_heuristic.js && node tests/test_build_graph.js"
   },
   "dependencies": {
     "@napi-rs/canvas": "^1.0.2",

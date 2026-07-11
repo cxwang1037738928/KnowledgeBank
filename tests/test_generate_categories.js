@@ -1,15 +1,16 @@
 /**
  * test_generate_categories.js — pipeline stage 4: cluster docs into categories
  *
- * Clusters embedded documents by cosine similarity and generates category
- * descriptions via LLM. Outputs go to tests/test-output/.
+ * Clusters embedded documents by cosine similarity and indexes each cluster
+ * with its top BM25 keywords and centroid medoid (no LLM). Outputs go to
+ * tests/test-output/.
  *
  * Run:  node tests/test_generate_categories.js [--threshold 0.75]
  *
- * Prerequisite: tests/test-output/embeddings.json (produced by test_embed.js)
+ * Prerequisite: tests/test-output/doclings.json (produced by test_extract.js)
  *
  * Outputs:
- *   tests/test-output/categories.json  — clusters with descriptions
+ *   tests/test-output/categories.json  — { index, members, keywords, medoid }
  */
 
 import 'dotenv/config';
@@ -36,10 +37,11 @@ console.log('[test_generate_categories] Clustering at threshold=' + threshold + 
 const result = await generateCategories(threshold);
 
 console.log(`\n[test_generate_categories] ${result.categories.length} cluster(s) at threshold=${threshold}:\n`);
-for (const [i, cat] of result.categories.entries()) {
+for (const cat of result.categories) {
   const members = cat.members.map((m) => m.filename).join(', ');
-  const desc    = cat.description ? `\n    "${cat.description}"` : '';
-  console.log(`  Cluster ${i + 1} (${cat.members.length} doc${cat.members.length !== 1 ? 's' : ''}): ${members}${desc}`);
+  console.log(`  Category ${cat.index} (${cat.members.length} doc${cat.members.length !== 1 ? 's' : ''}): ${members}`);
+  console.log(`    keywords: ${cat.keywords.slice(0, 8).join(', ')}`);
+  console.log(`    medoid:   ${cat.medoid.filename}`);
 }
 
 const elapsed = ((Date.now() - start) / 1000).toFixed(2);
