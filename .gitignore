@@ -11,3 +11,6 @@ __pycache__/
 # Test artifacts + frontend build output
 tests/test_log.txt
 frontend/dist/
+
+# Vendored browser embedding model (npm run fetch:model)
+models/

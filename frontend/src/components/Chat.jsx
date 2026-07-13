@@ -18,11 +18,30 @@ let _embedder = null;
 async function getEmbedder(onStatus) {
   if (!_embedder) {
     _embedder = (async () => {
-      onStatus('downloading embedding model…');
+      onStatus('loading embedding model…');
       const { pipeline, env } = await import('@xenova/transformers');
-      env.allowLocalModels = false;
+
+      // The browser cache is off by design, so the model is re-fetched every
+      // session. Serve it from our own backend (npm run fetch:model) rather
+      // than huggingface.co — otherwise every chat depends on the public
+      // internet and dies with an opaque network error when HF is slow,
+      // rate-limiting, or unreachable. Same for onnxruntime's wasm, which
+      // otherwise comes from cdn.jsdelivr.net.
       env.useBrowserCache = false;
-      return pipeline('feature-extraction', EMBED_MODEL, { quantized: true });
+      env.allowLocalModels = true;
+      env.localModelPath = '/models/';
+      env.backends.onnx.wasm.wasmPaths = '/models/ort/';
+
+      try {
+        return await pipeline('feature-extraction', EMBED_MODEL, { quantized: true });
+      } catch (err) {
+        // models/ not vendored yet — fall back to the HF hub so chat still
+        // works, but say so, since this is the flaky path.
+        console.warn('[chat] local model load failed, falling back to huggingface.co:', err);
+        onStatus('downloading embedding model from huggingface…');
+        env.allowLocalModels = false;
+        return pipeline('feature-extraction', EMBED_MODEL, { quantized: true });
+      }
     })().catch((e) => {
       _embedder = null;       // allow retry after a failed download
       throw e;

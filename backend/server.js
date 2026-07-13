@@ -27,7 +27,9 @@ import { chatRouter } from './routes/chat.js';
 
 const app  = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const DIST = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'frontend', 'dist');
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const DIST = path.join(ROOT, 'frontend', 'dist');
+const MODELS = path.join(ROOT, 'models');
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
@@ -39,6 +41,16 @@ app.use(express.json());
 app.use('/api/pipeline', pipelineRouter);
 app.use('/api/corpus', corpusRouter);
 app.use('/api/chat', chatRouter);
+
+// ── Browser embedding model (npm run fetch:model) ────────────────────────────
+// Chat.jsx embeds queries in-browser with the cache off, so it re-fetches the
+// model every session. Serving it here instead of huggingface.co keeps chat
+// working without internet access. Vite proxies /models in dev.
+if (existsSync(MODELS)) {
+  app.use('/models', express.static(MODELS));
+} else {
+  console.warn('[server] models/ not found — chat will fall back to huggingface.co. Run: npm run fetch:model');
+}
 
 // ── Frontend (production build) ──────────────────────────────────────────────
 

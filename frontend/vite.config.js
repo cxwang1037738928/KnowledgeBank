@@ -13,6 +13,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': 'http://localhost:3000',
+      // The browser embedding model + onnx wasm, vendored by npm run fetch:model
+      '/models': 'http://localhost:3000',
     },
   },
 });
