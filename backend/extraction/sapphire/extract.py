@@ -17,11 +17,17 @@ Output: data/doclings.json  — dict keyed by docId, each entry holds:
   references       : [str] raw bibliographic reference strings (GROBID)
   parsedReferences : [{title, authors, raw}] structured refs (GROBID CRF) —
                      lets heuristic.py skip its LLM reference-parsing pass
-  metadata         : {title, authors, abstract} (GROBID header model;
-                     docling/LLM fallback; abstract falls back to the first
-                     200 words of body text as a last resort — Crossref
+  metadata         : {title, authors, abstract, created} (GROBID header
+                     model; docling/LLM fallback; abstract falls back to the
+                     first 200 words of body text as a last resort — Crossref
                      enrichment overwrites it when a real abstract exists),
-                     plus doi added later by doi_regex.js
+                     plus doi added later by doi_regex.js.
+                     created is {year, month|null} — GROBID's TEI header date
+                     when present, else the earliest plausible date in the
+                     first-page text, never later than the current UTC
+                     year/month; Crossref's issued date (search_doi.js)
+                     overwrites it when available. heuristic.py uses it to
+                     reject citation edges that point forward in time.
 """
 
 import json
@@ -53,7 +59,7 @@ for _stream in (sys.stdout, sys.stderr):
 # Paths (resolve relative to project root — two levels up from this file)
 # ---------------------------------------------------------------------------
 
-ROOT         = Path(__file__).resolve().parents[2]
+ROOT         = Path(__file__).resolve().parents[3]
 DATA_DIR     = ROOT / os.environ.get("DATA_DIR", "data")
 DOCUMENTS_META = DATA_DIR / "documents.json"
 DOCLINGS_OUT   = DATA_DIR / "doclings.json"
@@ -618,6 +624,60 @@ def _extract_metadata(doc) -> dict:
 
 _TEI_NS = {"tei": "http://www.tei-c.org/ns/1.0"}
 
+_MONTH_NUM = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+# Years 1600–2099: wide enough for any citable document, narrow enough that
+# page numbers and grant IDs rarely collide.
+_YEAR = r"(?:1[6-9]|20)\d{2}"
+
+
+def _valid_created(year: int, month: int | None) -> bool:
+    """A creation date can't be in the future: reject candidates later than
+    the current UTC year/month (a bare year equal to the current year is
+    allowed — the month is simply unknown)."""
+    now = datetime.now(timezone.utc)
+    if year > now.year:
+        return False
+    if year == now.year and month is not None and month > now.month:
+        return False
+    return True
+
+
+def _scan_created(text: str) -> dict | None:
+    """Earliest plausible {year, month|null} date mentioned in `text`.
+
+    Callers pass the first-page region only (~3000 chars: arXiv stamp,
+    'Received:', journal line) — body text is full of in-text citation years
+    ('(Hochreiter & Schmidhuber, 1997)') that would make every paper look as
+    old as its oldest reference. Future dates are rejected via
+    _valid_created; among survivors the earliest wins, with a known month
+    beating an unknown one in the same year.
+    """
+    candidates: list[tuple[int, int | None]] = []
+    # 'June 2017', 'Jun. 2017', 'August 15, 2017' (month before year)
+    for m in re.finditer(
+            rf"\b([A-Za-z]{{3,9}})\.?\s+(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s+)?({_YEAR})\b",
+            text):
+        month = _MONTH_NUM.get(m.group(1)[:3].lower())
+        if month:
+            candidates.append((int(m.group(2)), month))
+    # ISO '2017-06' / '2017-06-12'
+    for m in re.finditer(rf"\b({_YEAR})-(\d{{2}})\b", text):
+        month = int(m.group(2))
+        if 1 <= month <= 12:
+            candidates.append((int(m.group(1)), month))
+    # Bare years (month unknown)
+    for m in re.finditer(rf"\b({_YEAR})\b", text):
+        candidates.append((int(m.group(1)), None))
+
+    valid = [(y, mo) for y, mo in candidates if _valid_created(y, mo)]
+    if not valid:
+        return None
+    year, month = min(valid, key=lambda c: (c[0], c[1] or 12))
+    return {"year": year, "month": month}
+
 
 def _tei_text(el) -> str:
     """Flattened text content of a TEI element (None-safe)."""
@@ -670,9 +730,28 @@ def _grobid_header(pdf_path: str) -> dict | None:
 
     abstract = _tei_text(root.find(".//tei:profileDesc/tei:abstract", _TEI_NS)) or None
 
+    # Publication date: prefer the machine-readable @when attribute; fall back
+    # to scanning the element's text ('June 2017'). _scan_created applies the
+    # same future-date cap as the first-page fallback.
+    created = None
+    date_el = root.find(".//tei:publicationStmt/tei:date", _TEI_NS)
+    if date_el is None:
+        date_el = root.find(
+            ".//tei:sourceDesc//tei:biblStruct//tei:imprint/tei:date", _TEI_NS)
+    if date_el is not None:
+        when = date_el.get("when") or ""
+        m = re.match(r"(\d{4})(?:-(\d{2}))?", when)
+        if m and _valid_created(int(m.group(1)),
+                                int(m.group(2)) if m.group(2) else None):
+            created = {"year": int(m.group(1)),
+                       "month": int(m.group(2)) if m.group(2) else None}
+        else:
+            created = _scan_created(_tei_text(date_el))
+
     if title is None and not authors and abstract is None:
         return None
-    return {"title": title, "authors": authors, "abstract": abstract}
+    return {"title": title, "authors": authors, "abstract": abstract,
+            "created": created}
 
 
 def _grobid_references(pdf_path: str) -> tuple[list[str], list[dict]] | None:
@@ -805,7 +884,14 @@ def convert_document(doc_meta: dict) -> dict:
             print("[extract]   no abstract found — using first 200 words of body text",
                   file=sys.stderr)
 
-    metadata = {"title": title, "authors": authors, "abstract": abstract}
+    # Created date: GROBID's TEI header date, else the earliest plausible date
+    # in the first-page region (NOT the whole body — in-text citation years
+    # would date every paper by its oldest reference). Crossref's issued date
+    # (search_doi.js) overwrites this when available.
+    created = grobid_meta.get("created") or _scan_created(full_text[:3000])
+
+    metadata = {"title": title, "authors": authors, "abstract": abstract,
+                "created": created}
 
     refs        = (grobid or {}).get("references") or []
     parsed_refs = (grobid or {}).get("parsedReferences") or []

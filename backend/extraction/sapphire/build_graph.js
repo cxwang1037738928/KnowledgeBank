@@ -15,8 +15,9 @@ import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { REF_HEADINGS, normHeading } from '../regex_utils.js';
 
-const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
 const HEURISTIC_PATH = path.join(DATA_DIR, 'heuristic_output.json');
@@ -33,6 +34,7 @@ function documentNode(docId, entry) {
     docId,
     label:    entry.metadata?.title || entry.filename,
     filename: entry.filename,
+    created:  entry.metadata?.created || null,   // {year, month|null} | null
   };
 }
 
@@ -103,6 +105,10 @@ export async function buildGraph() {
 
     const sections = entry.sections || [];
     sections.forEach((section, i) => {
+      // Bibliographies aren't knowledge nodes: their "content" is raw
+      // citation strings, which pollute the graph and any downstream
+      // embedding/extraction over section nodes.
+      if (REF_HEADINGS.has(normHeading(section.heading || ''))) return;
       if (section.heading || section.text.length > 50) {
         nodes.push(sectionNode(docId, i, section));
         edges.push(sectionEdge(docId, i));
@@ -134,7 +140,7 @@ export async function buildGraph() {
   return graph;
 }
 
-// Run directly: node backend/extraction/build_graph.js
+// Run directly: node backend/extraction/sapphire/build_graph.js
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   buildGraph().catch((err) => {
     console.error('[build_graph]', err.message);

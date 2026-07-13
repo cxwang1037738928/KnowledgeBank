@@ -13,7 +13,9 @@
  *
  * Caching: results are cached at cache/meta.json, keyed by DOI, so a given DOI
  * is fetched at most once across all runs. Each cached object holds:
- *   { title, author, abstract, reference, citedBy, fetchedAt }
+ *   { title, author, abstract, created, reference, citedBy, fetchedAt }
+ * (created = {year, month|null} from `issued`; DOIs cached before this field
+ * existed need a cache entry delete to pick it up.)
  * A DOI Crossref does not know is cached as null (a "known miss") so it is not
  * retried on every run. Transient network/HTTP errors are NOT cached.
  *
@@ -22,23 +24,37 @@
  *   getMeta(doi)        — cache-aware single lookup (reads/writes meta.json)
  *   enrichDoclings()    — apply Crossref data to every DOI'd doc in doclings.json
  *
- * Run directly: node backend/extraction/search_doi.js
+ * Run directly: node backend/extraction/sapphire/search_doi.js
  */
 
 import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { stripJats } from './regex_utils.js';
 
-const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+/**
+ * Strip JATS/XML markup from a Crossref abstract; null when empty. Crossref
+ * abstracts typically start with a literal 'Abstract' heading element — after
+ * tag stripping that word leaks in as a prefix, so it is removed too.
+ */
+export function stripJats(x) {
+  if (!x) return null;
+  const text = x
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^abstract[\s:.]+/i, '');
+  return text || null;
+}
+
+const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const DATA_DIR      = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const DOCLINGS_PATH = path.join(DATA_DIR, 'doclings.json');
 const CACHE_DIR     = path.join(ROOT, 'cache');
 const META_PATH     = path.join(CACHE_DIR, 'meta.json');
 
 const MAILTO          = process.env.CROSSREF_MAILTO || 'ericwang030@gmail.com';
-const USER_AGENT      = `BookWyrm/1.0 (mailto:${MAILTO})`;
+const USER_AGENT      = `OpenCrawl/1.0 (mailto:${MAILTO})`;
 const TIMEOUT_MS      = parseInt(process.env.CROSSREF_TIMEOUT_MS || '20000', 10);
 const POLITE_DELAY_MS = parseInt(process.env.CROSSREF_DELAY_MS || '250', 10);
 
@@ -69,10 +85,24 @@ function normalizeWork(m) {
     ? m['is-referenced-by-count']
     : null;
 
+  // Publication date from `issued` date-parts [year, month, day]. Same
+  // future-date cap as extract.py's text-scan fallback, for consistency.
+  let created = null;
+  const parts = m.issued?.['date-parts']?.[0];
+  if (Array.isArray(parts) && Number.isFinite(parts[0])) {
+    const year  = parts[0];
+    const month = Number.isFinite(parts[1]) ? parts[1] : null;
+    const now = new Date();
+    const future = year > now.getFullYear()
+      || (year === now.getFullYear() && month !== null && month > now.getMonth() + 1);
+    if (!future) created = { year, month };
+  }
+
   return {
     title,
     author,
     abstract: stripJats(m.abstract),
+    created,
     reference,
     citedBy,
     fetchedAt: new Date().toISOString(),
@@ -201,6 +231,7 @@ export async function enrichDoclings() {
     if (meta.title)                        entry.metadata.title    = meta.title;
     if (meta.author && meta.author.length) entry.metadata.authors  = meta.author;
     if (meta.abstract)                     entry.metadata.abstract = meta.abstract;
+    if (meta.created?.year)                entry.metadata.created  = meta.created;
     if (meta.citedBy != null)              entry.metadata.citedBy  = meta.citedBy;
     if (meta.reference && meta.reference.length) entry.crossrefReferences = meta.reference;
   }
@@ -210,7 +241,7 @@ export async function enrichDoclings() {
   return doclings;
 }
 
-// Run directly: node backend/extraction/search_doi.js
+// Run directly: node backend/extraction/sapphire/search_doi.js
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   enrichDoclings().catch((err) => {
     console.error('[search_doi]', err.message);

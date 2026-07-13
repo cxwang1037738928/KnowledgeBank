@@ -35,7 +35,7 @@ const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)),
 const TEST_DATA     = path.join(ROOT, 'tests', 'test-output');
 const TEST_OUTPUT   = path.join(TEST_DATA, 'text');
 const DOCLINGS_PATH = path.join(TEST_DATA, 'doclings.json');
-const EXTRACT_PY    = path.join(ROOT, 'backend', 'extraction', 'extract.py');
+const EXTRACT_PY    = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'extract.py');
 
 // Redirect all pipeline I/O to tests/test-output/ — must be set before
 // the Python subprocess inherits process.env.
@@ -66,12 +66,12 @@ await new Promise((resolve, reject) => {
 
 // ---- Stamp DOIs (regex over each document head) ------------------------------
 
-const { annotateDois } = await import('../backend/extraction/doi_regex.js');
+const { annotateDois } = await import('../backend/extraction/sapphire/doi_regex.js');
 await annotateDois();
 
 // ---- Overlay Crossref metadata for DOI'd docs (network; never fatal) ---------
 
-const { enrichDoclings } = await import('../backend/extraction/search_doi.js');
+const { enrichDoclings } = await import('../backend/extraction/sapphire/search_doi.js');
 try {
   await enrichDoclings();
 } catch (err) {

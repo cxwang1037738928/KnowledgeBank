@@ -24,11 +24,11 @@ import { fileURLToPath } from 'url';
 import { spawn }  from 'child_process';
 import { Router } from 'express';
 
-import { annotateDois }       from '../extraction/doi_regex.js';
-import { enrichDoclings }     from '../extraction/search_doi.js';
+import { annotateDois }       from '../extraction/sapphire/doi_regex.js';
+import { enrichDoclings }     from '../extraction/sapphire/search_doi.js';
 import { embedAll }           from '../extraction/embed.js';
 import { generateCategories } from '../extraction/generate_categories.js';
-import { buildGraph }         from '../extraction/build_graph.js';
+import { buildGraph }         from '../extraction/sapphire/build_graph.js';
 import { processDocument }    from '../parser/cleaning/enhance_pdf.js';
 import { getDocumentStatus }  from '../parser/cleaning/clean_pdf.js';
 
@@ -37,8 +37,8 @@ import { getDocumentStatus }  from '../parser/cleaning/clean_pdf.js';
 const __dirname  = path.dirname(fileURLToPath(import.meta.url));
 const ROOT       = path.resolve(__dirname, '..', '..');
 const DATA_DIR   = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const EXTRACT_PY  = path.join(ROOT, 'backend', 'extraction', 'extract.py');
-const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'heuristic.py');
+const EXTRACT_PY  = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'extract.py');
+const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'heuristic.py');
 const PYTHON     = process.env.PYTHON || 'python';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -328,28 +328,27 @@ pipelineRouter.post('/categorize', wrap(async (req, res) => {
 // ── POST /api/pipeline/heuristic ─────────────────────────────────────────────
 //
 // Spawns heuristic.py.  Scores every document with BM25 top-m chunk
-// representativeness + IDF novelty (blended, percentile-normalised), parses
-// reference strings with Phi-4 via Ollama to build a citation graph, computes
-// PageRank over that graph, and blends the two signals:
+// representativeness (normalised within its cluster) + IDF novelty, builds
+// the citation graph from GROBID parsedReferences (DOI + indexed fuzzy title
+// matching; no LLM), computes PageRank over that graph, and blends:
 //   final = 0.25 × BM25 + 0.75 × PageRank
+// Top-k slots are apportioned across clusters proportionally to cluster size.
 //
 // Writes data/heuristic_output.json:
 //   { k, generatedAt, topK: [...], edges: [...] }
 //
-// Requires Ollama to be running with the model named in CITATION_MODEL
-// (default phi4).  Run categorize before heuristic so cluster keywords
-// are available.
+// Run categorize before heuristic so cluster keywords are available.
 //
 // Request body:
 //   { k?: number }    number of top documents to select (default 2)
 //
 // Response (200):
-//   { k, topK: [{ docId, filename, finalScore, bm25Score,
+//   { k, topK: [{ docId, filename, cluster, finalScore, bm25Score,
 //                 bm25Representativeness, bm25Novelty, pagerankScore }],
 //     edges: number }
 //
 // Errors:
-//   502 — heuristic.py exited non-zero (Python or Ollama error)
+//   502 — heuristic.py exited non-zero
 
 pipelineRouter.post('/heuristic', wrap(async (req, res) => {
   const k = parseInt(req.body?.k ?? '2', 10);

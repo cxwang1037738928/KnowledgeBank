@@ -1,8 +1,9 @@
 /**
  * generate_categories.js
  *
- * Clusters documents by cosine similarity of their title+abstract embeddings,
- * then indexes each cluster with a compact, deterministic summary — no LLM.
+ * Clusters documents by cosine similarity of their title+abstract embeddings
+ * (single-linkage gated by mutual-kNN — see CLUSTER_MUTUAL_K), then indexes
+ * each cluster with a compact, deterministic summary — no LLM.
  *
  * Title+abstract vectors capture topic better than averaged full-text chunk
  * vectors: the full-text average is pulled by methodology sections, results
@@ -23,7 +24,12 @@
  *              category centroid"), reusing the vectors already embedded here
  *
  * Reads:  data/doclings.json
- * Writes: data/categories.json — { threshold, generatedAt, categories: [...] }
+ * Writes: data/categories.json  — { threshold, generatedAt, categories: [...] }
+ *         data/doc_vectors.json — { generatedAt, model, dims, docs: [{docId,
+ *           filename, title, vector}] }: the title+abstract vectors this run
+ *           clustered with, persisted so the frontend embedding-space view
+ *           (routes/corpus.js) can project and re-cluster them at any
+ *           threshold without re-embedding.
  *
  * Run: node backend/extraction/generate_categories.js --threshold 0.75
  */
@@ -39,10 +45,15 @@ const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url))
 const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
 const CATEGORIES_OUT = path.join(DATA_DIR, 'categories.json');
+const VECTORS_OUT    = path.join(DATA_DIR, 'doc_vectors.json');
 
 const EMBED_MODEL = 'Xenova/all-MiniLM-L12-v2';
 const BATCH_SIZE  = 32;
 const KEYWORDS_N  = parseInt(process.env.KEYWORDS_N || '20', 10);
+// Mutual-kNN gate: a pair may merge only if each doc is in the other's top
+// MUTUAL_K nearest neighbours (plus the similarity threshold). Guards
+// single-linkage against transitive chaining on large corpora.
+const MUTUAL_K    = parseInt(process.env.CLUSTER_MUTUAL_K || '10', 10);
 
 // ---------------------------------------------------------------------------
 // Embedding
@@ -76,13 +87,14 @@ function metaText(entry) {
 }
 
 // ---------------------------------------------------------------------------
-// TF-IDF cluster keywords. heuristic.py's cluster_keywords scores by summed
-// IDF alone, which works for multi-doc clusters (shared distinctive terms
-// accumulate) but degenerates for single-doc clusters — every corpus-rare term
-// ties at max IDF, so the tiebreak surfaces noise. Weighting IDF by in-cluster
-// term frequency (what BM25 fundamentally does) surfaces readable keywords in
-// both cases: a distinctive term repeated within the cluster outranks a rare
-// term seen once. IDF is the same corpus statistic used by heuristic.py.
+// TF-IDF cluster keywords — the single source of keyword truth (heuristic.py
+// reads them from categories.json rather than recomputing). Summed IDF alone
+// works for multi-doc clusters (shared distinctive terms accumulate) but
+// degenerates for single-doc clusters — every corpus-rare term ties at max
+// IDF, so the tiebreak surfaces noise. Weighting IDF by in-cluster term
+// frequency (what BM25 fundamentally does) surfaces readable keywords in both
+// cases: a distinctive term repeated within the cluster outranks a rare term
+// seen once. IDF is the same corpus statistic heuristic.py uses.
 // ---------------------------------------------------------------------------
 
 function bodyText(entry) {
@@ -225,11 +237,29 @@ export async function generateCategories(threshold) {
     embeddings.forEach((vec, j) => { vectors[batchIds[j]] = vec; });
   }
 
-  // Single-linkage clustering: merge any pair whose cosine similarity >= threshold
-  const uf = new UnionFind(docIds.length);
-  for (let i = 0; i < docIds.length; i++) {
-    for (let j = i + 1; j < docIds.length; j++) {
-      if (dotProduct(vectors[docIds[i]], vectors[docIds[j]]) >= threshold) {
+  // Single-linkage clustering with a mutual-kNN gate: merge a pair only when
+  // cosine similarity >= threshold AND each doc is in the other's top
+  // MUTUAL_K nearest neighbours. Plain single-linkage chains at moderate
+  // thresholds — doc A links B, B links C, and a corpus-sized transitive
+  // blob forms even though A and C are unrelated. The mutuality requirement
+  // caps each doc's merge fan-out at its genuinely closest peers, so chains
+  // can only form through pairs that both sides consider near. Memory is
+  // O(n * MUTUAL_K) instead of a full similarity matrix.
+  const n = docIds.length;
+  const neighbours = []; // per doc: Map(otherIdx -> sim) of its top MUTUAL_K
+  for (let i = 0; i < n; i++) {
+    const sims = [];
+    for (let j = 0; j < n; j++) {
+      if (j !== i) sims.push([j, dotProduct(vectors[docIds[i]], vectors[docIds[j]])]);
+    }
+    sims.sort((a, b) => b[1] - a[1]);
+    neighbours.push(new Map(sims.slice(0, MUTUAL_K)));
+  }
+
+  const uf = new UnionFind(n);
+  for (let i = 0; i < n; i++) {
+    for (const [j, sim] of neighbours[i]) {
+      if (j > i && sim >= threshold && neighbours[j].has(i)) {
         uf.union(i, j);
       }
     }
@@ -272,6 +302,21 @@ export async function generateCategories(threshold) {
 
   await fs.mkdir(path.dirname(CATEGORIES_OUT), { recursive: true });
   await fs.writeFile(CATEGORIES_OUT, JSON.stringify(output, null, 2), 'utf-8');
+
+  // Persist the vectors for the frontend embedding-space view (corpus.js):
+  // projection + live re-clustering at any threshold, without re-embedding.
+  const docVectors = {
+    generatedAt: output.generatedAt,
+    model:       EMBED_MODEL,
+    dims:        vectors[docIds[0]].length,
+    docs: docIds.map(id => ({
+      docId:    id,
+      filename: doclings[id]?.filename || id,
+      title:    (doclings[id]?.metadata?.title || '').trim() || null,
+      vector:   vectors[id],
+    })),
+  };
+  await fs.writeFile(VECTORS_OUT, JSON.stringify(docVectors), 'utf-8');
 
   console.log(
     `[generate_categories] ${categories.length} cluster(s) at threshold=${threshold}`,

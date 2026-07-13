@@ -8,21 +8,18 @@ writes files.
 
 Contents:
   Tokenisation      tokenise
-  BM25              BM25, top_terms, cluster_keywords
+  BM25              BM25, top_terms
   Doc scoring       topm_chunk_representativeness, whole_doc_representativeness,
                     novelty_score
   Normalization     percentile_normalize
-  Citation graph    parse_references_ollama, build_connectivity, compute_pagerank
+  Citation graph    build_connectivity, compute_pagerank
 """
 
-import json
 import math
 import re
 import sys
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter, defaultdict
 
-import requests
 import networkx as nx
 
 # ---------------------------------------------------------------------------
@@ -106,32 +103,6 @@ def top_terms(bm25: BM25, n: int) -> list[str]:
     return [t for t, _ in sorted(term_scores.items(), key=lambda x: (-x[1], x[0]))[:n]]
 
 
-def cluster_keywords(member_token_lists: list[list[str]], bm25: BM25,
-                     n: int, per_doc_cap: int | None = None) -> list[str]:
-    """
-    Per-cluster keywords: summed IDF over members' unique terms.
-
-    `per_doc_cap` limits how many terms each member may contribute (its
-    top-cap terms by IDF). Without a cap, a 100-page member with a 5-10x
-    larger vocabulary than its 10-page siblings dominates the keyword
-    pool — and representativeness then grades every member against a
-    keyword set the longest member effectively wrote. Pass None to
-    restore the old uncapped behavior.
-    """
-    scores: dict[str, float] = defaultdict(float)
-    for tokens in member_token_lists:
-        unique = set(tokens)
-        if per_doc_cap is not None and len(unique) > per_doc_cap:
-            # (-idf, term): the term tiebreak makes the per-doc cap pick the
-            # same terms every run when several share an IDF at the cutoff.
-            unique = set(sorted(unique, key=lambda t: (-bm25.idf(t), t))[:per_doc_cap])
-        for term in unique:
-            scores[term] += bm25.idf(term)
-    # Alphabetical tiebreak on the final cutoff too — without it the keyword
-    # set (and thus representativeness) varies run-to-run on IDF ties.
-    return [t for t, _ in sorted(scores.items(), key=lambda x: (-x[1], x[0]))[:n]]
-
-
 # ---------------------------------------------------------------------------
 # Document scoring
 # ---------------------------------------------------------------------------
@@ -195,11 +166,17 @@ def novelty_score(bm25: BM25, doc_tokens: list[str]) -> float:
     Corpus-wide novelty: average IDF of a document's unique vocabulary,
     against the full corpus. Counterweight to representativeness, which
     on its own rewards the most TYPICAL member of a cluster.
+
+    Hapax terms (df == 1) are excluded: they carry maximum IDF but are
+    dominated by OCR artifacts, typos, and ligature damage rather than
+    genuine vocabulary — on a scanned corpus, unfiltered novelty is
+    effectively an OCR-noise detector. A term must appear in at least two
+    documents to count as novel vocabulary rather than noise.
     """
-    unique_terms = set(doc_tokens)
-    if not unique_terms:
+    scoreable = [t for t in set(doc_tokens) if bm25.df.get(t, 0) >= 2]
+    if not scoreable:
         return 0.0
-    return sum(bm25.idf(t) for t in unique_terms) / len(unique_terms)
+    return sum(bm25.idf(t) for t in scoreable) / len(scoreable)
 
 
 # ---------------------------------------------------------------------------
@@ -241,78 +218,8 @@ def percentile_normalize(scores: dict[str, float]) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Citation parsing (Ollama) + connectivity + PageRank
+# Citation connectivity + PageRank
 # ---------------------------------------------------------------------------
-
-_PARSE_PROMPT = """You are a citation parser. Given the list of bibliographic reference strings below, extract each one's title and author names.
-Return ONLY a JSON array with no explanation or markdown fences:
-[{{"title": "...", "authors": ["Last, First", ...]}}, ...]
-
-If a field cannot be determined, use an empty string or empty list.
-
-References:
-{refs}"""
-
-
-def _salvage_ref_objects(raw: str) -> list[dict]:
-    """Recover complete {title, authors} objects from a truncated or
-    malformed JSON array. Entry objects contain no nested braces, so each
-    non-greedy {...} block is parseable on its own; a cut-off final entry
-    is simply skipped instead of poisoning the whole batch."""
-    objects = []
-    for m in re.finditer(r"\{.*?\}", raw, re.DOTALL):
-        try:
-            obj = json.loads(m.group())
-            if isinstance(obj, dict):
-                objects.append(obj)
-        except json.JSONDecodeError:
-            continue
-    return objects
-
-
-def parse_references_ollama(raw_refs: list[str], ollama_url: str, model: str,
-                            batch_size: int = 10, timeout: int = 120) -> list[dict]:
-    """
-    Parses reference strings into structured {title, authors} dicts via an
-    Ollama-hosted model. References are independent of one another, so
-    long lists are split into batches of `batch_size` and the parsed
-    arrays concatenated. Batches must stay small: a 3b model given 50
-    refs at once blows past both the context window (input truncation)
-    and the output token budget (done_reason=length, JSON cut mid-entry),
-    which silently zeroed every batch. num_ctx/num_predict are raised
-    explicitly so Ollama's defaults (4096 ctx, capped output) don't
-    truncate; a batch whose JSON still arrives damaged is salvaged
-    object-by-object rather than dropped whole.
-    """
-    parsed: list[dict] = []
-    for i in range(0, len(raw_refs), batch_size):
-        batch = raw_refs[i:i + batch_size]
-        try:
-            prompt = _PARSE_PROMPT.format(refs="\n".join(f"- {r}" for r in batch))
-            resp = requests.post(
-                f"{ollama_url}/api/generate",
-                json={"model": model, "prompt": prompt, "stream": False,
-                      "options": {"temperature": 0,
-                                  "num_ctx": 8192,
-                                  "num_predict": -1}},
-                timeout=timeout,
-            )
-            if resp.status_code != 200:
-                continue
-            raw = resp.json().get("response", "").strip()
-            match = re.search(r"\[.*\]", raw, re.DOTALL)
-            try:
-                batch_parsed = json.loads(match.group() if match else raw)
-            except json.JSONDecodeError:
-                batch_parsed = _salvage_ref_objects(raw)
-            if isinstance(batch_parsed, list):
-                parsed.extend(p for p in batch_parsed if isinstance(p, dict))
-        except Exception:
-            continue
-    return parsed
-
-
-
 
 def _surname(name: str) -> str:
     """Normalized surname for author matching. Handles both citation-style
@@ -362,7 +269,17 @@ def _titles_match(key: str, ref_title: str, min_contained: int) -> bool:
     return False
 
 
-def build_connectivity(doclings: dict, parse_fn, min_key_length: int,
+def _index_tokens(norm_title: str) -> set[str]:
+    """Informative tokens of a normalized title, for the inverted index.
+    Stopwords and 1-2 char tokens are dropped so posting lists stay short;
+    titles made entirely of such tokens fall back to all their tokens (the
+    exact-title hash join covers them regardless)."""
+    tokens = {t for t in norm_title.split()
+              if len(t) > 2 and t not in _STOPWORDS}
+    return tokens or set(norm_title.split())
+
+
+def build_connectivity(doclings: dict, min_key_length: int,
                        min_contained_length: int = 15) -> dict[str, set[str]]:
     """
     Directed citation adjacency: source_docId -> set of target_docIds it
@@ -372,24 +289,36 @@ def build_connectivity(doclings: dict, parse_fn, min_key_length: int,
         lists (search_doi.js -> crossrefReferences) carry each cited work's
         DOI; when it equals another corpus document's DOI the edge is
         certain, needing no title/author agreement.
-      Phase 2 — fuzzy title match (fallback). For references without a
-        resolvable DOI, the parsed reference's title must match a target by
-        bidirectional containment (via _titles_match: exact equality, or
-        proper containment where the contained side is at least
-        `min_contained_length` chars) AND — when both sides have extracted
-        authors — share at least one author surname (via _surname, which
-        bridges 'Last, First' vs 'First Last'). Keys shorter than
-        `min_key_length` are skipped as too ambiguous.
+      Phase 2 — fuzzy title match (fallback) over GROBID's structured
+        parsedReferences (extract.py). The reference's title must match a
+        target by bidirectional containment (via _titles_match: exact
+        equality, or proper containment where the contained side is at
+        least `min_contained_length` chars) AND — when both sides have
+        extracted authors — share at least one author surname (via
+        _surname, which bridges 'Last, First' vs 'First Last'). Keys
+        shorter than `min_key_length` are skipped as too ambiguous.
+        When both sides carry a created year (metadata.created), edges
+        pointing forward in time are rejected: a paper cannot cite a
+        target created more than a year after it (the +1 absorbs
+        preprint-vs-published skew).
 
-    Both phases degrade gracefully: a doc with no crossrefReferences simply
-    contributes nothing in phase 1 and relies on phase 2; a doc with no DOI
-    can still be a phase-2 target. `parse_fn` is injected (raw_refs ->
-    [{title, authors}]) so the LLM transport is swappable and the matching
-    logic is testable without a model.
+    Docs without parsedReferences contribute no phase-2 edges — the old
+    Ollama fallback for raw reference strings is gone (at 10k docs it meant
+    tens of thousands of LLM calls; GROBID is the only supported parser).
+
+    Phase-2 candidates come from indexes rather than scanning every corpus
+    title per reference (O(refs x titles) dies at 10k docs): an exact hash
+    join on the normalized title, plus an inverted token index — only
+    corpus titles sharing >= 2 informative tokens with the reference title
+    (>= 1 when either side has a single informative token) are verified
+    with _titles_match. Containment implies the contained side's tokens
+    all appear in the containing side, so the token filter never drops a
+    true containment match with >= 2 informative tokens.
     """
-    title_lookup: dict[str, str] = {}
-    author_lookup: dict[str, set[str]] = defaultdict(set)
+    title_lookup: dict[str, str] = {}          # normalized title -> doc_id
     doi_lookup: dict[str, str] = {}
+    surnames_of: dict[str, set[str]] = {}      # doc_id -> author surnames
+    year_of: dict[str, int] = {}               # doc_id -> created year
 
     for doc_id, entry in doclings.items():
         meta = entry.get("metadata", {})
@@ -404,13 +333,30 @@ def build_connectivity(doclings: dict, parse_fn, min_key_length: int,
                       file=sys.stderr)
             else:
                 title_lookup[title] = doc_id
-        for author in (meta.get("authors") or []):
-            a = author.strip().lower()
-            if a and len(a) >= min_key_length:
-                author_lookup[a].add(doc_id)
+        surnames_of[doc_id] = {
+            s for s in (_surname(a) for a in (meta.get("authors") or [])
+                        if len(a.strip()) >= min_key_length)
+            if s
+        }
         doi = _norm_doi(meta.get("doi") or "")
         if doi:
             doi_lookup[doi] = doc_id
+        created = meta.get("created") or {}
+        if isinstance(created, dict) and created.get("year"):
+            year_of[doc_id] = created["year"]
+
+    # Inverted token index over corpus titles (phase-2 candidate generation).
+    key_of: dict[str, str] = {tid: key for key, tid in title_lookup.items()}
+    token_index: dict[str, set[str]] = defaultdict(set)
+    single_token_targets: dict[str, set[str]] = defaultdict(set)
+    for key, target_id in title_lookup.items():
+        tokens = _index_tokens(key)
+        for t in tokens:
+            token_index[t].add(target_id)
+        if len(tokens) == 1:
+            # A 1-token corpus title contained in a longer reference title
+            # shares only that token — it can never reach the 2-token bar.
+            single_token_targets[next(iter(tokens))].add(target_id)
 
     adjacency: dict[str, set[str]] = {doc_id: set() for doc_id in doclings}
 
@@ -427,67 +373,58 @@ def build_connectivity(doclings: dict, parse_fn, min_key_length: int,
             if target_id and target_id != doc_id:
                 adjacency[doc_id].add(target_id)
 
-    # GROBID (extract.py) already ships structured {title, authors} refs in
-    # parsedReferences — use them directly. Only docs missing them (extracted
-    # before the GROBID integration, or while the server was down) go through
-    # the LLM parse, fired in parallel since each call is independent I/O.
-    parsed_map: dict[str, list[dict]] = {}
-    needs_llm: dict[str, list[str]] = {}
-    for doc_id, entry in doclings.items():
-        pre_parsed = entry.get("parsedReferences") or []
-        raw_refs   = entry.get("references") or []
-        if pre_parsed:
-            parsed_map[doc_id] = pre_parsed
-        elif raw_refs:
-            needs_llm[doc_id] = raw_refs
-        else:
-            parsed_map[doc_id] = []
-
-    if needs_llm:
-        with ThreadPoolExecutor() as executor:
-            futures = {
-                executor.submit(parse_fn, refs): doc_id
-                for doc_id, refs in needs_llm.items()
-            }
-            for future in as_completed(futures):
-                doc_id = futures[future]
-                try:
-                    parsed_map[doc_id] = future.result()
-                except Exception:
-                    parsed_map[doc_id] = []
-
     # --- Phase 2: fuzzy title matching (fallback) ----------------------------
-    for doc_id, parsed in parsed_map.items():
-        for ref in parsed:
+    for doc_id, entry in doclings.items():
+        src_year = year_of.get(doc_id)
+        for ref in (entry.get("parsedReferences") or []):
             ref_title = _norm_title(ref.get("title") or "")
-            ref_authors = [a.strip().lower() for a in ref.get("authors", []) if a.strip()]
-
             if not ref_title or len(ref_title) < min_key_length:
                 continue
 
-            # Bidirectional containment: match when the corpus title is inside
-            # the reference title OR vice-versa (see _titles_match). The
-            # reverse direction rescues targets whose stored title carries
-            # extra text (e.g. a copyright banner GROBID glued onto the real
-            # title); the contained-side length guard stops short generic
-            # titles ('networks') from hitting every longer title.
-            title_candidates = {
-                target_id for key, target_id in title_lookup.items()
-                if target_id != doc_id
-                and _titles_match(key, ref_title, min_contained_length)
+            # Candidate targets from the indexes: exact hash join, plus corpus
+            # titles sharing enough informative tokens for containment to be
+            # possible. Verified below with _titles_match, so candidate
+            # generation only needs recall.
+            ref_tokens = _index_tokens(ref_title)
+            need = 1 if len(ref_tokens) == 1 else 2
+            counts = Counter()
+            for t in ref_tokens:
+                for target_id in token_index.get(t, ()):
+                    counts[target_id] += 1
+            candidates = {tid for tid, c in counts.items() if c >= need}
+            for t in ref_tokens:
+                candidates |= single_token_targets.get(t, set())
+            exact = title_lookup.get(ref_title)
+            if exact:
+                candidates.add(exact)
+
+            ref_surnames = {
+                s for s in (_surname(a) for a in ref.get("authors", []) if a.strip())
+                if s
             }
-            if not title_candidates:
-                continue
 
-            ref_surnames = {s for s in (_surname(a) for a in ref_authors) if s}
-
-            for target_id in title_candidates:
-                target_authors = {a for a, ids in author_lookup.items() if target_id in ids}
-                target_surnames = {s for s in (_surname(a) for a in target_authors) if s}
-                # If the corpus doc has no extracted authors we can't verify via
-                # author matching — accept the title match alone rather than
-                # silently dropping the edge. If both sides have authors,
+            for target_id in candidates:
+                if target_id == doc_id:
+                    continue
+                # Bidirectional containment: the corpus title inside the
+                # reference title OR vice-versa (see _titles_match). The
+                # reverse direction rescues targets whose stored title carries
+                # extra text (e.g. a copyright banner GROBID glued onto the
+                # real title); the contained-side length guard stops short
+                # generic titles ('networks') from hitting every longer title.
+                if not _titles_match(key_of[target_id], ref_title, min_contained_length):
+                    continue
+                # A source can't cite a target created after it. Only enforced
+                # when both years are known; +1 year of slack absorbs
+                # preprint-vs-published and month-unknown skew.
+                tgt_year = year_of.get(target_id)
+                if src_year and tgt_year and tgt_year > src_year + 1:
+                    continue
+                # If the corpus doc has no extracted authors we can't verify
+                # via author matching — accept the title match alone rather
+                # than silently dropping the edge. If both sides have authors,
                 # require at least one surname in common.
+                target_surnames = surnames_of.get(target_id, set())
                 if target_surnames and ref_surnames:
                     if not (ref_surnames & target_surnames):
                         continue

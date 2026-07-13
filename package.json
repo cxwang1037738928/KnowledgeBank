@@ -1,12 +1,17 @@
 {
-  "name": "bookwyrm",
+  "name": "opencrawl",
   "version": "1.0.0",
   "description": "Intelligent document retrieval with RAG and cosine similarity search",
   "main": "backend/server.js",
   "type": "module",
   "scripts": {
     "start": "node backend/server.js",
+    "start:test": "cross-env DATA_DIR=tests/test-output node backend/server.js",
     "dev": "node --watch backend/server.js",
+    "dev:test": "cross-env DATA_DIR=tests/test-output node --watch backend/server.js",
+    "dev:web": "npm --prefix frontend run dev",
+    "build:web": "npm --prefix frontend run build",
+    "install:web": "npm --prefix frontend install",
     "install:py": ".venv\\Scripts\\python.exe -m pip install -r backend/extraction/requirements.txt",
     "test:clean": "node tests/test_cleaning.js",
     "test:extract": "node tests/test_extract.js",
@@ -27,6 +32,11 @@
     "multer": "^2.2.0",
     "pdf-parse": "^1.1.1",
     "pdfjs-dist": "^6.1.200",
-    "sharp": "^0.35.2"
+    "sharp": "^0.35.2",
+    "umap-js": "^1.4.0"
+  },
+  "devDependencies": {
+    "cross-env": "^10.1.0",
+    "playwright": "^1.61.1"
   }
 }

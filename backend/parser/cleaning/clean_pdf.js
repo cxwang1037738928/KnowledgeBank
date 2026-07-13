@@ -167,11 +167,15 @@ export async function validatePDF(filePath) {
 }
 
 /**
- * Extracts PDF metadata using pdf-parse.
+ * Extracts PDF metadata using pdf-parse. Only pageCount is kept — the PDF Info
+ * dictionary's Title/Author are unreliable (often null or junk) and unused
+ * downstream; authoritative title/authors come from extract.py (GROBID → LLM →
+ * docling → Crossref) into doclings.json. The parse also serves as a deeper
+ * corruption check.
  * Returns null if the PDF cannot be parsed (treat as corrupted).
  *
  * @param {string} filePath
- * @returns {Promise<{ pageCount: number, title: string|null, author: string|null } | null>}
+ * @returns {Promise<{ pageCount: number } | null>}
  */
 export async function extractPDFMeta(filePath) {
   try {
@@ -179,8 +183,6 @@ export async function extractPDFMeta(filePath) {
     const result = await pdfParse(buffer, { max: 0 }); // max:0 = parse metadata only, skip full text
     return {
       pageCount: result.numpages,
-      title: result.info?.Title || null,
-      author: result.info?.Author || null,
     };
   } catch {
     return null;
@@ -222,8 +224,6 @@ export async function ingestDocument(filePath, { enqueue = true } = {}) {
     fileSize: validation.fileSize,
     sha256: validation.hash,
     pageCount: pdfMeta.pageCount,
-    title: pdfMeta.title,
-    author: pdfMeta.author,
     uploadedAt: now,
     status: STATUS.PENDING,
     statusUpdatedAt: now,
@@ -341,8 +341,6 @@ export async function scanAndIngestDirectory() {
  * @property {number}   fileSize
  * @property {string}   sha256
  * @property {number}   pageCount
- * @property {string|null} title
- * @property {string|null} author
  * @property {string}   uploadedAt
  * @property {string}   status        - pending | processing | completed | failed
  * @property {string}   statusUpdatedAt

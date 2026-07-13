@@ -8,7 +8,6 @@
  *
  * Prerequisite: tests/test-output/doclings.json, embeddings.json, categories.json
  *   (produced by test_extract.js, test_embed.js, test_generate_categories.js)
- * Needs Ollama running with CITATION_MODEL (default ministral-3:3b-instruct-2512-q4_K_M).
  *
  * Outputs:
  *   tests/test-output/heuristic_output.json
@@ -27,7 +26,7 @@ process.env.DATA_DIR = TEST_DATA;
 
 await fs.mkdir(TEST_DATA, { recursive: true });
 
-const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'heuristic.py');
+const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'heuristic.py');
 const PYTHON       = process.env.PYTHON || 'python';
 
 const argv = process.argv;
@@ -35,7 +34,7 @@ const i    = argv.indexOf('--k');
 const k    = i !== -1 ? argv[i + 1] : '5';
 
 const start = Date.now();
-console.log(`[test_heuristic] Spawning heuristic.py --k ${k} (${PYTHON}; GROBID parsedReferences, Ollama only as legacy fallback) ...\n`);
+console.log(`[test_heuristic] Spawning heuristic.py --k ${k} (${PYTHON}; GROBID parsedReferences, no LLM) ...\n`);
 
 await new Promise((resolve, reject) => {
   const proc = spawn(PYTHON, [HEURISTIC_PY, '--k', k], { stdio: 'inherit', cwd: ROOT });
@@ -58,8 +57,8 @@ console.log(`  ${heuristic.edges.length} citation edge(s) across the corpus`);
 if (heuristic.edges.length === 0) {
   console.warn('  WARNING: zero citation edges — PageRank is uniform, so ranking is');
   console.warn('           effectively BM25-only. Usual causes: missing metadata.title/');
-  console.warn('           authors (see test_extract.js coverage summary), empty');
-  console.warn('           references arrays, or citation model parsing failures.');
+  console.warn('           authors (see test_extract.js coverage summary), or empty');
+  console.warn('           parsedReferences arrays (GROBID down during extraction).');
 }
 
 const elapsed = ((Date.now() - start) / 1000).toFixed(2);

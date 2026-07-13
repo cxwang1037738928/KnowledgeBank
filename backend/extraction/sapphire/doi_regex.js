@@ -9,22 +9,35 @@
  * full of OTHER papers' DOIs that must not be picked up.
  *
  * Exports:
- *   findDoi(text)   — re-exported from regex_utils.js (pattern lives there)
+ *   findDoi(text)   — first DOI in a string, or null
  *   annotateDois()  — read doclings.json, set metadata.doi on every entry,
  *                     write it back; returns {docId: doi|null}
  *
- * Run directly: node backend/extraction/doi_regex.js
+ * Run directly: node backend/extraction/sapphire/doi_regex.js
  */
 
 import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { findDoi } from './regex_utils.js';
 
-export { findDoi };
+// Crossref-recommended pattern: matches 98%+ of DOIs issued since 2000.
+// 10.<4-9 digit registrant>/<suffix of allowed characters>.
+export const DOI_RE = /\b10\.\d{4,9}\/[-._;()/:a-zA-Z0-9]+/g;
 
-const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+/**
+ * First DOI found in `text`, or null. Trailing punctuation that regularly
+ * glues onto DOIs in extracted text (sentence periods, closing parens) is
+ * stripped from the match.
+ */
+export function findDoi(text) {
+  if (!text) return null;
+  const match = text.match(DOI_RE);
+  if (!match) return null;
+  return match[0].replace(/[.,;)\]]+$/, '') || null;
+}
+
+const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const DATA_DIR      = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const DOCLINGS_PATH = path.join(DATA_DIR, 'doclings.json');
 
@@ -62,7 +75,7 @@ export async function annotateDois() {
   return found;
 }
 
-// Run directly: node backend/extraction/doi_regex.js
+// Run directly: node backend/extraction/sapphire/doi_regex.js
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   annotateDois().catch((err) => {
     console.error('[doi_regex]', err.message);

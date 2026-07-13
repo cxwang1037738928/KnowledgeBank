@@ -25,7 +25,7 @@ process.env.DATA_DIR = TEST_DATA;
 
 await fs.mkdir(TEST_DATA, { recursive: true });
 
-const { buildGraph } = await import('../backend/extraction/build_graph.js');
+const { buildGraph } = await import('../backend/extraction/sapphire/build_graph.js');
 
 const start = Date.now();
 console.log('[test_build_graph] Building knowledge graph ...\n');
