@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import Chat from './components/Chat.jsx';
+import DocumentViewer from './components/DocumentViewer.jsx';
 import EmbeddingSpace from './components/EmbeddingSpace.jsx';
 import KnowledgeGraph from './components/KnowledgeGraph.jsx';
 import ModelsPanel from './components/ModelsPanel.jsx';
@@ -16,6 +17,12 @@ const ICONS = {
   chat: (
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" aria-hidden="true">
       <path d="M2.5 3.5h11v7h-6l-3 3v-3h-2z" />
+    </svg>
+  ),
+  docs: (
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round" aria-hidden="true">
+      <path d="M4 1.5h6l2.5 2.5v10.5h-8.5z M10 1.5v2.5h2.5" />
+      <path d="M6 8h4 M6 10.5h4" strokeLinecap="round" />
     </svg>
   ),
   space: (
@@ -41,6 +48,7 @@ const ICONS = {
 
 const TABS = [
   { id: 'chat',   label: 'Chat' },
+  { id: 'docs',   label: 'Documents' },
   { id: 'space',  label: 'Embedding Space' },
   { id: 'graph',  label: 'Knowledge Graph' },
   { id: 'models', label: 'Models' },
@@ -61,8 +69,16 @@ function ComingSoon({ crawler }) {
 export default function App() {
   const [tab, setTab] = useState('chat');
   const [controlsEl, setControlsEl] = useState(null);
+  const [docTarget, setDocTarget] = useState(null);   // { docId, chunkId, nonce }
   const { crawler, setCrawler } = useCrawler();
   const live = crawler === 'sapphire';
+
+  // A [n] citation (or source chip) was clicked in Chat: jump to the cited
+  // chunk in the Documents tab.
+  const openCitation = (src) => {
+    setDocTarget({ docId: src.docId, chunkId: src.chunkId, nonce: Date.now() });
+    setTab('docs');
+  };
 
   return (
     <div className="app">
@@ -118,7 +134,10 @@ export default function App() {
             {/* Tabs stay mounted so camera position / graph layout / chat
                 history survive tab switches; hidden ones are display:none. */}
             <div className="viz-fill" style={{ display: tab === 'chat' ? 'block' : 'none' }}>
-              <Chat active={tab === 'chat'} />
+              <Chat active={tab === 'chat'} onCitation={openCitation} />
+            </div>
+            <div className="viz-fill" style={{ display: tab === 'docs' ? 'block' : 'none' }}>
+              {controlsEl && <DocumentViewer controlsEl={controlsEl} active={tab === 'docs'} target={docTarget} />}
             </div>
             <div className="viz-fill" style={{ display: tab === 'space' ? 'block' : 'none' }}>
               {controlsEl && <EmbeddingSpace controlsEl={controlsEl} active={tab === 'space'} />}

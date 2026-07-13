@@ -151,10 +151,21 @@ def _choose_converter(doc_meta: dict) -> DocumentConverter:
 # ---------------------------------------------------------------------------
 
 def _extract_sections(doc) -> list[dict]:
-    """Walk the document body and collect (heading, body-text) pairs."""
+    """Walk the document body and collect (heading, body-text, page-range)."""
     sections = []
     current_heading = None
     current_text_parts = []
+    current_pages: list[int] = []
+
+    def _flush():
+        if current_heading is None and not current_text_parts:
+            return
+        sections.append({
+            "heading": current_heading or "",
+            "text": " ".join(current_text_parts),
+            # 1-based inclusive [first, last]; None when docling has no prov
+            "pages": [min(current_pages), max(current_pages)] if current_pages else None,
+        })
 
     for item, _ in doc.iterate_items():
         label = getattr(item, "label", None)
@@ -162,32 +173,35 @@ def _extract_sections(doc) -> list[dict]:
         if not text:
             continue
 
+        prov = getattr(item, "prov", None) or []
+        page = getattr(prov[0], "page_no", None) if prov else None
+
         if label in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
-            if current_heading is not None or current_text_parts:
-                sections.append({
-                    "heading": current_heading or "",
-                    "text": " ".join(current_text_parts),
-                })
+            _flush()
             current_heading = text
             current_text_parts = []
+            current_pages = [page] if page else []
         else:
             current_text_parts.append(text)
+            if page:
+                current_pages.append(page)
 
-    if current_heading is not None or current_text_parts:
-        sections.append({
-            "heading": current_heading or "",
-            "text": " ".join(current_text_parts),
-        })
+    _flush()
     return sections
 
 
-def _extract_tables(doc) -> list[str]:
+def _extract_tables(doc) -> list[dict]:
+    """[{text, page}] — page is 1-based, None without provenance.
+    (Older extracts stored plain strings; chunker.js accepts both.)"""
     tables = []
     for tbl in doc.tables:
         try:
-            tables.append(tbl.export_to_markdown())
+            text = tbl.export_to_markdown()
         except Exception:
-            tables.append(str(tbl))
+            text = str(tbl)
+        prov = getattr(tbl, "prov", None) or []
+        page = getattr(prov[0], "page_no", None) if prov else None
+        tables.append({"text": text, "page": page})
     return tables
 
 

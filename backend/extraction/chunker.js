@@ -118,10 +118,15 @@ export function chunkText(text, chunkSize = DEFAULTS.chunkSize, overlap = DEFAUL
 // ---------------------------------------------------------------------------
 
 /**
- * chunkDocument(entry, opts) → [{ text, heading, sectionIndex, type }]
+ * chunkDocument(entry, opts) → [{ text, heading, sectionIndex, type, pages, prefixLen }]
  *
  * entry is one value from doclings.json:
- *   { text, markdown, sections: [{heading, text}], tables: [str], metadata }
+ *   { text, markdown, sections: [{heading, text, pages}], tables: [str], metadata }
+ *
+ * pages is the section's 1-based [first, last] PDF page range (null when the
+ * extractor recorded no provenance); prefixLen is the length in characters of
+ * the embedded "title — heading\n" prefix, so a viewer can strip it before
+ * locating the chunk body in the source PDF.
  *
  * Strategy:
  *   1. Merge runs of tiny sections (< minSectionMerge words) into one unit so
@@ -145,11 +150,19 @@ export function chunkDocument(entry, opts = {}) {
       heading: null,
       sectionIndex: null,
       type: 'text',
+      pages: null,
+      prefixLen: 0,
     }));
   }
 
+  const mergePages = (a, b) => {
+    if (!a) return b || null;
+    if (!b) return a;
+    return [Math.min(a[0], b[0]), Math.max(a[1], b[1])];
+  };
+
   // --- 1. merge tiny adjacent sections -------------------------------------
-  const units = []; // { heading, text, sectionIndex }
+  const units = []; // { heading, text, sectionIndex, pages }
   for (let i = 0; i < sections.length; i++) {
     const sec = sections[i];
     const body = (sec.text || '').trim();
@@ -160,8 +173,9 @@ export function chunkDocument(entry, opts = {}) {
     if (last && wordCount(last.text) < minSectionMerge && words < minSectionMerge) {
       last.text = [last.text, heading ? `${heading}. ${body}` : body]
         .filter(Boolean).join(' ');
+      last.pages = mergePages(last.pages, sec.pages || null);
     } else {
-      units.push({ heading, text: body, sectionIndex: i });
+      units.push({ heading, text: body, sectionIndex: i, pages: sec.pages || null });
     }
   }
 
@@ -181,23 +195,31 @@ export function chunkDocument(entry, opts = {}) {
         heading: unit.heading || null,
         sectionIndex: unit.sectionIndex,
         type: 'text',
+        pages: unit.pages,
+        prefixLen: prefix.length,
       });
     }
   }
 
   // --- 3. tables as standalone chunks ---------------------------------------
-  (entry.tables || []).forEach((tbl, i) => {
-    const t = (tbl || '').trim();
+  // Tables are {text, page} since page provenance landed; older extracts
+  // stored plain markdown strings.
+  (entry.tables || []).forEach((tbl) => {
+    const t = ((typeof tbl === 'string' ? tbl : tbl?.text) || '').trim();
     if (!t) return;
+    const page = typeof tbl === 'object' ? tbl?.page ?? null : null;
     const words = t.split(/\s+/);
     const truncated = words.length > maxTableWords
       ? words.slice(0, maxTableWords).join(' ') + ' …'
       : t;
+    const tablePrefix = title ? `${title} — Table\n` : '';
     out.push({
-      text: (title ? `${title} — Table\n` : '') + truncated,
+      text: tablePrefix + truncated,
       heading: 'Table',
       sectionIndex: null,
       type: 'table',
+      pages: page ? [page, page] : null,
+      prefixLen: tablePrefix.length,
     });
   });
 

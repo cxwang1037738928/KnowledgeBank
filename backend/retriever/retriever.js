@@ -116,9 +116,11 @@ export async function retrieve(queryEmbedding, queryText, { topK = DEFAULT_TOP_K
   scored.sort((a, b) => b.score - a.score);
 
   return scored.slice(0, topK).map(({ chunk, sim, boost, score }) => ({
+    chunkId:  chunk.id,
     docId:    chunk.docId,
     filename: chunk.filename,
     heading:  chunk.heading,
+    pages:    chunk.pages ?? null,
     text:     chunk.text,
     sim:      Math.round(sim * 10000) / 10000,
     boost:    Math.round(boost * 10000) / 10000,

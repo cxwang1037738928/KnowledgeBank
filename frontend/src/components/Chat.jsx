@@ -38,7 +38,39 @@ async function embedQuery(text, onStatus) {
   return Array.from(out.data);
 }
 
-function Sources({ sources }) {
+/**
+ * Render reply text with [n] citation markers as clickable links that jump
+ * to the cited chunk in the Documents tab ([1, 3] style groups included).
+ */
+function CitedText({ text, sources, onCitation }) {
+  if (!sources?.length || !onCitation) return text;
+  const parts = text.split(/(\[\d+(?:\s*,\s*\d+)*\])/g);
+  return parts.map((part, i) => {
+    const m = part.match(/^\[(\d+(?:\s*,\s*\d+)*)\]$/);
+    if (!m) return part;
+    const nums = m[1].split(',').map((n) => parseInt(n, 10));
+    if (nums.some((n) => n < 1 || n > sources.length)) return part;
+    return (
+      <span className="citation-group" key={i}>
+        {nums.map((n) => {
+          const src = sources[n - 1];
+          return (
+            <button
+              key={n}
+              className="citation-link"
+              title={`${src.filename}${src.heading ? ` — ${src.heading}` : ''}${src.pages ? ` · p.${src.pages[0]}` : ''}`}
+              onClick={() => onCitation(src)}
+            >
+              {n}
+            </button>
+          );
+        })}
+      </span>
+    );
+  });
+}
+
+function Sources({ sources, onCitation }) {
   if (!sources?.length) return null;
   // One chip per document, best-scoring chunk first.
   const byDoc = [];
@@ -48,15 +80,20 @@ function Sources({ sources }) {
   return (
     <div className="msg-sources">
       {byDoc.map((s) => (
-        <span className="source-chip" key={s.docId} title={`${s.heading || 'document'} · score ${s.score}`}>
+        <button
+          className="source-chip"
+          key={s.docId}
+          title={`${s.heading || 'document'} · score ${s.score} — open in Documents`}
+          onClick={() => onCitation?.(s)}
+        >
           {s.filename.replace(/\.pdf$/i, '')}
-        </span>
+        </button>
       ))}
     </div>
   );
 }
 
-export default function Chat({ active }) {
+export default function Chat({ active, onCitation }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [status, setStatus] = useState(null);   // busy string | null
@@ -122,8 +159,10 @@ export default function Chat({ active }) {
               <div className="msg assistant error" key={i}>{m.error}</div>
             ) : (
               <div className="msg assistant" key={i}>
-                <div className="msg-body">{m.content}</div>
-                <Sources sources={m.sources} />
+                <div className="msg-body">
+                  <CitedText text={m.content} sources={m.sources} onCitation={onCitation} />
+                </div>
+                <Sources sources={m.sources} onCitation={onCitation} />
               </div>
             )
           )}

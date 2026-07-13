@@ -7,7 +7,8 @@
  *
  * POST /api/chat
  *   Request:  { messages: [{role:'user'|'assistant', content}], queryEmbedding: number[] }
- *   Response: { reply, model, sources: [{docId, filename, heading, sim, boost, score}] }
+ *   Response: { reply, model, sources: [{chunkId, docId, filename, heading, pages, sim, boost, score}] }
+ *             sources[n-1] is what a [n] citation marker in reply refers to
  *   Errors:   400 bad payload · 502 Ollama failure · 503 missing corpus/model
  */
 

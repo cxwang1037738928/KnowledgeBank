@@ -123,7 +123,8 @@ export async function embedAll({ force = false } = {}) {
         id:           `${docId}_${i}`,
         docId,
         filename:     entry.filename,
-        pageNumber:   null,
+        pages:        chunk.pages ?? null,      // 1-based [first, last] in the source PDF
+        prefixLen:    chunk.prefixLen ?? 0,     // chars of embedded heading prefix in text
         chunkIndex:   i,
         heading:      chunk.heading,
         sectionIndex: chunk.sectionIndex,

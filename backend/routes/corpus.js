@@ -11,6 +11,10 @@
  *          (same vectors, same mutual-kNN gate, same threshold semantics)
  *          with no server round-trip.
  *   GET  /graph         — data/graph.json passthrough (knowledge graph).
+ *   GET  /documents     — corpus document list (id, filename, title, authors).
+ *   GET  /documents/:docId/pdf — streams the original source PDF.
+ *   GET  /chunks/:chunkId — one indexed chunk (text, pages, prefixLen) so the
+ *          viewer can locate and highlight it in the PDF.
  *   GET  /models        — installed Ollama models + current per-role choices.
  *   POST /settings      — persist per-role model choices to .env and
  *          process.env, so pipeline spawns pick them up immediately.
@@ -171,6 +175,63 @@ corpusRouter.get('/graph', wrap(async (req, res) => {
   } catch {
     throw httpError(404, 'graph.json not found — run the build-graph stage first');
   }
+}));
+
+// ---------------------------------------------------------------------------
+// Documents + chunks (citation deep-links)
+// ---------------------------------------------------------------------------
+
+const DOCLINGS_PATH   = path.join(DATA_DIR, 'doclings.json');
+const EMBEDDINGS_PATH = path.join(DATA_DIR, 'embeddings.json');
+
+// Both files are MBs; memoize each parse on its mtime.
+const fileCache = new Map();
+async function readJsonCached(filePath, missing) {
+  const mtime = await fs.stat(filePath).then((s) => s.mtimeMs).catch(() => null);
+  if (mtime === null) throw httpError(404, missing);
+  const hit = fileCache.get(filePath);
+  if (hit?.mtime === mtime) return hit.data;
+  const data = JSON.parse(await fs.readFile(filePath, 'utf-8'));
+  fileCache.set(filePath, { mtime, data });
+  return data;
+}
+
+const loadDoclings = () =>
+  readJsonCached(DOCLINGS_PATH, 'doclings.json not found — run the extract stage first');
+
+corpusRouter.get('/documents', wrap(async (req, res) => {
+  const doclings = await loadDoclings();
+  const docs = Object.values(doclings).map((d) => ({
+    docId:    d.docId,
+    filename: d.filename,
+    title:    d.metadata?.title || d.filename,
+    authors:  d.metadata?.authors || [],
+    created:  d.metadata?.created || null,
+  }));
+  docs.sort((a, b) => a.title.localeCompare(b.title));
+  res.json({ documents: docs });
+}));
+
+corpusRouter.get('/documents/:docId/pdf', wrap(async (req, res) => {
+  const doclings = await loadDoclings();
+  const entry = doclings[req.params.docId];
+  if (!entry) throw httpError(404, `Unknown document "${req.params.docId}"`);
+  try {
+    await fs.access(entry.filePath);
+  } catch {
+    throw httpError(404, `Source PDF missing on disk: ${entry.filename}`);
+  }
+  res.type('application/pdf');
+  res.sendFile(path.resolve(entry.filePath));
+}));
+
+corpusRouter.get('/chunks/:chunkId', wrap(async (req, res) => {
+  const store = await readJsonCached(
+    EMBEDDINGS_PATH, 'embeddings.json not found — run the embed stage first');
+  const chunk = (store.chunks || []).find((c) => c.id === req.params.chunkId);
+  if (!chunk) throw httpError(404, `Unknown chunk "${req.params.chunkId}"`);
+  const { embedding, ...rest } = chunk;
+  res.json(rest);
 }));
 
 // ---------------------------------------------------------------------------

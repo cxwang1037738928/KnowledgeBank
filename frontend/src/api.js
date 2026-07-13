@@ -10,6 +10,9 @@ async function request(url, options) {
 export const getEmbeddingMap = () => request('/api/corpus/embedding-map');
 export const getGraph        = () => request('/api/corpus/graph');
 export const getModels       = () => request('/api/corpus/models');
+export const getDocuments    = () => request('/api/corpus/documents');
+export const getChunk        = (chunkId) => request(`/api/corpus/chunks/${encodeURIComponent(chunkId)}`);
+export const documentPdfUrl  = (docId) => `/api/corpus/documents/${encodeURIComponent(docId)}/pdf`;
 
 export const saveSettings = (updates) =>
   request('/api/corpus/settings', {
