@@ -6,6 +6,7 @@
  *                    heuristic, build-graph, run, status)
  *   /api/corpus    — read-only data access for the frontend (embedding map,
  *                    knowledge graph) + model settings
+ *   /api/chat      — RAG chat (retriever/ + Ollama REASONING_MODEL)
  *
  * Serves frontend/dist statically when it exists (npm run build:web);
  * during development run the Vite dev server instead (npm run dev:web).
@@ -22,6 +23,7 @@ import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { pipelineRouter } from './routes/pipeline.js';
 import { corpusRouter } from './routes/corpus.js';
+import { chatRouter } from './routes/chat.js';
 
 const app  = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -36,6 +38,7 @@ app.use(express.json());
 
 app.use('/api/pipeline', pipelineRouter);
 app.use('/api/corpus', corpusRouter);
+app.use('/api/chat', chatRouter);
 
 // ── Frontend (production build) ──────────────────────────────────────────────
 

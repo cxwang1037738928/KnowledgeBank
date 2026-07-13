@@ -43,7 +43,7 @@ export const MODEL_ROLES = {
   EXTRACTION_MODEL:       'Other extraction tasks (extract.py)',
   QUERY_CLASSIFIER_MODEL: 'Query classification (parse_user_query.js)',
   KG_MODEL:               'Knowledge-graph construction (LightRAG, upcoming)',
-  REASONING_MODEL:        'Answer synthesis / reasoning over retrieved context (upcoming)',
+  REASONING_MODEL:        'Answer synthesis over retrieved chunks (/api/chat)',
 };
 
 export const corpusRouter = express.Router();
