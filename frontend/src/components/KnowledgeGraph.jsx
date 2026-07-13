@@ -17,19 +17,20 @@ function useSize(ref, active) {
   const [size, setSize] = useState({ w: 0, h: 0 });
 
   useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
+    const wrapEl = ref.current;
+    if (!wrapEl) return;
     const measure = () => {
-      const w = el.clientWidth;
-      const h = el.clientHeight;
-      setSize((s) => (s.w === w && s.h === h ? s : { w, h }));
+      const width = wrapEl.clientWidth;
+      const height = wrapEl.clientHeight;
+      setSize((prevSize) =>
+        (prevSize.w === width && prevSize.h === height ? prevSize : { w: width, h: height }));
     };
     measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(el);
+    const resizeObserver = new ResizeObserver(measure);
+    resizeObserver.observe(wrapEl);
     window.addEventListener('resize', measure);
     return () => {
-      ro.disconnect();
+      resizeObserver.disconnect();
       window.removeEventListener('resize', measure);
     };
   }, [ref, active]);
@@ -38,50 +39,56 @@ function useSize(ref, active) {
 }
 
 export default function KnowledgeGraph({ controlsEl, active }) {
-  const [raw, setRaw] = useState(null);
+  const [graphJson, setGraphJson] = useState(null);
   const [error, setError] = useState(null);
   const [showSections, setShowSections] = useState(true);
   const [showCites, setShowCites] = useState(true);
   const wrapRef = useRef(null);
-  const { w, h } = useSize(wrapRef, active);
+  const { w: width, h: height } = useSize(wrapRef, active);
 
   useEffect(() => {
-    getGraph().then(setRaw).catch((e) => setError(e.message));
+    getGraph().then(setGraphJson).catch((err) => setError(err.message));
   }, []);
 
   // graph.json → force-graph shape, defensively: edges referencing nodes that
   // were never materialized (known build_graph.js stub gap, pending the
   // LightRAG migration) would crash the layout, so they're dropped + counted.
   const { data, stats } = useMemo(() => {
-    if (!raw) return { data: null, stats: null };
-    const keepNode = (n) => showSections || n.type !== 'section';
-    const nodes = raw.nodes.filter(keepNode).map((n) => ({
-      id: n.id,
-      name: n.type === 'document' ? (n.label || n.filename) : `${n.label} — ${n.preview?.slice(0, 80) ?? ''}`,
-      type: n.type,
-      created: n.created,
+    if (!graphJson) return { data: null, stats: null };
+    const keepNode = (graphNode) => showSections || graphNode.type !== 'section';
+    const nodes = graphJson.nodes.filter(keepNode).map((graphNode) => ({
+      id: graphNode.id,
+      name: graphNode.type === 'document'
+        ? (graphNode.label || graphNode.filename)
+        : `${graphNode.label} — ${graphNode.preview?.slice(0, 80) ?? ''}`,
+      type: graphNode.type,
+      created: graphNode.created,
     }));
-    const ids = new Set(nodes.map((n) => n.id));
-    let dangling = 0;
-    const links = raw.edges
-      .filter((e) => {
-        if (e.type === 'cites' && !showCites) return false;
-        if (e.type === 'has_section' && !showSections) return false;
-        const ok = ids.has(e.source) && ids.has(e.target);
-        if (!ok && (showSections || e.type === 'cites')) dangling++;
-        return ok;
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    let danglingCount = 0;
+    const links = graphJson.edges
+      .filter((graphEdge) => {
+        if (graphEdge.type === 'cites' && !showCites) return false;
+        if (graphEdge.type === 'has_section' && !showSections) return false;
+        const endpointsPresent = nodeIds.has(graphEdge.source) && nodeIds.has(graphEdge.target);
+        if (!endpointsPresent && (showSections || graphEdge.type === 'cites')) danglingCount++;
+        return endpointsPresent;
       })
-      .map((e) => ({ source: e.source, target: e.target, type: e.type }));
+      .map((graphEdge) => ({
+        source: graphEdge.source,
+        target: graphEdge.target,
+        type: graphEdge.type,
+      }));
     return {
       data: { nodes, links },
       stats: {
-        docs: raw.nodes.filter((n) => n.type === 'document').length,
-        sections: raw.nodes.filter((n) => n.type === 'section').length,
-        cites: raw.edges.filter((e) => e.type === 'cites').length,
-        dangling,
+        docs: graphJson.nodes.filter((graphNode) => graphNode.type === 'document').length,
+        sections: graphJson.nodes.filter((graphNode) => graphNode.type === 'section').length,
+        cites: graphJson.edges.filter((graphEdge) => graphEdge.type === 'cites').length,
+        dangling: danglingCount,
       },
     };
-  }, [raw, showSections, showCites]);
+  }, [graphJson, showSections, showCites]);
 
   // Night-sky canvas colors (a canvas can't resolve CSS vars itself).
   // Documents are the star-blue accent; sections recede to slate; citation
@@ -107,7 +114,7 @@ export default function KnowledgeGraph({ controlsEl, active }) {
           <input
             type="checkbox"
             checked={showSections}
-            onChange={(e) => setShowSections(e.target.checked)}
+            onChange={(event) => setShowSections(event.target.checked)}
           />
           Section nodes
         </label>
@@ -115,7 +122,7 @@ export default function KnowledgeGraph({ controlsEl, active }) {
           <input
             type="checkbox"
             checked={showCites}
-            onChange={(e) => setShowCites(e.target.checked)}
+            onChange={(event) => setShowCites(event.target.checked)}
           />
           Citation edges
         </label>
@@ -148,18 +155,18 @@ export default function KnowledgeGraph({ controlsEl, active }) {
 
   return (
     <div ref={wrapRef} className="viz-fill">
-      {w > 0 && (
+      {width > 0 && (
         <ForceGraph2D
-          width={w}
-          height={h}
+          width={width}
+          height={height}
           graphData={data}
           backgroundColor="rgba(0,0,0,0)"
-          nodeVal={(n) => (n.type === 'document' ? 7 : 1.6)}
-          nodeColor={(n) => (n.type === 'document' ? palette.doc : palette.section)}
-          nodeLabel={(n) => n.name}
-          linkColor={(l) => (l.type === 'cites' ? palette.cite : palette.member)}
-          linkWidth={(l) => (l.type === 'cites' ? 1.6 : 0.5)}
-          linkDirectionalArrowLength={(l) => (l.type === 'cites' ? 5 : 0)}
+          nodeVal={(node) => (node.type === 'document' ? 7 : 1.6)}
+          nodeColor={(node) => (node.type === 'document' ? palette.doc : palette.section)}
+          nodeLabel={(node) => node.name}
+          linkColor={(link) => (link.type === 'cites' ? palette.cite : palette.member)}
+          linkWidth={(link) => (link.type === 'cites' ? 1.6 : 0.5)}
+          linkDirectionalArrowLength={(link) => (link.type === 'cites' ? 5 : 0)}
           linkDirectionalArrowRelPos={0.95}
           cooldownTicks={200}
         />

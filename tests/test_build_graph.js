@@ -31,20 +31,20 @@ const start = Date.now();
 console.log('[test_build_graph] Building knowledge graph ...\n');
 const graph = await buildGraph();
 
-const docNodes     = graph.nodes.filter((n) => n.type === 'document').length;
-const sectionNodes = graph.nodes.filter((n) => n.type === 'section').length;
-const citeEdges    = graph.edges.filter((e) => e.type === 'cites').length;
-const sectionEdges = graph.edges.filter((e) => e.type === 'has_section').length;
+const docNodes     = graph.nodes.filter((node) => node.type === 'document').length;
+const sectionNodes = graph.nodes.filter((node) => node.type === 'section').length;
+const citeEdges    = graph.edges.filter((edge) => edge.type === 'cites').length;
+const sectionEdges = graph.edges.filter((edge) => edge.type === 'has_section').length;
 
 console.log('[test_build_graph] Graph summary:');
 console.log(`  nodes: ${docNodes} document, ${sectionNodes} section`);
 console.log(`  edges: ${citeEdges} cites, ${sectionEdges} has_section`);
 
-const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+const elapsed   = ((Date.now() - start) / 1000).toFixed(2);
+const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 await fs.appendFile(
   path.join(ROOT, 'tests', 'test_log.txt'),
-  `[${ts}] test_build_graph         : ${elapsed}s\n`,
+  `[${timestamp}] test_build_graph         : ${elapsed}s\n`,
   'utf-8',
 );
 console.log(`\nDone in ${elapsed}s. All outputs in tests/test-output/.`);

@@ -4,25 +4,25 @@
 // clustering (generate_categories.js) exactly at any threshold.
 
 class UnionFind {
-  constructor(n) {
-    this.parent = Array.from({ length: n }, (_, i) => i);
-    this.rank = new Array(n).fill(0);
+  constructor(pointCount) {
+    this.parent = Array.from({ length: pointCount }, (_, pointIdx) => pointIdx);
+    this.rank = new Array(pointCount).fill(0);
   }
 
-  find(x) {
-    while (this.parent[x] !== x) {
-      this.parent[x] = this.parent[this.parent[x]];
-      x = this.parent[x];
+  find(pointIdx) {
+    while (this.parent[pointIdx] !== pointIdx) {
+      this.parent[pointIdx] = this.parent[this.parent[pointIdx]];
+      pointIdx = this.parent[pointIdx];
     }
-    return x;
+    return pointIdx;
   }
 
-  union(x, y) {
-    const px = this.find(x), py = this.find(y);
-    if (px === py) return;
-    if (this.rank[px] < this.rank[py]) this.parent[px] = py;
-    else if (this.rank[px] > this.rank[py]) this.parent[py] = px;
-    else { this.parent[py] = px; this.rank[px]++; }
+  union(leftIdx, rightIdx) {
+    const leftRoot = this.find(leftIdx), rightRoot = this.find(rightIdx);
+    if (leftRoot === rightRoot) return;
+    if (this.rank[leftRoot] < this.rank[rightRoot]) this.parent[leftRoot] = rightRoot;
+    else if (this.rank[leftRoot] > this.rank[rightRoot]) this.parent[rightRoot] = leftRoot;
+    else { this.parent[rightRoot] = leftRoot; this.rank[leftRoot]++; }
   }
 }
 
@@ -32,28 +32,28 @@ class UnionFind {
  * by cluster size (0 = largest — stable palette slots for the biggest
  * clusters), `clusters` is [{ index, members }] in that same order.
  */
-export function clusterize(n, edges, threshold) {
-  const uf = new UnionFind(n);
-  for (const { i, j, sim } of edges) {
-    if (sim >= threshold) uf.union(i, j);
+export function clusterize(pointCount, edges, threshold) {
+  const unionFind = new UnionFind(pointCount);
+  for (const { i: sourceIdx, j: targetIdx, sim } of edges) {
+    if (sim >= threshold) unionFind.union(sourceIdx, targetIdx);
   }
 
-  const byRoot = new Map();
-  for (let i = 0; i < n; i++) {
-    const root = uf.find(i);
-    if (!byRoot.has(root)) byRoot.set(root, []);
-    byRoot.get(root).push(i);
+  const membersByRoot = new Map();
+  for (let pointIdx = 0; pointIdx < pointCount; pointIdx++) {
+    const root = unionFind.find(pointIdx);
+    if (!membersByRoot.has(root)) membersByRoot.set(root, []);
+    membersByRoot.get(root).push(pointIdx);
   }
 
   // Size-descending, first-member tiebreak so slot colors are stable while
   // the slider moves (largest topics keep their hue).
-  const groups = [...byRoot.values()].sort(
-    (a, b) => b.length - a.length || a[0] - b[0]
+  const groups = [...membersByRoot.values()].sort(
+    (groupA, groupB) => groupB.length - groupA.length || groupA[0] - groupB[0]
   );
 
-  const assign = new Int32Array(n);
-  groups.forEach((members, idx) => {
-    for (const m of members) assign[m] = idx;
+  const assign = new Int32Array(pointCount);
+  groups.forEach((members, clusterIdx) => {
+    for (const memberIdx of members) assign[memberIdx] = clusterIdx;
   });
 
   return { assign, clusters: groups.map((members, index) => ({ index, members })) };

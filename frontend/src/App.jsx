@@ -55,12 +55,12 @@ const TABS = [
 ];
 
 function ComingSoon({ crawler }) {
-  const c = CRAWLERS[crawler];
+  const crawlerInfo = CRAWLERS[crawler];
   return (
     <div className="viz-empty">
-      {GEM(c.accent, 44)}
-      <h2>{c.name}</h2>
-      <p>The {c.tagline} crawler is on the roadmap — its pipeline hasn't landed yet.</p>
+      {GEM(crawlerInfo.accent, 44)}
+      <h2>{crawlerInfo.name}</h2>
+      <p>The {crawlerInfo.tagline} crawler is on the roadmap — its pipeline hasn't landed yet.</p>
       <p>Switch back to Sapphire to explore the academic corpus.</p>
     </div>
   );
@@ -74,9 +74,16 @@ export default function App() {
   const live = crawler === 'sapphire';
 
   // A [n] citation (or source chip) was clicked in Chat: jump to the cited
-  // chunk in the Documents tab.
-  const openCitation = (src) => {
-    setDocTarget({ docId: src.docId, chunkId: src.chunkId, nonce: Date.now() });
+  // chunk in the Documents tab. query = {text, embedding} of the question
+  // that produced it — the viewer highlights only the sentences that score
+  // above threshold against it.
+  const openCitation = (source, query) => {
+    setDocTarget({
+      docId: source.docId,
+      chunkId: source.chunkId,
+      query: query || null,
+      nonce: Date.now(),
+    });
     setTab('docs');
   };
 
@@ -89,14 +96,14 @@ export default function App() {
         </div>
 
         <nav className="tab-rail" aria-label="Views">
-          {TABS.map((t) => (
+          {TABS.map((tabDef) => (
             <button
-              key={t.id}
-              className={`tab-btn ${tab === t.id ? 'active' : ''}`}
-              onClick={() => setTab(t.id)}
+              key={tabDef.id}
+              className={`tab-btn ${tab === tabDef.id ? 'active' : ''}`}
+              onClick={() => setTab(tabDef.id)}
             >
-              {ICONS[t.id]}
-              {t.label}
+              {ICONS[tabDef.id]}
+              {tabDef.label}
             </button>
           ))}
         </nav>
@@ -114,15 +121,15 @@ export default function App() {
       <main className="main">
         {/* Crawler switcher — the top-right jewel box. */}
         <div className="crawler-switch" role="group" aria-label="Crawler">
-          {Object.entries(CRAWLERS).map(([id, c]) => (
+          {Object.entries(CRAWLERS).map(([crawlerId, crawlerInfo]) => (
             <button
-              key={id}
-              className={`crawler-btn ${crawler === id ? 'active' : ''}`}
-              onClick={() => setCrawler(id)}
-              title={`${c.name} — ${c.tagline}${c.ready ? '' : ' (coming soon)'}`}
+              key={crawlerId}
+              className={`crawler-btn ${crawler === crawlerId ? 'active' : ''}`}
+              onClick={() => setCrawler(crawlerId)}
+              title={`${crawlerInfo.name} — ${crawlerInfo.tagline}${crawlerInfo.ready ? '' : ' (coming soon)'}`}
             >
-              {GEM(c.accent)}
-              <span>{c.name}</span>
+              {GEM(crawlerInfo.accent)}
+              <span>{crawlerInfo.name}</span>
             </button>
           ))}
         </div>

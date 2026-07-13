@@ -108,26 +108,26 @@ def run(k: int = K) -> None:
         return
 
     doc_ids   = list(doclings.keys())
-    filenames = {d: doclings[d]["filename"] for d in doc_ids}
+    filenames = {doc_id: doclings[doc_id]["filename"] for doc_id in doc_ids}
 
     # Tokenize body text only — reference sections would leak author names and
     # cited titles into BM25 novelty. Headings are normalized so numbered
     # bibliography headings ('7. References') don't slip through.
-    def _norm_heading(text: str) -> str:
-        t = text.lower().strip()
-        t = re.sub(r'^[\divxlc]+[\.\)]?\s+', '', t)
-        return t.rstrip(' .:')
+    def _norm_heading(heading: str) -> str:
+        normalized = heading.lower().strip()
+        normalized = re.sub(r'^[\divxlc]+[\.\)]?\s+', '', normalized)
+        return normalized.rstrip(' .:')
 
-    def _body_text(entry: dict) -> str:
-        sections = entry.get("sections", [])
-        body = [s["text"] for s in sections
-                if _norm_heading(s.get("heading", "")) not in _REF_HEADINGS
-                and (s.get("text") or "").strip()]
-        return " ".join(body) if body else entry.get("text", "")
+    def _body_text(docling_entry: dict) -> str:
+        sections = docling_entry.get("sections", [])
+        body_sections = [section["text"] for section in sections
+                         if _norm_heading(section.get("heading", "")) not in _REF_HEADINGS
+                         and (section.get("text") or "").strip()]
+        return " ".join(body_sections) if body_sections else docling_entry.get("text", "")
 
-    tokenised = {d: tokenise(_body_text(doclings[d])) for d in doc_ids}
+    tokenised = {doc_id: tokenise(_body_text(doclings[doc_id])) for doc_id in doc_ids}
 
-    bm25 = BM25([tokenised[d] for d in doc_ids], k1=BM25_K1, b=BM25_B)
+    bm25 = BM25([tokenised[doc_id] for doc_id in doc_ids], k1=BM25_K1, b=BM25_B)
 
     # Clusters + keywords come from categories.json (single source of keyword
     # truth). Docs absent from it form one pseudo-cluster graded against
@@ -137,47 +137,48 @@ def run(k: int = K) -> None:
     cluster_kws: list[list[str]] = []   # keywords per cluster (parallel)
     if CATEGORIES_PATH.exists():
         categories = json.loads(CATEGORIES_PATH.read_text(encoding='utf-8'))
-        for cat in categories.get("categories", []):
-            member_ids = [m["docId"] for m in cat.get("members", []) if m["docId"] in tokenised]
+        for category in categories.get("categories", []):
+            member_ids = [member["docId"] for member in category.get("members", [])
+                          if member["docId"] in tokenised]
             if not member_ids:
                 continue
             clusters.append(member_ids)
-            cluster_kws.append(cat.get("keywords") or fallback_kws)
-    categorized = {d for members in clusters for d in members}
-    leftover = [d for d in doc_ids if d not in categorized]
-    if leftover:
-        clusters.append(leftover)
+            cluster_kws.append(category.get("keywords") or fallback_kws)
+    categorized_ids = {doc_id for members in clusters for doc_id in members}
+    uncategorized_ids = [doc_id for doc_id in doc_ids if doc_id not in categorized_ids]
+    if uncategorized_ids:
+        clusters.append(uncategorized_ids)
         cluster_kws.append(fallback_kws)
 
     # Representativeness: percentile-normalized within each cluster (see file
     # header). Novelty: corpus-level, normalized globally.
     norm_repr: dict[str, float] = {}
     cluster_of: dict[str, int] = {}
-    for ci, members in enumerate(clusters):
-        raw = {
-            d: topm_chunk_representativeness(
-                bm25, tokenised[d], cluster_kws[ci],
+    for cluster_idx, members in enumerate(clusters):
+        raw_repr = {
+            doc_id: topm_chunk_representativeness(
+                bm25, tokenised[doc_id], cluster_kws[cluster_idx],
                 chunk_words=CHUNK_WORDS, top_m=TOP_M_CHUNKS,
             )
-            for d in members
+            for doc_id in members
         }
-        norm_repr.update(percentile_normalize(raw))
-        for d in members:
-            cluster_of[d] = ci
+        norm_repr.update(percentile_normalize(raw_repr))
+        for doc_id in members:
+            cluster_of[doc_id] = cluster_idx
 
-    raw_novelty  = {d: novelty_score(bm25, tokenised[d]) for d in doc_ids}
+    raw_novelty  = {doc_id: novelty_score(bm25, tokenised[doc_id]) for doc_id in doc_ids}
     norm_novelty = percentile_normalize(raw_novelty)
     bm25_component = {
-        d: (1 - NOVELTY_WEIGHT) * norm_repr[d] + NOVELTY_WEIGHT * norm_novelty[d]
-        for d in doc_ids
+        doc_id: (1 - NOVELTY_WEIGHT) * norm_repr[doc_id] + NOVELTY_WEIGHT * norm_novelty[doc_id]
+        for doc_id in doc_ids
     }
 
     print("[heuristic] Building citation connectivity graph ...")
     adjacency = build_connectivity(doclings, min_key_length=MIN_KEY_LENGTH,
                                    min_contained_length=MIN_CONTAINED_TITLE)
 
-    edges = [{"source": src, "target": tgt}
-             for src, targets in adjacency.items() for tgt in targets]
+    edges = [{"source": source_id, "target": target_id}
+             for source_id, target_ids in adjacency.items() for target_id in target_ids]
 
     norm_pagerank = percentile_normalize(
         compute_pagerank(adjacency, doc_ids, damping=PAGERANK_DAMPING)
@@ -185,44 +186,47 @@ def run(k: int = K) -> None:
 
     scored = [
         {
-            "docId":                  d,
-            "filename":               filenames[d],
-            "cluster":                cluster_of[d],
-            "finalScore":             round(ALPHA * bm25_component[d] + (1 - ALPHA) * norm_pagerank[d], 4),
-            "bm25Score":              round(bm25_component[d], 4),
-            "bm25Representativeness": round(norm_repr[d], 4),
-            "bm25Novelty":            round(norm_novelty[d], 4),
-            "pagerankScore":          round(norm_pagerank[d], 4),
+            "docId":                  doc_id,
+            "filename":               filenames[doc_id],
+            "cluster":                cluster_of[doc_id],
+            "finalScore":             round(ALPHA * bm25_component[doc_id]
+                                            + (1 - ALPHA) * norm_pagerank[doc_id], 4),
+            "bm25Score":              round(bm25_component[doc_id], 4),
+            "bm25Representativeness": round(norm_repr[doc_id], 4),
+            "bm25Novelty":            round(norm_novelty[doc_id], 4),
+            "pagerankScore":          round(norm_pagerank[doc_id], 4),
         }
-        for d in doc_ids
+        for doc_id in doc_ids
     ]
 
     # Per-cluster quotas, proportional to cluster size (largest-remainder
     # apportionment — see file header for why this neutralizes singletons).
     k = min(k, len(doc_ids))
-    sizes = [len(members) for members in clusters]
-    exact = [k * s / len(doc_ids) for s in sizes]
-    quota = [int(e) for e in exact]
-    remaining = k - sum(quota)
+    cluster_sizes = [len(members) for members in clusters]
+    exact_quotas = [k * size / len(doc_ids) for size in cluster_sizes]
+    quotas = [int(exact) for exact in exact_quotas]
+    remaining_slots = k - sum(quotas)
     # Ties broken by larger cluster, then index — deterministic run-to-run.
-    order = sorted(range(len(clusters)),
-                   key=lambda ci: (-(exact[ci] - quota[ci]), -sizes[ci], ci))
-    while remaining > 0:
-        for ci in order:
-            if remaining == 0:
+    remainder_order = sorted(
+        range(len(clusters)),
+        key=lambda cluster_idx: (-(exact_quotas[cluster_idx] - quotas[cluster_idx]),
+                                 -cluster_sizes[cluster_idx], cluster_idx))
+    while remaining_slots > 0:
+        for cluster_idx in remainder_order:
+            if remaining_slots == 0:
                 break
-            if quota[ci] < sizes[ci]:
-                quota[ci] += 1
-                remaining -= 1
+            if quotas[cluster_idx] < cluster_sizes[cluster_idx]:
+                quotas[cluster_idx] += 1
+                remaining_slots -= 1
 
-    by_cluster: dict[int, list[dict]] = {}
-    for entry in scored:
-        by_cluster.setdefault(entry["cluster"], []).append(entry)
+    scored_by_cluster: dict[int, list[dict]] = {}
+    for scored_doc in scored:
+        scored_by_cluster.setdefault(scored_doc["cluster"], []).append(scored_doc)
     top_k: list[dict] = []
-    for ci, members in by_cluster.items():
-        members.sort(key=lambda x: -x["finalScore"])
-        top_k.extend(members[:quota[ci]])
-    top_k.sort(key=lambda x: -x["finalScore"])
+    for cluster_idx, members in scored_by_cluster.items():
+        members.sort(key=lambda doc: -doc["finalScore"])
+        top_k.extend(members[:quotas[cluster_idx]])
+    top_k.sort(key=lambda doc: -doc["finalScore"])
 
     output = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -234,8 +238,8 @@ def run(k: int = K) -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_PATH.write_text(json.dumps(output, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f"[heuristic] Top-{k} documents:")
-    for entry in top_k:
-        print(f"  {entry['filename']}  (score={entry['finalScore']})")
+    for top_doc in top_k:
+        print(f"  {top_doc['filename']}  (score={top_doc['finalScore']})")
     print(f"[heuristic] Wrote {OUTPUT_PATH}")
 
 

@@ -60,12 +60,16 @@ function spawnAsync(cmd, args) {
     });
 
     let stderr = '';
-    proc.stdout.on('data', d => process.stdout.write(d.toString()));
-    proc.stderr.on('data', d => { const s = d.toString(); stderr += s; process.stderr.write(s); });
+    proc.stdout.on('data', stdoutChunk => process.stdout.write(stdoutChunk.toString()));
+    proc.stderr.on('data', stderrChunk => {
+      const text = stderrChunk.toString();
+      stderr += text;
+      process.stderr.write(text);
+    });
 
-    proc.on('close', code => {
-      if (code !== 0) {
-        const err = new Error(`${path.basename(cmd)} exited with code ${code}`);
+    proc.on('close', exitCode => {
+      if (exitCode !== 0) {
+        const err = new Error(`${path.basename(cmd)} exited with code ${exitCode}`);
         err.status = 502;
         err.detail = stderr.slice(-500);
         return reject(err);
@@ -112,12 +116,12 @@ export const STAGES = {
 
   async embed({ force = false } = {}) {
     await embedAll({ force });
-    const store = await readData('embeddings.json');
+    const embeddingStore = await readData('embeddings.json');
     return {
-      chunks:     store.chunks.length,
-      docs:       store.metadata.totalDocs,
-      model:      store.metadata.model,
-      dimensions: store.metadata.dimensions,
+      chunks:     embeddingStore.chunks.length,
+      docs:       embeddingStore.metadata.totalDocs,
+      model:      embeddingStore.metadata.model,
+      dimensions: embeddingStore.metadata.dimensions,
     };
   },
 
@@ -126,7 +130,8 @@ export const STAGES = {
     return {
       threshold:  result.threshold,
       categories: result.categories.length,
-      docs:       result.categories.reduce((n, c) => n + c.members.length, 0),
+      docs:       result.categories.reduce(
+        (total, category) => total + category.members.length, 0),
     };
   },
 
@@ -137,14 +142,14 @@ export const STAGES = {
   },
 
   async graph() {
-    const g = await buildGraph();
+    const graph = await buildGraph();
     return {
-      nodes:        g.nodes.length,
-      edges:        g.edges.length,
-      docNodes:     g.nodes.filter(n => n.type === 'document').length,
-      sectionNodes: g.nodes.filter(n => n.type === 'section').length,
-      citeEdges:    g.edges.filter(e => e.type === 'cites').length,
-      sectionEdges: g.edges.filter(e => e.type === 'has_section').length,
+      nodes:        graph.nodes.length,
+      edges:        graph.edges.length,
+      docNodes:     graph.nodes.filter(node => node.type === 'document').length,
+      sectionNodes: graph.nodes.filter(node => node.type === 'section').length,
+      citeEdges:    graph.edges.filter(edge => edge.type === 'cites').length,
+      sectionEdges: graph.edges.filter(edge => edge.type === 'has_section').length,
     };
   },
 };
@@ -155,23 +160,27 @@ export const pipelineRouter = Router();
 
 // GET /status — last-run timestamp per stage (null = never ran).
 pipelineRouter.get('/status', wrap(async (req, res) => {
-  const timestamp = async (filename, getter) => {
+  const timestamp = async (filename, readTimestamp) => {
     try {
-      return getter(await readData(filename)) ?? null;
+      return readTimestamp(await readData(filename)) ?? null;
     } catch {
       return null;
     }
   };
 
   const [doclings, embeddings, categories, heuristic, graph] = await Promise.all([
-    timestamp('doclings.json', o => {
-      const times = Object.values(o).map(e => e.extractedAt).filter(Boolean);
-      return times.length ? times.reduce((a, b) => (a > b ? a : b)) : null;
+    timestamp('doclings.json', doclingStore => {
+      const times = Object.values(doclingStore)
+        .map(doclingEntry => doclingEntry.extractedAt)
+        .filter(Boolean);
+      return times.length
+        ? times.reduce((latest, time) => (latest > time ? latest : time))
+        : null;
     }),
-    timestamp('embeddings.json',       o => o?.metadata?.updated),
-    timestamp('categories.json',       o => o?.generatedAt),
-    timestamp('heuristic_output.json', o => o?.generatedAt),
-    timestamp('graph.json',            o => o?.createdAt),
+    timestamp('embeddings.json',       store => store?.metadata?.updated),
+    timestamp('categories.json',       store => store?.generatedAt),
+    timestamp('heuristic_output.json', store => store?.generatedAt),
+    timestamp('graph.json',            store => store?.createdAt),
   ]);
 
   res.json({ doclings, embeddings, categories, heuristic, graph });
@@ -242,11 +251,11 @@ pipelineRouter.post('/run', wrap(async (req, res) => {
   };
 
   const stages = {};
-  for (const name of STAGE_ORDER) {
+  for (const stageName of STAGE_ORDER) {
     try {
-      stages[name] = { ok: true, ...(await STAGES[name](params[name])) };
+      stages[stageName] = { ok: true, ...(await STAGES[stageName](params[stageName])) };
     } catch (err) {
-      stages[name] = { ok: false, error: err.message };
+      stages[stageName] = { ok: false, error: err.message };
       break;
     }
   }

@@ -21,13 +21,13 @@ function RoleCard({ role, description, value, installed, onSaved }) {
   const apply = async () => {
     setState('saving');
     try {
-      const resp = await saveSettings({ [role]: draft.trim() });
-      onSaved(resp.roles);
+      const saved = await saveSettings({ [role]: draft.trim() });
+      onSaved(saved.roles);
       setState('ok');
       setMessage('Saved to .env');
-    } catch (e) {
+    } catch (err) {
       setState('err');
-      setMessage(e.message);
+      setMessage(err.message);
     }
   };
 
@@ -41,7 +41,7 @@ function RoleCard({ role, description, value, installed, onSaved }) {
           list="installed-models"
           value={draft}
           placeholder="model name, e.g. phi4"
-          onChange={(e) => { setDraft(e.target.value); setState('idle'); }}
+          onChange={(event) => { setDraft(event.target.value); setState('idle'); }}
           aria-label={`${ROLE_LABELS[role] || role} model`}
         />
         <button className="btn" onClick={apply} disabled={!dirty || !draft.trim() || state === 'saving'}>
@@ -64,7 +64,7 @@ export default function ModelsPanel() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    getModels().then(setInfo).catch((e) => setError(e.message));
+    getModels().then(setInfo).catch((err) => setError(err.message));
   }, []);
 
   if (error) return <div className="viz-empty"><p>{error}</p></div>;
@@ -87,7 +87,7 @@ export default function ModelsPanel() {
         )}
 
         <datalist id="installed-models">
-          {info.installed.map((m) => <option key={m} value={m} />)}
+          {info.installed.map((modelName) => <option key={modelName} value={modelName} />)}
         </datalist>
 
         {Object.entries(info.descriptions).map(([role, description]) => (

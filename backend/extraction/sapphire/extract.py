@@ -44,11 +44,11 @@ import requests
 # Force UTF-8 console streams: Windows defaults to cp1252, and a non-Latin-1
 # char in a print inside the per-document try/except misfiles a converted doc
 # as an extraction error.
-for _stream in (sys.stdout, sys.stderr):
-    _reconfigure = getattr(_stream, "reconfigure", None)
-    if callable(_reconfigure):
+for _console_stream in (sys.stdout, sys.stderr):
+    _reconfigure_stream = getattr(_console_stream, "reconfigure", None)
+    if callable(_reconfigure_stream):
         try:
-            _reconfigure(encoding="utf-8")
+            _reconfigure_stream(encoding="utf-8")
         except Exception:
             pass
 
@@ -66,8 +66,8 @@ ENHANCED_DIR   = Path(os.environ.get("ENHANCED_DIR", str(DATA_DIR / "enhanced"))
 # When unset, assumes "tesseract" is already on the system PATH (Linux/Docker).
 _ocr_dir = os.environ.get("OCR_PATH", "").strip()
 if _ocr_dir:
-    _exe = "tesseract.exe" if os.name == "nt" else "tesseract"
-    TESSERACT_CMD = str(Path(_ocr_dir) / _exe)
+    _tesseract_exe = "tesseract.exe" if os.name == "nt" else "tesseract"
+    TESSERACT_CMD = str(Path(_ocr_dir) / _tesseract_exe)
 else:
     TESSERACT_CMD = "tesseract"
 
@@ -114,12 +114,13 @@ if _page_batch:
 # ---------------------------------------------------------------------------
 
 def _make_converter(ocr: bool) -> DocumentConverter:
-    opts = PdfPipelineOptions()
-    opts.do_ocr = ocr
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.do_ocr = ocr
     if ocr:
-        opts.ocr_options = TesseractCliOcrOptions(force_full_page_ocr=False, tesseract_cmd=TESSERACT_CMD)
+        pipeline_options.ocr_options = TesseractCliOcrOptions(
+            force_full_page_ocr=False, tesseract_cmd=TESSERACT_CMD)
     return DocumentConverter(
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
     )
 
 _converter_digital = _make_converter(ocr=False)
@@ -136,10 +137,10 @@ def _choose_converter(doc_meta: dict) -> DocumentConverter:
     report_path = ENHANCED_DIR / f"{doc_id}.json"
     if report_path.exists():
         try:
-            report = json.loads(report_path.read_text(encoding='utf-8'))
-            pages = report.get("pages", [])
-            scanned = sum(1 for p in pages if p.get("pageType") != "digital")
-            if pages and scanned / len(pages) < 0.3:
+            enhance_report = json.loads(report_path.read_text(encoding='utf-8'))
+            pages = enhance_report.get("pages", [])
+            scanned_count = sum(1 for page in pages if page.get("pageType") != "digital")
+            if pages and scanned_count / len(pages) < 0.3:
                 return _converter_digital
         except Exception:
             pass
@@ -194,14 +195,14 @@ def _extract_tables(doc) -> list[dict]:
     """[{text, page}] — page is 1-based, None without provenance.
     (Older extracts stored plain strings; chunker.js accepts both.)"""
     tables = []
-    for tbl in doc.tables:
+    for table in doc.tables:
         try:
-            text = tbl.export_to_markdown()
+            table_text = table.export_to_markdown()
         except Exception:
-            text = str(tbl)
-        prov = getattr(tbl, "prov", None) or []
-        page = getattr(prov[0], "page_no", None) if prov else None
-        tables.append({"text": text, "page": page})
+            table_text = str(table)
+        provenance = getattr(table, "prov", None) or []
+        page = getattr(provenance[0], "page_no", None) if provenance else None
+        tables.append({"text": table_text, "page": page})
     return tables
 
 
@@ -235,28 +236,28 @@ _REF_DROP_LABELS = frozenset({
 })
 
 
-def _norm_heading(text: str) -> str:
+def _norm_heading(heading: str) -> str:
     """Normalize a heading for refs-section matching: lowercase, strip
     leading numbering ('7. References', 'VII. References') and trailing
     punctuation."""
-    t = text.lower().strip()
-    t = re.sub(r'^[\divxlc]+[\.\)]?\s+', '', t)   # '7. ' / 'vii. ' / '7) '
-    return t.rstrip(' .:')
+    normalized = heading.lower().strip()
+    normalized = re.sub(r'^[\divxlc]+[\.\)]?\s+', '', normalized)   # '7. ' / 'vii. ' / '7) '
+    return normalized.rstrip(' .:')
 
 
-def _is_ref_heading(text: str) -> bool:
-    return _norm_heading(text) in _REF_SECTION_HEADINGS
+def _is_ref_heading(heading: str) -> bool:
+    return _norm_heading(heading) in _REF_SECTION_HEADINGS
 
 
 def _finalize_entries(entries: list[str]) -> list[str]:
     """Post-process split entries: strip spurious glued leading numbers and
     drop caption-only / empty entries. Applied to every extraction tier."""
-    out = []
-    for e in entries:
-        e = _REF_LEADING_NUM_RE.sub('', e.strip()).strip()
-        if e and not _REF_CAPTION_RE.match(e):
-            out.append(e)
-    return out
+    finalized = []
+    for entry in entries:
+        entry = _REF_LEADING_NUM_RE.sub('', entry.strip()).strip()
+        if entry and not _REF_CAPTION_RE.match(entry):
+            finalized.append(entry)
+    return finalized
 
 
 # ---------------------------------------------------------------------------
@@ -264,10 +265,10 @@ def _finalize_entries(entries: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _parse_json(raw: str):
+def _parse_json(llm_response: str):
     """Strip markdown fences and parse JSON; return None on failure."""
     try:
-        return json.loads(_CODE_FENCE.sub("", raw).strip())
+        return json.loads(_CODE_FENCE.sub("", llm_response).strip())
     except Exception:
         return None
 
@@ -294,10 +295,10 @@ def _clean_boilerplate_title(title: str) -> str | None:
     """Strip leading copyright/publisher boilerplate GROBID sometimes glues
     onto a title — a polluted title poisons chunk embeddings, category
     vectors, and citation matching. Returns None when nothing survives."""
-    parts = re.split(r'(?<=[.!?])\s+', title.strip())
-    while parts and _NOT_TITLE_RE.match(parts[0]):
-        parts.pop(0)
-    cleaned = " ".join(parts).strip()
+    title_sentences = re.split(r'(?<=[.!?])\s+', title.strip())
+    while title_sentences and _NOT_TITLE_RE.match(title_sentences[0]):
+        title_sentences.pop(0)
+    cleaned = " ".join(title_sentences).strip()
     return cleaned or None
 
 
@@ -309,8 +310,8 @@ def _llm_extract_metadata(sections: list[dict], need_authors: bool = True) -> di
         return None
 
     title: str | None = None
-    for s in sections[:7]:
-        heading = (s.get("heading") or "").strip()
+    for section in sections[:7]:
+        heading = (section.get("heading") or "").strip()
         if (heading
                 and heading.lower().strip() not in _METADATA_SKIP
                 and not _NOT_TITLE_RE.match(heading)):
@@ -318,42 +319,43 @@ def _llm_extract_metadata(sections: list[dict], need_authors: bool = True) -> di
             break
 
     abstract: str | None = None
-    for s in sections:
-        if (s.get("heading") or "").lower().strip().startswith("abstract"):
-            abstract = (s.get("text") or "").strip() or None
+    for section in sections:
+        if (section.get("heading") or "").lower().strip().startswith("abstract"):
+            abstract = (section.get("text") or "").strip() or None
             break
 
     authors: list[str] = []
     candidate_parts: list[str] = []
     if need_authors:
-        for s in sections[:5]:
-            text = (s.get("text") or "").strip()
-            if text:
-                candidate_parts.append(" ".join(text.split()[:300]))
+        for section in sections[:5]:
+            section_text = (section.get("text") or "").strip()
+            if section_text:
+                candidate_parts.append(" ".join(section_text.split()[:300]))
                 if len(candidate_parts) >= 2:
                     break
 
     if candidate_parts:
-        combined = "\n".join(candidate_parts)
+        header_text = "\n".join(candidate_parts)
         prompt = (
             "Extract the author names from this academic paper header text.\n"
             'Return ONLY a JSON array of strings, each a full author name (e.g. ["John Smith", "Jane Doe"]).\n'
             "Ignore affiliations, email addresses, degree titles (PhD, Member IEEE, etc.), and institution names.\n"
             "Return [] if no clear author names are present. No explanation, no extra text.\n\n"
-            f"Text:\n{combined}"
+            f"Text:\n{header_text}"
         )
         try:
-            resp = requests.post(
+            response = requests.post(
                 f"{OLLAMA_URL}/api/generate",
                 json={"model": METADATA_MODEL, "prompt": prompt, "stream": False,
                       "options": {"temperature": 0}},
                 timeout=60,
             )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "").strip()
-            parsed = _parse_json(raw)
-            if isinstance(parsed, list):
-                authors = [a for a in parsed if isinstance(a, str) and a.strip()]
+            response.raise_for_status()
+            llm_response = response.json().get("response", "").strip()
+            parsed_authors = _parse_json(llm_response)
+            if isinstance(parsed_authors, list):
+                authors = [author for author in parsed_authors
+                           if isinstance(author, str) and author.strip()]
         except Exception:
             pass
 
@@ -374,13 +376,13 @@ def _ref_section_from_text(full_text: str) -> str | None:
     export_to_text() output so each numbered entry stays on its own line.
     Returns everything after the last known refs heading to end-of-document.
     """
-    heading_pat = '|'.join(
-        re.escape(h) for h in sorted(_REF_SECTION_HEADINGS, key=len, reverse=True)
+    heading_pattern = '|'.join(
+        re.escape(heading) for heading in sorted(_REF_SECTION_HEADINGS, key=len, reverse=True)
     )
-    matches = list(re.finditer(rf'(?im)^(?:{heading_pat})\s*\n', full_text))
-    if not matches:
+    heading_matches = list(re.finditer(rf'(?im)^(?:{heading_pattern})\s*\n', full_text))
+    if not heading_matches:
         return None
-    return full_text[matches[-1].end():].strip()
+    return full_text[heading_matches[-1].end():].strip()
 
 
 def _split_references_regex(text: str) -> list[str]:
@@ -406,72 +408,77 @@ def _split_references_regex(text: str) -> list[str]:
     if not text:
         return []
 
-    def _spans_to_entries(spans):
+    def _spans_to_entries(marker_spans):
         entries = []
-        for i, (_, me) in enumerate(spans):
-            end = spans[i + 1][0] if i + 1 < len(spans) else len(text)
-            body = text[me:end].strip()
+        for span_idx, (_, marker_end) in enumerate(marker_spans):
+            entry_end = (marker_spans[span_idx + 1][0]
+                         if span_idx + 1 < len(marker_spans) else len(text))
+            body = text[marker_end:entry_end].strip()
             if not body:
                 continue
             # split off embedded caption lines so they don't pollute a reference
-            cur = []
-            for ln in body.split('\n'):
-                s = ln.strip()
-                if _REF_CAPTION_RE.match(s):      # caption -> flush current, drop caption
-                    if cur:
-                        entries.append(' '.join(cur).strip())
-                        cur = []
+            entry_lines = []
+            for raw_line in body.split('\n'):
+                line = raw_line.strip()
+                if _REF_CAPTION_RE.match(line):   # caption -> flush current, drop caption
+                    if entry_lines:
+                        entries.append(' '.join(entry_lines).strip())
+                        entry_lines = []
                     continue
-                cur.append(s)
-            if cur:
-                entries.append(' '.join(cur).strip())
+                entry_lines.append(line)
+            if entry_lines:
+                entries.append(' '.join(entry_lines).strip())
         return entries
 
     # 1. Line-start markers: [1], (1), 1., 1A. — optional leading bullet/dash "- [1]"
-    spans = [(m.start(), m.end()) for m in
-             re.finditer(r'(?m)^[ \t]*(?:[-\u2013\u2014\u2022*]\s+)?'
-                         r'(?:\[\d+\]|\(\d+\)|\d+[a-zA-Z]?\.)\s+', text)]
-    if len(spans) >= 2:
-        entries = _spans_to_entries(spans)
+    marker_spans = [(match.start(), match.end()) for match in
+                    re.finditer(r'(?m)^[ \t]*(?:[-\u2013\u2014\u2022*]\s+)?'
+                                r'(?:\[\d+\]|\(\d+\)|\d+[a-zA-Z]?\.)\s+', text)]
+    if len(marker_spans) >= 2:
+        entries = _spans_to_entries(marker_spans)
         if entries:
             return _finalize_entries(entries)
 
     # 2. Inline N. — space-joined paragraph (e.g. from _extract_sections)
     #    (?<![a-zA-Z:]) avoids J., No., Fig., doi:10.
     #    (?=[A-Z\("[]) avoids matching volume/page numbers before lowercase
-    spans = [(m.start(), m.end()) for m in
-             re.finditer(r'(?<![a-zA-Z:])\d{1,3}\.\s+(?=[A-Z\("[])', text)]
-    if len(spans) >= 2:
-        entries = _spans_to_entries(spans)
+    marker_spans = [(match.start(), match.end()) for match in
+                    re.finditer(r'(?<![a-zA-Z:])\d{1,3}\.\s+(?=[A-Z\("[])', text)]
+    if len(marker_spans) >= 2:
+        entries = _spans_to_entries(marker_spans)
         if entries:
             return _finalize_entries(entries)
 
     # 3. Inline bracket markers [N]
-    spans = [(m.start(), m.end()) for m in re.finditer(r'\[\d+\]\s+', text)]
-    if len(spans) >= 2:
-        entries = _spans_to_entries(spans)
+    marker_spans = [(match.start(), match.end())
+                    for match in re.finditer(r'\[\d+\]\s+', text)]
+    if len(marker_spans) >= 2:
+        entries = _spans_to_entries(marker_spans)
         if entries:
             return _finalize_entries(entries)
 
     # 4. Blank-line paragraph separation
-    paras = [p.strip() for p in re.split(r'\n[ \t]*\n', text) if len(p.strip()) > 15]
-    if len(paras) >= 2:
-        return _finalize_entries(paras)
+    paragraphs = [paragraph.strip() for paragraph in re.split(r'\n[ \t]*\n', text)
+                  if len(paragraph.strip()) > 15]
+    if len(paragraphs) >= 2:
+        return _finalize_entries(paragraphs)
 
     # 5. Author-date: each entry starts on a new line with Lastname, First
-    starts = [m.start() for m in re.finditer(r'(?m)^[A-Z][a-z\-]{1,25},\s+[A-Z]', text)]
-    if len(starts) >= 2:
+    entry_starts = [match.start() for match in
+                    re.finditer(r'(?m)^[A-Z][a-z\-]{1,25},\s+[A-Z]', text)]
+    if len(entry_starts) >= 2:
         entries = []
-        for i, pos in enumerate(starts):
-            end = starts[i + 1] if i + 1 < len(starts) else len(text)
-            body = text[pos:end].strip()
+        for start_idx, entry_start in enumerate(entry_starts):
+            entry_end = (entry_starts[start_idx + 1]
+                         if start_idx + 1 < len(entry_starts) else len(text))
+            body = text[entry_start:entry_end].strip()
             if len(body) > 15:
                 entries.append(body)
         if entries:
             return _finalize_entries(entries)
 
     # 6. One reference per line
-    lines = [ln.strip() for ln in text.splitlines() if len(ln.strip()) > 20]
+    lines = [line.strip() for line in text.splitlines() if len(line.strip()) > 20]
     return _finalize_entries(lines) if len(lines) >= 2 else ([text] if text else [])
 
 
@@ -482,19 +489,19 @@ def _split_references_regex(text: str) -> list[str]:
 def _clean_structured_entry(text: str) -> str:
     """Clean a single structure-derived entry: collapse internal line breaks
     (wrapped lines within one item) and strip a leading '[3] ' / '3. ' marker."""
-    t = ' '.join(ln.strip() for ln in text.splitlines() if ln.strip())
-    return _REF_MARKER_PREFIX_RE.sub('', t).strip()
+    joined = ' '.join(line.strip() for line in text.splitlines() if line.strip())
+    return _REF_MARKER_PREFIX_RE.sub('', joined).strip()
 
 
 def _refs_from_labels(doc) -> list[str]:
     """Tier 1: docling's layout model labeled individual bibliography entries
     as DocItemLabel.REFERENCE.  Cleanest path — no splitting heuristics."""
     refs = []
-    for t in getattr(doc, "texts", []):
-        if getattr(t, "label", None) == DocItemLabel.REFERENCE:
-            txt = (getattr(t, "text", "") or "").strip()
-            if txt:
-                refs.append(_clean_structured_entry(txt))
+    for doc_item in getattr(doc, "texts", []):
+        if getattr(doc_item, "label", None) == DocItemLabel.REFERENCE:
+            item_text = (getattr(doc_item, "text", "") or "").strip()
+            if item_text:
+                refs.append(_clean_structured_entry(item_text))
     return _finalize_entries(refs)
 
 
@@ -524,12 +531,13 @@ def _refs_from_section_walk(doc) -> list[str]:
     # If each collected item still bundles several entries (multi-line),
     # split those; otherwise treat one item = one reference.
     entries = []
-    for c in collected:
-        lines = [ln.strip() for ln in c.splitlines() if ln.strip()]
-        if len(lines) > 1 and sum(bool(_REF_MARKER_PREFIX_RE.match(ln)) for ln in lines) >= 2:
-            entries.extend(_split_references_regex(c))
+    for collected_item in collected:
+        item_lines = [line.strip() for line in collected_item.splitlines() if line.strip()]
+        if (len(item_lines) > 1
+                and sum(bool(_REF_MARKER_PREFIX_RE.match(line)) for line in item_lines) >= 2):
+            entries.extend(_split_references_regex(collected_item))
         else:
-            entries.append(_clean_structured_entry(c))
+            entries.append(_clean_structured_entry(collected_item))
     return _finalize_entries(entries)
 
 
@@ -539,8 +547,8 @@ def _refs_from_text_dump(doc, sections: list[dict] | None = None) -> list[str]:
     ref_section_text = _ref_section_from_text(full_text)
     if not ref_section_text and sections:
         ref_section_text = next(
-            (s["text"] for s in reversed(sections)
-             if _is_ref_heading(s.get("heading", ""))),
+            (section["text"] for section in reversed(sections)
+             if _is_ref_heading(section.get("heading", ""))),
             None,
         )
     return _split_references_regex(ref_section_text) if ref_section_text else []
@@ -587,15 +595,15 @@ def _extract_metadata(doc) -> dict:
             meta["title"] = text
         if label == DocItemLabel.SECTION_HEADER:
             section_count += 1
-            lower = text.lower().strip()
-            if meta["title"] is None and lower not in _SKIP and len(text.split()) <= 15:
+            heading_lower = text.lower().strip()
+            if meta["title"] is None and heading_lower not in _SKIP and len(text.split()) <= 15:
                 meta["title"] = text
             elif (section_count <= 6 and not meta["authors"]
                   and 1 <= len(text.split()) <= 5
-                  and lower not in _SKIP
-                  and all(re.match(r'^[A-Z][a-zA-Z\-\.]*$', w) for w in text.split())):
+                  and heading_lower not in _SKIP
+                  and all(re.match(r'^[A-Z][a-zA-Z\-\.]*$', word) for word in text.split())):
                 meta["authors"].append(text)
-            if lower.startswith("abstract"):
+            if heading_lower.startswith("abstract"):
                 meta["abstract"] = ""
         elif meta["abstract"] == "" and label not in (DocItemLabel.SECTION_HEADER, DocItemLabel.TITLE):
             meta["abstract"] = text
@@ -644,39 +652,41 @@ def _scan_created(text: str) -> dict | None:
     """
     candidates: list[tuple[int, int | None]] = []
     # 'June 2017', 'Jun. 2017', 'August 15, 2017' (month before year)
-    for m in re.finditer(
+    for match in re.finditer(
             rf"\b([A-Za-z]{{3,9}})\.?\s+(?:\d{{1,2}}(?:st|nd|rd|th)?,?\s+)?({_YEAR})\b",
             text):
-        month = _MONTH_NUM.get(m.group(1)[:3].lower())
+        month = _MONTH_NUM.get(match.group(1)[:3].lower())
         if month:
-            candidates.append((int(m.group(2)), month))
+            candidates.append((int(match.group(2)), month))
     # ISO '2017-06' / '2017-06-12'
-    for m in re.finditer(rf"\b({_YEAR})-(\d{{2}})\b", text):
-        month = int(m.group(2))
+    for match in re.finditer(rf"\b({_YEAR})-(\d{{2}})\b", text):
+        month = int(match.group(2))
         if 1 <= month <= 12:
-            candidates.append((int(m.group(1)), month))
+            candidates.append((int(match.group(1)), month))
     # Bare years (month unknown)
-    for m in re.finditer(rf"\b({_YEAR})\b", text):
-        candidates.append((int(m.group(1)), None))
+    for match in re.finditer(rf"\b({_YEAR})\b", text):
+        candidates.append((int(match.group(1)), None))
 
-    valid = [(y, mo) for y, mo in candidates if _valid_created(y, mo)]
-    if not valid:
+    valid_dates = [(year, month) for year, month in candidates
+                   if _valid_created(year, month)]
+    if not valid_dates:
         return None
-    year, month = min(valid, key=lambda c: (c[0], c[1] or 12))
+    year, month = min(valid_dates, key=lambda date: (date[0], date[1] or 12))
     return {"year": year, "month": month}
 
 
-def _tei_text(el) -> str:
+def _tei_text(element) -> str:
     """Flattened text content of a TEI element (None-safe)."""
-    return " ".join("".join(el.itertext()).split()) if el is not None else ""
+    return " ".join("".join(element.itertext()).split()) if element is not None else ""
 
 
-def _tei_persname(pers) -> str:
+def _tei_persname(persname_el) -> str:
     """'First Middle Last' from a TEI <persName> element."""
-    forenames = [_tei_text(f) for f in pers.findall("tei:forename", _TEI_NS)]
-    surname   = _tei_text(pers.find("tei:surname", _TEI_NS))
-    parts = [p for p in forenames + [surname] if p]
-    return " ".join(parts)
+    forenames = [_tei_text(forename)
+                 for forename in persname_el.findall("tei:forename", _TEI_NS)]
+    surname   = _tei_text(persname_el.find("tei:surname", _TEI_NS))
+    name_parts = [part for part in forenames + [surname] if part]
+    return " ".join(name_parts)
 
 
 def _grobid_alive() -> bool:
@@ -690,48 +700,49 @@ def _grobid_header(pdf_path: str) -> dict | None:
     """Title/authors/abstract from GROBID's processHeaderDocument (CRF header
     model). Returns None on any transport or parse failure."""
     try:
-        with open(pdf_path, "rb") as fh:
-            resp = requests.post(
+        with open(pdf_path, "rb") as pdf_file:
+            response = requests.post(
                 f"{GROBID_URL}/api/processHeaderDocument",
-                files={"input": (os.path.basename(pdf_path), fh, "application/pdf")},
+                files={"input": (os.path.basename(pdf_path), pdf_file, "application/pdf")},
                 data={"consolidateHeader": "0"},
                 # 0.8.x defaults this endpoint to BibTeX — demand TEI XML
                 headers={"Accept": "application/xml"},
                 timeout=GROBID_TIMEOUT,
             )
-        if resp.status_code != 200:
+        if response.status_code != 200:
             return None
-        root = ET.fromstring(resp.text)
+        tei_root = ET.fromstring(response.text)
     except (requests.RequestException, ET.ParseError):
         return None
 
-    raw_title = _tei_text(root.find(".//tei:titleStmt/tei:title", _TEI_NS))
+    raw_title = _tei_text(tei_root.find(".//tei:titleStmt/tei:title", _TEI_NS))
     title = _clean_boilerplate_title(raw_title) if raw_title else None
 
     authors = []
-    for author in root.findall(
+    for author_el in tei_root.findall(
             ".//tei:sourceDesc//tei:biblStruct//tei:author/tei:persName", _TEI_NS):
-        name = _tei_persname(author)
-        if name and name not in authors:
-            authors.append(name)
+        author_name = _tei_persname(author_el)
+        if author_name and author_name not in authors:
+            authors.append(author_name)
 
-    abstract = _tei_text(root.find(".//tei:profileDesc/tei:abstract", _TEI_NS)) or None
+    abstract = _tei_text(tei_root.find(".//tei:profileDesc/tei:abstract", _TEI_NS)) or None
 
     # Publication date: prefer the machine-readable @when attribute; fall back
     # to scanning the element's text ('June 2017'). _scan_created applies the
     # same future-date cap as the first-page fallback.
     created = None
-    date_el = root.find(".//tei:publicationStmt/tei:date", _TEI_NS)
+    date_el = tei_root.find(".//tei:publicationStmt/tei:date", _TEI_NS)
     if date_el is None:
-        date_el = root.find(
+        date_el = tei_root.find(
             ".//tei:sourceDesc//tei:biblStruct//tei:imprint/tei:date", _TEI_NS)
     if date_el is not None:
         when = date_el.get("when") or ""
-        m = re.match(r"(\d{4})(?:-(\d{2}))?", when)
-        if m and _valid_created(int(m.group(1)),
-                                int(m.group(2)) if m.group(2) else None):
-            created = {"year": int(m.group(1)),
-                       "month": int(m.group(2)) if m.group(2) else None}
+        when_match = re.match(r"(\d{4})(?:-(\d{2}))?", when)
+        if when_match and _valid_created(
+                int(when_match.group(1)),
+                int(when_match.group(2)) if when_match.group(2) else None):
+            created = {"year": int(when_match.group(1)),
+                       "month": int(when_match.group(2)) if when_match.group(2) else None}
         else:
             created = _scan_created(_tei_text(date_el))
 
@@ -746,23 +757,23 @@ def _grobid_references(pdf_path: str) -> tuple[list[str], list[dict]] | None:
     Returns (raw_strings, parsed) where parsed is [{title, authors, raw}] —
     already structured, so heuristic.py needs no LLM pass. None on failure."""
     try:
-        with open(pdf_path, "rb") as fh:
-            resp = requests.post(
+        with open(pdf_path, "rb") as pdf_file:
+            response = requests.post(
                 f"{GROBID_URL}/api/processReferences",
-                files={"input": (os.path.basename(pdf_path), fh, "application/pdf")},
+                files={"input": (os.path.basename(pdf_path), pdf_file, "application/pdf")},
                 data={"consolidateCitations": "0", "includeRawCitations": "1"},
                 headers={"Accept": "application/xml"},
                 timeout=GROBID_TIMEOUT,
             )
-        if resp.status_code != 200:
+        if response.status_code != 200:
             return None
-        root = ET.fromstring(resp.text)
+        tei_root = ET.fromstring(response.text)
     except (requests.RequestException, ET.ParseError):
         return None
 
     raw_refs: list[str] = []
     parsed:   list[dict] = []
-    for bibl in root.findall(".//tei:listBibl/tei:biblStruct", _TEI_NS):
+    for bibl in tei_root.findall(".//tei:listBibl/tei:biblStruct", _TEI_NS):
         # Article title lives in <analytic>; for books/theses only <monogr>
         # exists, so fall back to it.
         title_el = (bibl.find("tei:analytic/tei:title", _TEI_NS)
@@ -772,19 +783,19 @@ def _grobid_references(pdf_path: str) -> tuple[list[str], list[dict]] | None:
         title = _tei_text(title_el)
 
         authors = []
-        for pers in bibl.findall(".//tei:author/tei:persName", _TEI_NS):
-            name = _tei_persname(pers)
-            if name and name not in authors:
-                authors.append(name)
+        for persname_el in bibl.findall(".//tei:author/tei:persName", _TEI_NS):
+            author_name = _tei_persname(persname_el)
+            if author_name and author_name not in authors:
+                authors.append(author_name)
 
-        raw = _tei_text(bibl.find("tei:note[@type='raw_reference']", _TEI_NS))
-        if not raw:
-            raw = " ".join(p for p in [", ".join(authors), title] if p)
+        raw_citation = _tei_text(bibl.find("tei:note[@type='raw_reference']", _TEI_NS))
+        if not raw_citation:
+            raw_citation = " ".join(part for part in [", ".join(authors), title] if part)
 
-        if raw:
-            raw_refs.append(raw)
+        if raw_citation:
+            raw_refs.append(raw_citation)
         if title or authors:
-            parsed.append({"title": title, "authors": authors, "raw": raw})
+            parsed.append({"title": title, "authors": authors, "raw": raw_citation})
 
     return raw_refs, parsed
 
@@ -828,10 +839,10 @@ def convert_document(doc_meta: dict) -> dict:
     converter = _choose_converter(doc_meta)
     with ThreadPoolExecutor(max_workers=1) as pool:
         grobid_future = pool.submit(_grobid_extract, file_path)
-        result = converter.convert(file_path)
+        conversion = converter.convert(file_path)
         grobid = grobid_future.result()
 
-    doc = result.document
+    doc = conversion.document
 
     full_text = doc.export_to_text()
     sections  = _extract_sections(doc)
@@ -844,24 +855,24 @@ def convert_document(doc_meta: dict) -> dict:
     abstract = grobid_meta.get("abstract")
 
     if not (title and authors and abstract):
-        fb = _llm_extract_metadata(sections, need_authors=not authors) or {}
-        title    = title    or fb.get("title")
-        authors  = authors  or fb.get("authors") or []
-        abstract = abstract or fb.get("abstract")
+        llm_meta = _llm_extract_metadata(sections, need_authors=not authors) or {}
+        title    = title    or llm_meta.get("title")
+        authors  = authors  or llm_meta.get("authors") or []
+        abstract = abstract or llm_meta.get("abstract")
     if not (title and authors and abstract):
-        fb = _extract_metadata(doc)
-        title    = title    or fb.get("title")
-        authors  = authors  or fb.get("authors") or []
-        abstract = abstract or fb.get("abstract")
+        docling_meta = _extract_metadata(doc)
+        title    = title    or docling_meta.get("title")
+        authors  = authors  or docling_meta.get("authors") or []
+        abstract = abstract or docling_meta.get("abstract")
 
     # Last-resort abstract: first 200 words of body text (Crossref enrichment
     # overwrites it later). Title deliberately gets NO body-text fallback —
     # citation matching is by containment, and a snippet posing as a title
     # would fabricate edges.
     if not abstract:
-        snippet = " ".join(full_text.split()[:200])
-        if snippet:
-            abstract = snippet
+        body_snippet = " ".join(full_text.split()[:200])
+        if body_snippet:
+            abstract = body_snippet
             print("[extract]   no abstract found — using first 200 words of body text",
                   file=sys.stderr)
 
@@ -914,26 +925,27 @@ def run(force: bool = False) -> None:
     skipped   = 0
     errors    = []
 
-    for doc_id, meta in docs_meta.items():
+    for doc_id, doc_meta in docs_meta.items():
         if not force and doc_id in existing:
-            print(f"[extract] Skipping {meta['filename']} (already extracted)")
+            print(f"[extract] Skipping {doc_meta['filename']} (already extracted)")
             skipped += 1
             continue
 
-        if meta.get("status") not in ("completed", "pending", None):
-            print(f"[extract] Skipping {meta['filename']} (status={meta.get('status')})")
+        if doc_meta.get("status") not in ("completed", "pending", None):
+            print(f"[extract] Skipping {doc_meta['filename']} (status={doc_meta.get('status')})")
             skipped += 1
             continue
 
-        print(f"[extract] Processing {meta['filename']} ...")
+        print(f"[extract] Processing {doc_meta['filename']} ...")
         try:
-            results[doc_id] = convert_document(meta)
+            results[doc_id] = convert_document(doc_meta)
             extracted.append(doc_id)
             print(f"[extract]   → {len(results[doc_id]['sections'])} sections, "
                   f"{len(results[doc_id]['references'])} references")
         except Exception as exc:
             print(f"[extract]   ERROR: {exc}", file=sys.stderr)
-            errors.append({"docId": doc_id, "filename": meta.get("filename"), "error": str(exc)})
+            errors.append({"docId": doc_id, "filename": doc_meta.get("filename"),
+                           "error": str(exc)})
 
     DOCLINGS_OUT.parent.mkdir(parents=True, exist_ok=True)
     DOCLINGS_OUT.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -953,8 +965,8 @@ def run(force: bool = False) -> None:
 
     if errors:
         print(f"[extract] {len(errors)} error(s):", file=sys.stderr)
-        for e in errors:
-            print(f"  {e['filename']}: {e['error']}", file=sys.stderr)
+        for error in errors:
+            print(f"  {error['filename']}: {error['error']}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -19,28 +19,28 @@ const OUTLINE   = 1.4;   // outline disc size relative to the coloured fill
 // texture per point instead. `disc` is the star body (used for both the grey
 // outline layer and the coloured fill on top of it); `ring` marks the hover.
 function makeSprite(kind) {
-  const c = document.createElement('canvas');
-  c.width = c.height = 64;
-  const g = c.getContext('2d');
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 64;
+  const ctx = canvas.getContext('2d');
   if (kind === 'ring') {
-    g.beginPath();
-    g.arc(32, 32, 24, 0, Math.PI * 2);
-    g.lineWidth = 6;
-    g.strokeStyle = '#fff';
-    g.stroke();
+    ctx.beginPath();
+    ctx.arc(32, 32, 24, 0, Math.PI * 2);
+    ctx.lineWidth = 6;
+    ctx.strokeStyle = '#fff';
+    ctx.stroke();
   } else {
     // Soft edge only (not a glow) so the grey outline layer beneath stays a
     // crisp rim rather than a smear.
-    const grad = g.createRadialGradient(32, 32, 0, 32, 32, 30);
-    grad.addColorStop(0, 'rgba(255,255,255,1)');
-    grad.addColorStop(0.82, 'rgba(255,255,255,1)');
-    grad.addColorStop(1, 'rgba(255,255,255,0)');
-    g.fillStyle = grad;
-    g.fillRect(0, 0, 64, 64);
+    const edgeGradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 30);
+    edgeGradient.addColorStop(0, 'rgba(255,255,255,1)');
+    edgeGradient.addColorStop(0.82, 'rgba(255,255,255,1)');
+    edgeGradient.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = edgeGradient;
+    ctx.fillRect(0, 0, 64, 64);
   }
-  const tex = new THREE.CanvasTexture(c);
-  tex.needsUpdate = true;
-  return tex;
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  return texture;
 }
 
 /**
@@ -51,33 +51,35 @@ function makeSprite(kind) {
  * shortest lines and no closed loops.
  */
 function mstEdges(members, positions) {
-  const dist = (a, b) => Math.hypot(
-    positions[a * 3] - positions[b * 3],
-    positions[a * 3 + 1] - positions[b * 3 + 1],
-    positions[a * 3 + 2] - positions[b * 3 + 2],
+  const distance = (fromMember, toMember) => Math.hypot(
+    positions[fromMember * 3] - positions[toMember * 3],
+    positions[fromMember * 3 + 1] - positions[toMember * 3 + 1],
+    positions[fromMember * 3 + 2] - positions[toMember * 3 + 2],
   );
   const inTree = [members[0]];
-  const rest = members.slice(1);
+  const remaining = members.slice(1);
   const edges = [];
-  while (rest.length) {
-    let best = null;
-    for (const a of inTree) {
-      rest.forEach((b, k) => {
-        const d = dist(a, b);
-        if (!best || d < best.d) best = { a, b, k, d };
+  while (remaining.length) {
+    let nearest = null;
+    for (const treeMember of inTree) {
+      remaining.forEach((candidate, remainingIdx) => {
+        const candidateDistance = distance(treeMember, candidate);
+        if (!nearest || candidateDistance < nearest.distance) {
+          nearest = { treeMember, candidate, remainingIdx, distance: candidateDistance };
+        }
       });
     }
-    edges.push([best.a, best.b]);
-    inTree.push(best.b);
-    rest.splice(best.k, 1);
+    edges.push([nearest.treeMember, nearest.candidate]);
+    inTree.push(nearest.candidate);
+    remaining.splice(nearest.remainingIdx, 1);
   }
   return edges;
 }
 
-const centroidOf = (pts) => {
-  const c = [0, 0, 0];
-  for (const p of pts) { c[0] += p[0]; c[1] += p[1]; c[2] += p[2]; }
-  return c.map((v) => v / pts.length);
+const centroidOf = (points) => {
+  const sum = [0, 0, 0];
+  for (const point of points) { sum[0] += point[0]; sum[1] += point[1]; sum[2] += point[2]; }
+  return sum.map((axisSum) => axisSum / points.length);
 };
 
 /**
@@ -88,44 +90,46 @@ const centroidOf = (pts) => {
  * at every cluster size and hugs the members: 1 doc gives a small ball, 2 docs
  * a capsule, N docs a padded hull. No special cases, no giant spheres.
  */
-const shell3D = (p) => [
-  [p[0] + PAD, p[1], p[2]], [p[0] - PAD, p[1], p[2]],
-  [p[0], p[1] + PAD, p[2]], [p[0], p[1] - PAD, p[2]],
-  [p[0], p[1], p[2] + PAD], [p[0], p[1], p[2] - PAD],
+const shell3D = (point) => [
+  [point[0] + PAD, point[1], point[2]], [point[0] - PAD, point[1], point[2]],
+  [point[0], point[1] + PAD, point[2]], [point[0], point[1] - PAD, point[2]],
+  [point[0], point[1], point[2] + PAD], [point[0], point[1], point[2] - PAD],
 ];
 
-const shell2D = (p, segments = 12) =>
-  Array.from({ length: segments }, (_, i) => {
-    const a = (i / segments) * Math.PI * 2;
-    return [p[0] + Math.cos(a) * PAD, p[1] + Math.sin(a) * PAD];
+const shell2D = (point, segments = 12) =>
+  Array.from({ length: segments }, (_, segmentIdx) => {
+    const angle = (segmentIdx / segments) * Math.PI * 2;
+    return [point[0] + Math.cos(angle) * PAD, point[1] + Math.sin(angle) * PAD];
   });
 
 function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
-  const n = data.points.length;
+  const pointCount = data.points.length;
 
   const dotTex  = useMemo(() => makeSprite('dot'), []);
   const ringTex = useMemo(() => makeSprite('ring'), []);
 
   const positions = useMemo(() => {
-    const arr = new Float32Array(n * 3);
-    data.points.forEach((p, i) => {
-      const c = mode === '3d' ? p.p3 : [...p.p2, 0];
-      arr[i * 3]     = c[0] * SCALE;
-      arr[i * 3 + 1] = c[1] * SCALE;
-      arr[i * 3 + 2] = (c[2] || 0) * SCALE;
+    const positionArray = new Float32Array(pointCount * 3);
+    data.points.forEach((docPoint, pointIdx) => {
+      const coords = mode === '3d' ? docPoint.p3 : [...docPoint.p2, 0];
+      positionArray[pointIdx * 3]     = coords[0] * SCALE;
+      positionArray[pointIdx * 3 + 1] = coords[1] * SCALE;
+      positionArray[pointIdx * 3 + 2] = (coords[2] || 0) * SCALE;
     });
-    return arr;
-  }, [data, mode, n]);
+    return positionArray;
+  }, [data, mode, pointCount]);
 
   const colors = useMemo(() => {
-    const arr = new Float32Array(n * 3);
-    const col = new THREE.Color();
-    for (let i = 0; i < n; i++) {
-      col.set(seriesColor(assign[i]));
-      arr[i * 3] = col.r; arr[i * 3 + 1] = col.g; arr[i * 3 + 2] = col.b;
+    const colorArray = new Float32Array(pointCount * 3);
+    const slotColor = new THREE.Color();
+    for (let pointIdx = 0; pointIdx < pointCount; pointIdx++) {
+      slotColor.set(seriesColor(assign[pointIdx]));
+      colorArray[pointIdx * 3] = slotColor.r;
+      colorArray[pointIdx * 3 + 1] = slotColor.g;
+      colorArray[pointIdx * 3 + 2] = slotColor.b;
     }
-    return arr;
-  }, [assign, n]);
+    return colorArray;
+  }, [assign, pointCount]);
 
   // Clusters are drawn two ways. A cluster of MIN_BLOB+ members gets a padded
   // convex-hull blob (hulling each member's padding shell, so the blob hugs its
@@ -136,48 +140,51 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
   const { hulls, constellations } = useMemo(() => {
     if (!showHulls) return { hulls: [], constellations: [] };
 
-    const byCluster = new Map();
-    for (let i = 0; i < n; i++) {
-      if (assign[i] >= SLOTS) continue;              // "other" bucket gets neither
-      if (!byCluster.has(assign[i])) byCluster.set(assign[i], []);
-      byCluster.get(assign[i]).push(i);
+    const membersBySlot = new Map();
+    for (let pointIdx = 0; pointIdx < pointCount; pointIdx++) {
+      const slot = assign[pointIdx];
+      if (slot >= SLOTS) continue;                   // "other" bucket gets neither
+      if (!membersBySlot.has(slot)) membersBySlot.set(slot, []);
+      membersBySlot.get(slot).push(pointIdx);
     }
 
     const hulls = [];
     const constellations = [];
 
-    for (const [slot, members] of byCluster) {
+    for (const [slot, members] of membersBySlot) {
       const color = seriesColor(slot);
 
       if (members.length < MIN_BLOB) {
         if (members.length < 2) continue;            // a lone star needs no line
-        const verts = new Float32Array(mstEdges(members, positions).flatMap(([a, b]) => [
-          positions[a * 3], positions[a * 3 + 1], positions[a * 3 + 2],
-          positions[b * 3], positions[b * 3 + 1], positions[b * 3 + 2],
-        ]));
+        const verts = new Float32Array(
+          mstEdges(members, positions).flatMap(([fromMember, toMember]) => [
+            positions[fromMember * 3], positions[fromMember * 3 + 1], positions[fromMember * 3 + 2],
+            positions[toMember * 3], positions[toMember * 3 + 1], positions[toMember * 3 + 2],
+          ]));
         constellations.push({ slot, color, verts });
         continue;
       }
 
-      const pts = members.map((i) => [
-        positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2],
+      const memberPoints = members.map((memberIdx) => [
+        positions[memberIdx * 3], positions[memberIdx * 3 + 1], positions[memberIdx * 3 + 2],
       ]);
-      const center = centroidOf(pts);
+      const center = centroidOf(memberPoints);
 
       if (mode === '3d') {
-        const cloud = pts.flatMap(shell3D)
-          .map((p) => new THREE.Vector3(p[0] - center[0], p[1] - center[1], p[2] - center[2]));
+        const shellPoints = memberPoints.flatMap(shell3D)
+          .map((point) => new THREE.Vector3(
+            point[0] - center[0], point[1] - center[1], point[2] - center[2]));
         let geometry;
         try {
-          geometry = new ConvexGeometry(cloud);
+          geometry = new ConvexGeometry(shellPoints);
           if (!(geometry.attributes.position?.count >= 4)) throw new Error('degenerate');
         } catch {
           geometry = new THREE.SphereGeometry(PAD, 16, 12);   // never drop a category
         }
         hulls.push({ slot, color, geometry, center });
       } else {
-        const cloud = pts.flatMap((p) => shell2D(p));
-        const outline = convexHull2D(cloud).map(([x, y]) => [x - center[0], y - center[1]]);
+        const shellPoints = memberPoints.flatMap((point) => shell2D(point));
+        const outline = convexHull2D(shellPoints).map(([x, y]) => [x - center[0], y - center[1]]);
         const shape = new THREE.Shape(outline.map(([x, y]) => new THREE.Vector2(x, y)));
         hulls.push({
           slot, color, center,
@@ -187,15 +194,19 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
       }
     }
     return { hulls, constellations };
-  }, [assign, positions, mode, showHulls, n]);
+  }, [assign, positions, mode, showHulls, pointCount]);
 
   // Dispose the previous frame's geometries — the slider rebuilds these on
   // every step, and orphaned BufferGeometry leaks GPU memory.
-  const prev = useRef([]);
+  const previousHulls = useRef([]);
   useEffect(() => {
-    const stale = prev.current;
-    prev.current = hulls;
-    return () => { for (const h of stale) if (!hulls.includes(h)) h.geometry.dispose(); };
+    const staleHulls = previousHulls.current;
+    previousHulls.current = hulls;
+    return () => {
+      for (const staleHull of staleHulls) {
+        if (!hulls.includes(staleHull)) staleHull.geometry.dispose();
+      }
+    };
   }, [hulls]);
 
   return (
@@ -211,37 +222,42 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
         dampingFactor={0.12}
       />
 
-      {hulls.map((h) => (
-        <group key={`${mode}-${h.slot}`} position={h.center}>
-          <mesh geometry={h.geometry} position={mode === '2d' ? [0, 0, -0.02] : undefined}>
+      {hulls.map((hull) => (
+        <group key={`${mode}-${hull.slot}`} position={hull.center}>
+          <mesh geometry={hull.geometry} position={mode === '2d' ? [0, 0, -0.02] : undefined}>
             <meshBasicMaterial
-              color={h.color}
+              color={hull.color}
               transparent
               opacity={mode === '3d' ? 0.1 : 0.14}
               depthWrite={false}
               side={THREE.DoubleSide}
             />
           </mesh>
-          {h.outline && (
+          {hull.outline && (
             <lineLoop position={[0, 0, -0.01]}>
               <bufferGeometry>
                 <bufferAttribute
                   attach="attributes-position"
-                  args={[new Float32Array(h.outline.flatMap(([x, y]) => [x, y, 0])), 3]}
+                  args={[new Float32Array(hull.outline.flatMap(([x, y]) => [x, y, 0])), 3]}
                 />
               </bufferGeometry>
-              <lineBasicMaterial color={h.color} transparent opacity={0.5} />
+              <lineBasicMaterial color={hull.color} transparent opacity={0.5} />
             </lineLoop>
           )}
         </group>
       ))}
 
-      {constellations.map((c) => (
-        <lineSegments key={`c-${mode}-${c.slot}`} renderOrder={1}>
-          <bufferGeometry key={`cg-${mode}-${c.slot}`}>
-            <bufferAttribute attach="attributes-position" args={[c.verts, 3]} />
+      {constellations.map((constellation) => (
+        <lineSegments key={`c-${mode}-${constellation.slot}`} renderOrder={1}>
+          <bufferGeometry key={`cg-${mode}-${constellation.slot}`}>
+            <bufferAttribute attach="attributes-position" args={[constellation.verts, 3]} />
           </bufferGeometry>
-          <lineBasicMaterial color={c.color} transparent opacity={0.55} depthWrite={false} />
+          <lineBasicMaterial
+            color={constellation.color}
+            transparent
+            opacity={0.55}
+            depthWrite={false}
+          />
         </lineSegments>
       ))}
 
@@ -267,10 +283,10 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
       <points
         key={mode}
         renderOrder={3}
-        onPointerMove={(e) => {
-          e.stopPropagation();
-          if (e.index !== undefined && e.index !== hoverIndex) {
-            onHover(e.index, e.nativeEvent.offsetX, e.nativeEvent.offsetY);
+        onPointerMove={(event) => {
+          event.stopPropagation();
+          if (event.index !== undefined && event.index !== hoverIndex) {
+            onHover(event.index, event.nativeEvent.offsetX, event.nativeEvent.offsetY);
           }
         }}
         onPointerOut={() => onHover(-1)}
@@ -290,22 +306,22 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
         />
       </points>
 
-      <HoverRing positions={positions} ringTex={ringTex} mode={mode} idx={hoverIndex} />
+      <HoverRing positions={positions} ringTex={ringTex} mode={mode} hoveredIdx={hoverIndex} />
     </>
   );
 }
 
 // Camera-facing ring on the hovered doc — the "surface ring on overlapping
 // marks" treatment, adapted to a point cloud.
-function HoverRing({ positions, ringTex, mode, idx }) {
-  if (idx < 0 || idx * 3 >= positions.length) return null;
-  const pos = new Float32Array([
-    positions[idx * 3], positions[idx * 3 + 1], positions[idx * 3 + 2],
+function HoverRing({ positions, ringTex, mode, hoveredIdx }) {
+  if (hoveredIdx < 0 || hoveredIdx * 3 >= positions.length) return null;
+  const hoveredPosition = new Float32Array([
+    positions[hoveredIdx * 3], positions[hoveredIdx * 3 + 1], positions[hoveredIdx * 3 + 2],
   ]);
   return (
     <points renderOrder={4}>
-      <bufferGeometry key={idx}>
-        <bufferAttribute attach="attributes-position" args={[pos, 3]} />
+      <bufferGeometry key={hoveredIdx}>
+        <bufferAttribute attach="attributes-position" args={[hoveredPosition, 3]} />
       </bufferGeometry>
       <pointsMaterial
         map={ringTex}
@@ -330,8 +346,11 @@ export default function EmbeddingSpace({ controlsEl, active }) {
 
   useEffect(() => {
     getEmbeddingMap()
-      .then((d) => { setData(d); setThreshold(d.defaultThreshold ?? 0.5); })
-      .catch((e) => setError(e.message));
+      .then((embeddingMap) => {
+        setData(embeddingMap);
+        setThreshold(embeddingMap.defaultThreshold ?? 0.5);
+      })
+      .catch((err) => setError(err.message));
   }, []);
 
   const { assign, clusters } = useMemo(() => {
@@ -371,7 +390,7 @@ export default function EmbeddingSpace({ controlsEl, active }) {
           type="range"
           min="0" max="1" step="0.001"
           value={threshold}
-          onChange={(e) => setThreshold(parseFloat(e.target.value))}
+          onChange={(event) => setThreshold(parseFloat(event.target.value))}
         />
       </div>
 
@@ -384,23 +403,27 @@ export default function EmbeddingSpace({ controlsEl, active }) {
       </div>
 
       <label className="check-row">
-        <input type="checkbox" checked={showHulls} onChange={(e) => setShowHulls(e.target.checked)} />
+        <input
+          type="checkbox"
+          checked={showHulls}
+          onChange={(event) => setShowHulls(event.target.checked)}
+        />
         Category blobs
       </label>
 
       <div>
         <span className="control-label">Categories · {data.points.length} docs</span>
         <div className="legend">
-          {clusters.slice(0, SLOTS).map((c) => (
-            <div className="legend-row" key={c.index}>
+          {clusters.slice(0, SLOTS).map((cluster) => (
+            <div className="legend-row" key={cluster.index}>
               <span
                 className="legend-swatch"
-                style={{ background: seriesColor(c.index), color: seriesColor(c.index) }}
+                style={{ background: seriesColor(cluster.index), color: seriesColor(cluster.index) }}
               />
-              <span className="legend-title" title={data.points[c.members[0]].title}>
-                {data.points[c.members[0]].title}
+              <span className="legend-title" title={data.points[cluster.members[0]].title}>
+                {data.points[cluster.members[0]].title}
               </span>
-              <span className="legend-count">{c.members.length}</span>
+              <span className="legend-count">{cluster.members.length}</span>
             </div>
           ))}
           {clusters.length > SLOTS && (
@@ -411,7 +434,8 @@ export default function EmbeddingSpace({ controlsEl, active }) {
               />
               <span className="legend-title">{clusters.length - SLOTS} more categories</span>
               <span className="legend-count">
-                {clusters.slice(SLOTS).reduce((s, c) => s + c.members.length, 0)}
+                {clusters.slice(SLOTS).reduce(
+                  (total, cluster) => total + cluster.members.length, 0)}
               </span>
             </div>
           )}

@@ -31,24 +31,24 @@ await embedAll({ force: true });
 
 const store  = JSON.parse(await fs.readFile(path.join(TEST_DATA, 'embeddings.json'), 'utf-8'));
 const chunks = store.chunks || [];
-const byDoc  = new Map();
-for (const c of chunks) {
-  if (!byDoc.has(c.docId)) byDoc.set(c.docId, []);
-  byDoc.get(c.docId).push(c);
+const chunksByDoc = new Map();
+for (const chunk of chunks) {
+  if (!chunksByDoc.has(chunk.docId)) chunksByDoc.set(chunk.docId, []);
+  chunksByDoc.get(chunk.docId).push(chunk);
 }
 
 console.log('\n[test_embed] Embedding complete:');
 console.log(`  model: ${store.metadata.model}  (${store.metadata.dimensions}-dim)`);
-console.log(`  ${chunks.length} chunks across ${byDoc.size} docs`);
-for (const [, docChunks] of byDoc) {
+console.log(`  ${chunks.length} chunks across ${chunksByDoc.size} docs`);
+for (const [, docChunks] of chunksByDoc) {
   console.log(`    ${docChunks[0].filename}: ${docChunks.length} chunks`);
 }
 
-const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+const elapsed   = ((Date.now() - start) / 1000).toFixed(2);
+const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 await fs.appendFile(
   path.join(ROOT, 'tests', 'test_log.txt'),
-  `[${ts}] test_embed               : ${elapsed}s\n`,
+  `[${timestamp}] test_embed               : ${elapsed}s\n`,
   'utf-8',
 );
 console.log(`\nDone in ${elapsed}s. Run test_chunking.js to inspect chunk quality or test_generate_categories.js next.`);

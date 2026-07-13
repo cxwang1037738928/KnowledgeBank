@@ -25,20 +25,22 @@ chatRouter.post('/', wrap(async (req, res) => {
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: '"messages" must be a non-empty array' });
   }
-  const last = messages[messages.length - 1];
-  if (last?.role !== 'user' || typeof last?.content !== 'string' || !last.content.trim()) {
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage?.role !== 'user' || typeof lastMessage?.content !== 'string'
+      || !lastMessage.content.trim()) {
     return res.status(400).json({ error: 'last message must be a user message with string "content"' });
   }
-  if (!Array.isArray(queryEmbedding) || queryEmbedding.some((v) => typeof v !== 'number')) {
+  if (!Array.isArray(queryEmbedding)
+      || queryEmbedding.some((component) => typeof component !== 'number')) {
     return res.status(400).json({ error: '"queryEmbedding" must be a number array (computed in the browser)' });
   }
 
-  const chunks = await retrieve(queryEmbedding, last.content);
+  const chunks = await retrieve(queryEmbedding, lastMessage.content);
   const { reply, model } = await answer(messages, chunks);
 
   res.json({
     reply,
     model,
-    sources: chunks.map(({ text, ...meta }) => meta),   // full text stays server-side
+    sources: chunks.map(({ text, ...sourceMeta }) => sourceMeta),   // full text stays server-side
   });
 }));

@@ -65,43 +65,48 @@ function httpError(status, message) {
 // ---------------------------------------------------------------------------
 
 // Vectors are L2-normalized (generate_categories.js), so dot = cosine.
-function dot(a, b) {
-  let s = 0;
-  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
-  return s;
+function dot(vecA, vecB) {
+  let sum = 0;
+  for (let componentIdx = 0; componentIdx < vecA.length; componentIdx++) {
+    sum += vecA[componentIdx] * vecB[componentIdx];
+  }
+  return sum;
 }
 
 // Deterministic PRNG (mulberry32) so the UMAP layout is stable across
 // requests and reloads instead of reshuffling on every fetch.
 function mulberry32(seed) {
-  let a = seed >>> 0;
+  let state = seed >>> 0;
   return () => {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    state |= 0; state = (state + 0x6D2B79F5) | 0;
+    let mixed = Math.imul(state ^ (state >>> 15), 1 | state);
+    mixed = (mixed + Math.imul(mixed ^ (mixed >>> 7), 61 | mixed)) ^ mixed;
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296;
   };
 }
 
 /** Per-axis min-max scale to [-1, 1] so the scene size is data-independent. */
 function normalizeCoords(coords) {
   const dims = coords[0].length;
-  for (let d = 0; d < dims; d++) {
+  for (let axis = 0; axis < dims; axis++) {
     let min = Infinity, max = -Infinity;
-    for (const c of coords) { min = Math.min(min, c[d]); max = Math.max(max, c[d]); }
+    for (const point of coords) {
+      min = Math.min(min, point[axis]);
+      max = Math.max(max, point[axis]);
+    }
     const span = max - min || 1;
-    for (const c of coords) c[d] = ((c[d] - min) / span) * 2 - 1;
+    for (const point of coords) point[axis] = ((point[axis] - min) / span) * 2 - 1;
   }
   return coords;
 }
 
 function project(vectors, nComponents, seed) {
-  const n = vectors.length;
-  if (n === 1) return [nComponents === 3 ? [0, 0, 0] : [0, 0]];
+  const docCount = vectors.length;
+  if (docCount === 1) return [nComponents === 3 ? [0, 0, 0] : [0, 0]];
   const umap = new UMAP({
     nComponents,
-    // UMAP requires nNeighbors < n; 15 is the library default sweet spot.
-    nNeighbors: Math.max(2, Math.min(15, n - 1)),
+    // UMAP requires nNeighbors < docCount; 15 is the library default sweet spot.
+    nNeighbors: Math.max(2, Math.min(15, docCount - 1)),
     minDist: 0.15,
     random: mulberry32(seed),
   });
@@ -112,20 +117,22 @@ function project(vectors, nComponents, seed) {
  * clusters with, so browser-side union-find over these edges reproduces the
  * backend clustering at any threshold. O(n²) sims, O(n·K) shipped. */
 function mutualKnnEdges(vectors, k) {
-  const n = vectors.length;
-  const top = [];
-  for (let i = 0; i < n; i++) {
+  const docCount = vectors.length;
+  const nearestNeighbours = [];
+  for (let docIdx = 0; docIdx < docCount; docIdx++) {
     const sims = [];
-    for (let j = 0; j < n; j++) {
-      if (j !== i) sims.push([j, dot(vectors[i], vectors[j])]);
+    for (let otherIdx = 0; otherIdx < docCount; otherIdx++) {
+      if (otherIdx !== docIdx) sims.push([otherIdx, dot(vectors[docIdx], vectors[otherIdx])]);
     }
-    sims.sort((a, b) => b[1] - a[1]);
-    top.push(new Map(sims.slice(0, k)));
+    sims.sort((simA, simB) => simB[1] - simA[1]);
+    nearestNeighbours.push(new Map(sims.slice(0, k)));
   }
   const edges = [];
-  for (let i = 0; i < n; i++) {
-    for (const [j, sim] of top[i]) {
-      if (j > i && top[j].has(i)) edges.push({ i, j, sim: Math.round(sim * 10000) / 10000 });
+  for (let docIdx = 0; docIdx < docCount; docIdx++) {
+    for (const [otherIdx, sim] of nearestNeighbours[docIdx]) {
+      if (otherIdx > docIdx && nearestNeighbours[otherIdx].has(docIdx)) {
+        edges.push({ i: docIdx, j: otherIdx, sim: Math.round(sim * 10000) / 10000 });
+      }
     }
   }
   return edges;
@@ -136,28 +143,28 @@ function mutualKnnEdges(vectors, k) {
 let mapCache = null;
 
 corpusRouter.get('/embedding-map', wrap(async (req, res) => {
-  let raw;
+  let docVectors;
   try {
-    raw = JSON.parse(await fs.readFile(VECTORS_PATH, 'utf-8'));
+    docVectors = JSON.parse(await fs.readFile(VECTORS_PATH, 'utf-8'));
   } catch {
     throw httpError(404, 'doc_vectors.json not found — run the categorize stage first');
   }
-  if (!raw.docs?.length) throw httpError(404, 'doc_vectors.json is empty');
+  if (!docVectors.docs?.length) throw httpError(404, 'doc_vectors.json is empty');
 
-  if (mapCache?.generatedAt !== raw.generatedAt) {
-    const vectors = raw.docs.map((d) => d.vector);
+  if (mapCache?.generatedAt !== docVectors.generatedAt) {
+    const vectors = docVectors.docs.map((doc) => doc.vector);
     const p3 = project(vectors, 3, 1337);
     const p2 = project(vectors, 2, 1337);
     mapCache = {
-      generatedAt: raw.generatedAt,
+      generatedAt: docVectors.generatedAt,
       mutualK: MUTUAL_K,
       defaultThreshold: parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
-      points: raw.docs.map((d, idx) => ({
-        docId:    d.docId,
-        filename: d.filename,
-        title:    d.title || d.filename,
-        p3:       p3[idx].map((v) => Math.round(v * 1000) / 1000),
-        p2:       p2[idx].map((v) => Math.round(v * 1000) / 1000),
+      points: docVectors.docs.map((doc, docIdx) => ({
+        docId:    doc.docId,
+        filename: doc.filename,
+        title:    doc.title || doc.filename,
+        p3:       p3[docIdx].map((coord) => Math.round(coord * 1000) / 1000),
+        p2:       p2[docIdx].map((coord) => Math.round(coord * 1000) / 1000),
       })),
       edges: mutualKnnEdges(vectors, MUTUAL_K),
     };
@@ -187,10 +194,10 @@ const EMBEDDINGS_PATH = path.join(DATA_DIR, 'embeddings.json');
 // Both files are MBs; memoize each parse on its mtime.
 const fileCache = new Map();
 async function readJsonCached(filePath, missing) {
-  const mtime = await fs.stat(filePath).then((s) => s.mtimeMs).catch(() => null);
+  const mtime = await fs.stat(filePath).then((stats) => stats.mtimeMs).catch(() => null);
   if (mtime === null) throw httpError(404, missing);
-  const hit = fileCache.get(filePath);
-  if (hit?.mtime === mtime) return hit.data;
+  const cached = fileCache.get(filePath);
+  if (cached?.mtime === mtime) return cached.data;
   const data = JSON.parse(await fs.readFile(filePath, 'utf-8'));
   fileCache.set(filePath, { mtime, data });
   return data;
@@ -201,14 +208,14 @@ const loadDoclings = () =>
 
 corpusRouter.get('/documents', wrap(async (req, res) => {
   const doclings = await loadDoclings();
-  const docs = Object.values(doclings).map((d) => ({
-    docId:    d.docId,
-    filename: d.filename,
-    title:    d.metadata?.title || d.filename,
-    authors:  d.metadata?.authors || [],
-    created:  d.metadata?.created || null,
+  const docs = Object.values(doclings).map((doclingEntry) => ({
+    docId:    doclingEntry.docId,
+    filename: doclingEntry.filename,
+    title:    doclingEntry.metadata?.title || doclingEntry.filename,
+    authors:  doclingEntry.metadata?.authors || [],
+    created:  doclingEntry.metadata?.created || null,
   }));
-  docs.sort((a, b) => a.title.localeCompare(b.title));
+  docs.sort((docA, docB) => docA.title.localeCompare(docB.title));
   res.json({ documents: docs });
 }));
 
@@ -226,12 +233,13 @@ corpusRouter.get('/documents/:docId/pdf', wrap(async (req, res) => {
 }));
 
 corpusRouter.get('/chunks/:chunkId', wrap(async (req, res) => {
-  const store = await readJsonCached(
+  const embeddingStore = await readJsonCached(
     EMBEDDINGS_PATH, 'embeddings.json not found — run the embed stage first');
-  const chunk = (store.chunks || []).find((c) => c.id === req.params.chunkId);
+  const chunk = (embeddingStore.chunks || []).find(
+    (storedChunk) => storedChunk.id === req.params.chunkId);
   if (!chunk) throw httpError(404, `Unknown chunk "${req.params.chunkId}"`);
-  const { embedding, ...rest } = chunk;
-  res.json(rest);
+  const { embedding, ...chunkWithoutEmbedding } = chunk;
+  res.json(chunkWithoutEmbedding);
 }));
 
 // ---------------------------------------------------------------------------
@@ -240,13 +248,13 @@ corpusRouter.get('/chunks/:chunkId', wrap(async (req, res) => {
 
 async function ollamaModels() {
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 3000);
-    const resp = await fetch(`${OLLAMA_URL}/api/tags`, { signal: ctrl.signal });
-    clearTimeout(timer);
-    if (!resp.ok) return null;
-    const body = await resp.json();
-    return (body.models || []).map((m) => m.name).sort();
+    const abortController = new AbortController();
+    const timeoutTimer = setTimeout(() => abortController.abort(), 3000);
+    const response = await fetch(`${OLLAMA_URL}/api/tags`, { signal: abortController.signal });
+    clearTimeout(timeoutTimer);
+    if (!response.ok) return null;
+    const body = await response.json();
+    return (body.models || []).map((model) => model.name).sort();
   } catch {
     return null; // Ollama down — the frontend falls back to free-text input
   }
@@ -274,45 +282,45 @@ corpusRouter.get('/models', wrap(async (req, res) => {
  */
 corpusRouter.post('/settings', wrap(async (req, res) => {
   const updates = req.body || {};
-  const keys = Object.keys(updates);
-  if (keys.length === 0) throw httpError(400, 'Empty settings payload');
+  const roleKeys = Object.keys(updates);
+  if (roleKeys.length === 0) throw httpError(400, 'Empty settings payload');
 
-  for (const key of keys) {
-    if (!(key in MODEL_ROLES)) throw httpError(400, `Unknown setting "${key}"`);
-    const value = updates[key];
-    if (typeof value !== 'string' || !value.trim() || /[\r\n]/.test(value)) {
-      throw httpError(400, `Invalid value for ${key}`);
+  for (const roleKey of roleKeys) {
+    if (!(roleKey in MODEL_ROLES)) throw httpError(400, `Unknown setting "${roleKey}"`);
+    const modelName = updates[roleKey];
+    if (typeof modelName !== 'string' || !modelName.trim() || /[\r\n]/.test(modelName)) {
+      throw httpError(400, `Invalid value for ${roleKey}`);
     }
   }
 
-  let env;
+  let envContents;
   try {
-    env = await fs.readFile(ENV_PATH, 'utf-8');
+    envContents = await fs.readFile(ENV_PATH, 'utf-8');
   } catch {
     throw httpError(500, '.env not found at project root');
   }
 
-  const lines = env.split(/\r?\n/);
-  const seen = new Set();
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(/^([A-Z_][A-Z0-9_]*)=/);
-    if (m && keys.includes(m[1])) {
-      lines[i] = `${m[1]}=${updates[m[1]].trim()}`;
-      seen.add(m[1]);
+  const envLines = envContents.split(/\r?\n/);
+  const replacedKeys = new Set();
+  for (let lineIdx = 0; lineIdx < envLines.length; lineIdx++) {
+    const keyMatch = envLines[lineIdx].match(/^([A-Z_][A-Z0-9_]*)=/);
+    if (keyMatch && roleKeys.includes(keyMatch[1])) {
+      envLines[lineIdx] = `${keyMatch[1]}=${updates[keyMatch[1]].trim()}`;
+      replacedKeys.add(keyMatch[1]);
     }
   }
-  const missing = keys.filter((k) => !seen.has(k));
-  if (missing.length) {
-    if (lines[lines.length - 1]?.trim() !== '') lines.push('');
-    lines.push('# Models set via the frontend Models tab');
-    for (const k of missing) lines.push(`${k}=${updates[k].trim()}`);
+  const appendKeys = roleKeys.filter((roleKey) => !replacedKeys.has(roleKey));
+  if (appendKeys.length) {
+    if (envLines[envLines.length - 1]?.trim() !== '') envLines.push('');
+    envLines.push('# Models set via the frontend Models tab');
+    for (const roleKey of appendKeys) envLines.push(`${roleKey}=${updates[roleKey].trim()}`);
   }
 
-  const tmp = `${ENV_PATH}.tmp`;
-  await fs.writeFile(tmp, lines.join('\n'), 'utf-8');
-  await fs.rename(tmp, ENV_PATH);
+  const tempPath = `${ENV_PATH}.tmp`;
+  await fs.writeFile(tempPath, envLines.join('\n'), 'utf-8');
+  await fs.rename(tempPath, ENV_PATH);
 
-  for (const k of keys) process.env[k] = updates[k].trim();
+  for (const roleKey of roleKeys) process.env[roleKey] = updates[roleKey].trim();
 
   const roles = {};
   for (const key of Object.keys(MODEL_ROLES)) roles[key] = process.env[key] || null;

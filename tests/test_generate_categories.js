@@ -27,9 +27,9 @@ await fs.mkdir(TEST_DATA, { recursive: true });
 
 const { generateCategories } = await import('../backend/extraction/generate_categories.js');
 
-const tArg      = process.argv.indexOf('--threshold');
-const threshold = tArg !== -1
-  ? parseFloat(process.argv[tArg + 1])
+const thresholdArgIdx = process.argv.indexOf('--threshold');
+const threshold = thresholdArgIdx !== -1
+  ? parseFloat(process.argv[thresholdArgIdx + 1])
   : parseFloat(process.env.CLUSTER_SIMILARITY || '0.75');
 
 const start = Date.now();
@@ -37,18 +37,18 @@ console.log('[test_generate_categories] Clustering at threshold=' + threshold + 
 const result = await generateCategories(threshold);
 
 console.log(`\n[test_generate_categories] ${result.categories.length} cluster(s) at threshold=${threshold}:\n`);
-for (const cat of result.categories) {
-  const members = cat.members.map((m) => m.filename).join(', ');
-  console.log(`  Category ${cat.index} (${cat.members.length} doc${cat.members.length !== 1 ? 's' : ''}): ${members}`);
-  console.log(`    keywords: ${cat.keywords.slice(0, 8).join(', ')}`);
-  console.log(`    medoid:   ${cat.medoid.filename}`);
+for (const category of result.categories) {
+  const memberNames = category.members.map((member) => member.filename).join(', ');
+  console.log(`  Category ${category.index} (${category.members.length} doc${category.members.length !== 1 ? 's' : ''}): ${memberNames}`);
+  console.log(`    keywords: ${category.keywords.slice(0, 8).join(', ')}`);
+  console.log(`    medoid:   ${category.medoid.filename}`);
 }
 
-const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+const elapsed   = ((Date.now() - start) / 1000).toFixed(2);
+const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 await fs.appendFile(
   path.join(ROOT, 'tests', 'test_log.txt'),
-  `[${ts}] test_generate_categories : ${elapsed}s\n`,
+  `[${timestamp}] test_generate_categories : ${elapsed}s\n`,
   'utf-8',
 );
 console.log(`\nDone in ${elapsed}s. Run test_heuristic.js next.`);

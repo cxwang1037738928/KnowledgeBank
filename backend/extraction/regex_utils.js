@@ -53,5 +53,5 @@ export const STOPWORDS = new Set([
 
 export function tokenise(text) {
   const tokens = (text.toLowerCase().match(/[a-z]+/g) || []);
-  return tokens.filter((t) => !STOPWORDS.has(t) && t.length > 2);
+  return tokens.filter((token) => !STOPWORDS.has(token) && token.length > 2);
 }

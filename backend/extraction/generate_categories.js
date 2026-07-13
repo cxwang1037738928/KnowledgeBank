@@ -73,8 +73,8 @@ async function embedBatch(texts) {
   const extractor = await getExtractor();
   const output    = await extractor(texts, { pooling: 'mean', normalize: true });
   const dims      = output.data.length / texts.length;
-  return Array.from({ length: texts.length }, (_, i) =>
-    Array.from(output.data.slice(i * dims, (i + 1) * dims))
+  return Array.from({ length: texts.length }, (_, textIdx) =>
+    Array.from(output.data.slice(textIdx * dims, (textIdx + 1) * dims))
   );
 }
 
@@ -99,35 +99,35 @@ function bodyText(entry) {
   // normHeading strips numbering ('7. References') so numbered bibliography
   // headings don't leak reference text into the keyword pool.
   const sections = (entry?.sections || []).filter(
-    (s) => !REF_HEADINGS.has(normHeading(s.heading)) && (s.text || '').trim()
+    (section) => !REF_HEADINGS.has(normHeading(section.heading)) && (section.text || '').trim()
   );
-  return sections.length ? sections.map((s) => s.text).join(' ') : (entry?.text || '');
+  return sections.length ? sections.map((section) => section.text).join(' ') : (entry?.text || '');
 }
 
 function buildIdf(tokenisedDocs) {
-  const N = tokenisedDocs.length;
-  const df = new Map();
+  const docCount = tokenisedDocs.length;
+  const docFreq = new Map();
   for (const tokens of tokenisedDocs) {
-    for (const t of new Set(tokens)) df.set(t, (df.get(t) || 0) + 1);
+    for (const token of new Set(tokens)) docFreq.set(token, (docFreq.get(token) || 0) + 1);
   }
   return (term) => {
-    const d = df.get(term) || 0;
-    return Math.log((N - d + 0.5) / (d + 0.5) + 1);
+    const termDocFreq = docFreq.get(term) || 0;
+    return Math.log((docCount - termDocFreq + 0.5) / (termDocFreq + 0.5) + 1);
   };
 }
 
-function clusterKeywords(memberTokens, idf, n = KEYWORDS_N) {
-  const tf = new Map();
+function clusterKeywords(memberTokens, idf, keywordCount = KEYWORDS_N) {
+  const termFreq = new Map();
   for (const tokens of memberTokens) {
-    for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1);
+    for (const token of tokens) termFreq.set(token, (termFreq.get(token) || 0) + 1);
   }
   const scores = new Map();
-  for (const [t, count] of tf) scores.set(t, count * idf(t));
+  for (const [term, count] of termFreq) scores.set(term, count * idf(term));
   // Alphabetical secondary sort key keeps ties deterministic across runs.
   return [...scores.entries()]
-    .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
-    .slice(0, n)
-    .map(([t]) => t);
+    .sort((entryA, entryB) => (entryB[1] - entryA[1]) || entryA[0].localeCompare(entryB[0]))
+    .slice(0, keywordCount)
+    .map(([term]) => term);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,29 +135,31 @@ function clusterKeywords(memberTokens, idf, n = KEYWORDS_N) {
 // ---------------------------------------------------------------------------
 
 class UnionFind {
-  constructor(n) {
-    this.parent = Array.from({ length: n }, (_, i) => i);
-    this.rank   = new Array(n).fill(0);
+  constructor(size) {
+    this.parent = Array.from({ length: size }, (_, nodeIdx) => nodeIdx);
+    this.rank   = new Array(size).fill(0);
   }
 
-  find(x) {
-    if (this.parent[x] !== x) this.parent[x] = this.find(this.parent[x]);
-    return this.parent[x];
+  find(node) {
+    if (this.parent[node] !== node) this.parent[node] = this.find(this.parent[node]);
+    return this.parent[node];
   }
 
-  union(x, y) {
-    const px = this.find(x), py = this.find(y);
-    if (px === py) return;
-    if      (this.rank[px] < this.rank[py]) this.parent[px] = py;
-    else if (this.rank[px] > this.rank[py]) this.parent[py] = px;
-    else { this.parent[py] = px; this.rank[px]++; }
+  union(nodeA, nodeB) {
+    const rootA = this.find(nodeA), rootB = this.find(nodeB);
+    if (rootA === rootB) return;
+    if      (this.rank[rootA] < this.rank[rootB]) this.parent[rootA] = rootB;
+    else if (this.rank[rootA] > this.rank[rootB]) this.parent[rootB] = rootA;
+    else { this.parent[rootB] = rootA; this.rank[rootA]++; }
   }
 }
 
 // Embeddings are L2-normalised, so dot product = cosine similarity.
-function dotProduct(a, b) {
+function dotProduct(vecA, vecB) {
   let sum = 0;
-  for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
+  for (let componentIdx = 0; componentIdx < vecA.length; componentIdx++) {
+    sum += vecA[componentIdx] * vecB[componentIdx];
+  }
   return sum;
 }
 
@@ -165,23 +167,23 @@ function dotProduct(a, b) {
 function clusterMedoid(memberIds, vectors) {
   if (memberIds.length === 1) return memberIds[0];
 
-  const dim = vectors[memberIds[0]].length;
-  const centroid = new Float64Array(dim);
-  for (const id of memberIds) {
-    const v = vectors[id];
-    for (let i = 0; i < dim; i++) centroid[i] += v[i];
+  const dims = vectors[memberIds[0]].length;
+  const centroid = new Float64Array(dims);
+  for (const memberId of memberIds) {
+    const memberVector = vectors[memberId];
+    for (let dim = 0; dim < dims; dim++) centroid[dim] += memberVector[dim];
   }
-  let mag = 0;
-  for (let i = 0; i < dim; i++) mag += centroid[i] * centroid[i];
-  mag = Math.sqrt(mag) || 1;
-  for (let i = 0; i < dim; i++) centroid[i] /= mag;
+  let magnitude = 0;
+  for (let dim = 0; dim < dims; dim++) magnitude += centroid[dim] * centroid[dim];
+  magnitude = Math.sqrt(magnitude) || 1;
+  for (let dim = 0; dim < dims; dim++) centroid[dim] /= magnitude;
 
-  let best = memberIds[0], bestSim = -Infinity;
-  for (const id of memberIds) {
-    const sim = dotProduct(vectors[id], centroid);
-    if (sim > bestSim) { bestSim = sim; best = id; }
+  let closestId = memberIds[0], bestSim = -Infinity;
+  for (const memberId of memberIds) {
+    const sim = dotProduct(vectors[memberId], centroid);
+    if (sim > bestSim) { bestSim = sim; closestId = memberId; }
   }
-  return best;
+  return closestId;
 }
 
 // ---------------------------------------------------------------------------
@@ -211,46 +213,48 @@ export async function generateCategories(threshold) {
   }
 
   console.log(`[generate_categories] Embedding title+abstract for ${docIds.length} doc(s) ...`);
-  const texts = docIds.map(id => metaText(doclings[id]));
+  const texts = docIds.map(docId => metaText(doclings[docId]));
   const vectors = {};
-  for (let i = 0; i < docIds.length; i += BATCH_SIZE) {
-    const batchIds   = docIds.slice(i, i + BATCH_SIZE);
-    const batchTexts = texts.slice(i, i + BATCH_SIZE);
+  for (let batchStart = 0; batchStart < docIds.length; batchStart += BATCH_SIZE) {
+    const batchIds   = docIds.slice(batchStart, batchStart + BATCH_SIZE);
+    const batchTexts = texts.slice(batchStart, batchStart + BATCH_SIZE);
     const embeddings = await embedBatch(batchTexts);
-    embeddings.forEach((vec, j) => { vectors[batchIds[j]] = vec; });
+    embeddings.forEach((vector, idxInBatch) => { vectors[batchIds[idxInBatch]] = vector; });
   }
 
   // Single-linkage gated by mutual-kNN: merge only when sim >= threshold AND
   // each doc is in the other's top MUTUAL_K neighbours — plain single-linkage
   // transitively chains unrelated docs into one blob at corpus scale.
-  const n = docIds.length;
+  const docCount = docIds.length;
   const neighbours = []; // per doc: Map(otherIdx -> sim) of its top MUTUAL_K
-  for (let i = 0; i < n; i++) {
+  for (let docIdx = 0; docIdx < docCount; docIdx++) {
     const sims = [];
-    for (let j = 0; j < n; j++) {
-      if (j !== i) sims.push([j, dotProduct(vectors[docIds[i]], vectors[docIds[j]])]);
+    for (let otherIdx = 0; otherIdx < docCount; otherIdx++) {
+      if (otherIdx !== docIdx) {
+        sims.push([otherIdx, dotProduct(vectors[docIds[docIdx]], vectors[docIds[otherIdx]])]);
+      }
     }
-    sims.sort((a, b) => b[1] - a[1]);
+    sims.sort((simA, simB) => simB[1] - simA[1]);
     neighbours.push(new Map(sims.slice(0, MUTUAL_K)));
   }
 
-  const uf = new UnionFind(n);
-  for (let i = 0; i < n; i++) {
-    for (const [j, sim] of neighbours[i]) {
-      if (j > i && sim >= threshold && neighbours[j].has(i)) {
-        uf.union(i, j);
+  const unionFind = new UnionFind(docCount);
+  for (let docIdx = 0; docIdx < docCount; docIdx++) {
+    for (const [otherIdx, sim] of neighbours[docIdx]) {
+      if (otherIdx > docIdx && sim >= threshold && neighbours[otherIdx].has(docIdx)) {
+        unionFind.union(docIdx, otherIdx);
       }
     }
   }
 
   const clusters = {};
-  for (let i = 0; i < docIds.length; i++) {
-    const root = uf.find(i);
-    if (!clusters[root]) clusters[root] = [];
-    clusters[root].push(docIds[i]);
+  for (let docIdx = 0; docIdx < docIds.length; docIdx++) {
+    const clusterRoot = unionFind.find(docIdx);
+    if (!clusters[clusterRoot]) clusters[clusterRoot] = [];
+    clusters[clusterRoot].push(docIds[docIdx]);
   }
 
-  const tokenised = new Map(docIds.map((d) => [d, tokenise(bodyText(doclings[d]))]));
+  const tokenised = new Map(docIds.map((docId) => [docId, tokenise(bodyText(doclings[docId]))]));
   const idf = buildIdf([...tokenised.values()]);
 
   const categories = Object.values(clusters).map((members, index) => {
@@ -261,7 +265,7 @@ export async function generateCategories(threshold) {
         docId,
         filename: doclings[docId]?.filename || docId,
       })),
-      keywords: clusterKeywords(members.map(d => tokenised.get(d) || []), idf),
+      keywords: clusterKeywords(members.map(docId => tokenised.get(docId) || []), idf),
       medoid: {
         docId:    medoidId,
         filename: doclings[medoidId]?.filename || medoidId,
@@ -284,11 +288,11 @@ export async function generateCategories(threshold) {
     generatedAt: output.generatedAt,
     model:       EMBED_MODEL,
     dims:        vectors[docIds[0]].length,
-    docs: docIds.map(id => ({
-      docId:    id,
-      filename: doclings[id]?.filename || id,
-      title:    (doclings[id]?.metadata?.title || '').trim() || null,
-      vector:   vectors[id],
+    docs: docIds.map(docId => ({
+      docId,
+      filename: doclings[docId]?.filename || docId,
+      title:    (doclings[docId]?.metadata?.title || '').trim() || null,
+      vector:   vectors[docId],
     })),
   };
   await fs.writeFile(VECTORS_OUT, JSON.stringify(docVectors), 'utf-8');
@@ -302,9 +306,9 @@ export async function generateCategories(threshold) {
 
 // Run directly: node backend/extraction/generate_categories.js --threshold 0.75
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const tArg      = process.argv.indexOf('--threshold');
-  const threshold = tArg !== -1
-    ? parseFloat(process.argv[tArg + 1])
+  const thresholdArgIdx = process.argv.indexOf('--threshold');
+  const threshold = thresholdArgIdx !== -1
+    ? parseFloat(process.argv[thresholdArgIdx + 1])
     : parseFloat(process.env.CLUSTER_SIMILARITY || '0.75');
 
   generateCategories(threshold).catch(err => {

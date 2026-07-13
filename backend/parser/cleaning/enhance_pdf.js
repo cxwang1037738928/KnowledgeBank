@@ -92,8 +92,8 @@ export async function classifyPageType(doc, pageNumber, { textDensityThreshold =
 export async function classifyAllPages(pdfPath) {
   const doc = await loadDocument(pdfPath);
   const results = [];
-  for (let p = 1; p <= doc.numPages; p++) {
-    results.push(await classifyPageType(doc, p));
+  for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+    results.push(await classifyPageType(doc, pageNum));
   }
   return results;
 }
@@ -138,8 +138,8 @@ export async function rasterizePage(doc, pageNumber, dpi = DEFAULT_DPI) {
 export async function rasterizeDocument(pdfPath, dpi = DEFAULT_DPI) {
   const doc = await loadDocument(pdfPath);
   const pages = [];
-  for (let p = 1; p <= doc.numPages; p++) {
-    pages.push({ pageNumber: p, ...(await rasterizePage(doc, p, dpi)) });
+  for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+    pages.push({ pageNumber: pageNum, ...(await rasterizePage(doc, pageNum, dpi)) });
   }
   return pages;
 }
@@ -155,34 +155,34 @@ async function toGrayscaleRaw(buffer) {
 
 function computeHistogram(grayData) {
   const hist = new Array(256).fill(0);
-  for (let i = 0; i < grayData.length; i++) hist[grayData[i]]++;
+  for (let pixelIdx = 0; pixelIdx < grayData.length; pixelIdx++) hist[grayData[pixelIdx]]++;
   return hist;
 }
 
 /** Otsu's method: finds the threshold that maximizes between-class variance. */
 function otsuThreshold(hist, total) {
   let sum = 0;
-  for (let i = 0; i < 256; i++) sum += i * hist[i];
+  for (let level = 0; level < 256; level++) sum += level * hist[level];
 
   let sumB = 0;
   let weightB = 0;
   let maxVariance = 0;
   let threshold = 0;
 
-  for (let t = 0; t < 256; t++) {
-    weightB += hist[t];
+  for (let level = 0; level < 256; level++) {
+    weightB += hist[level];
     if (weightB === 0) continue;
     const weightF = total - weightB;
     if (weightF === 0) break;
 
-    sumB += t * hist[t];
+    sumB += level * hist[level];
     const meanB = sumB / weightB;
     const meanF = (sum - sumB) / weightF;
     const variance = weightB * weightF * (meanB - meanF) ** 2;
 
     if (variance > maxVariance) {
       maxVariance = variance;
-      threshold = t;
+      threshold = level;
     }
   }
   return threshold;
@@ -229,28 +229,28 @@ export async function estimateSkewAngle(buffer, { maxAngle = 10, coarseStep = 1,
       rowSums[y] = sum;
     }
 
-    const mean = rowSums.reduce((a, b) => a + b, 0) / rowSums.length;
-    return rowSums.reduce((a, b) => a + (b - mean) ** 2, 0) / rowSums.length;
+    const mean = rowSums.reduce((total, rowSum) => total + rowSum, 0) / rowSums.length;
+    return rowSums.reduce((total, rowSum) => total + (rowSum - mean) ** 2, 0) / rowSums.length;
   }
 
   let bestAngle = 0;
   let bestVariance = -Infinity;
-  for (let a = -maxAngle; a <= maxAngle; a += coarseStep) {
-    const v = await varianceAtAngle(a);
-    if (v > bestVariance) {
-      bestVariance = v;
-      bestAngle = a;
+  for (let angle = -maxAngle; angle <= maxAngle; angle += coarseStep) {
+    const variance = await varianceAtAngle(angle);
+    if (variance > bestVariance) {
+      bestVariance = variance;
+      bestAngle = angle;
     }
   }
 
   // No ink content (blank/fully-white page) — nothing to align.
   if (bestVariance <= 0) return 0;
 
-  for (let a = bestAngle - coarseStep; a <= bestAngle + coarseStep; a += fineStep) {
-    const v = await varianceAtAngle(a);
-    if (v > bestVariance) {
-      bestVariance = v;
-      bestAngle = a;
+  for (let angle = bestAngle - coarseStep; angle <= bestAngle + coarseStep; angle += fineStep) {
+    const variance = await varianceAtAngle(angle);
+    if (variance > bestVariance) {
+      bestVariance = variance;
+      bestAngle = angle;
     }
   }
 
@@ -317,7 +317,7 @@ export async function enhancePage(buffer, opts = {}) {
  */
 async function isBlankPage(buffer) {
   const { data, info } = await sharp(buffer).grayscale().raw().toBuffer({ resolveWithObject: true });
-  const white = data.reduce((n, v) => n + (v > 250 ? 1 : 0), 0);
+  const white = data.reduce((count, pixel) => count + (pixel > 250 ? 1 : 0), 0);
   return white / (info.width * info.height) > 0.99;
 }
 
@@ -355,13 +355,13 @@ export async function processDocument(pdfPath, { docId, dpi = DEFAULT_DPI } = {}
   const saveDir = docId ? path.join(ENHANCED_DIR, docId) : null;
 
   const pages = [];
-  for (let p = 1; p <= doc.numPages; p++) {
-    pages.push(await processPage(doc, p, { dpi, saveDir }));
+  for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+    pages.push(await processPage(doc, pageNum, { dpi, saveDir }));
   }
 
   const report = { docId: docId ?? null, pdfPath, numPages: doc.numPages, dpi, processedAt: new Date().toISOString(), pages };
 
-  const blankPages = pages.filter(p => p.blank).map(p => p.pageNumber);
+  const blankPages = pages.filter(page => page.blank).map(page => page.pageNumber);
   if (blankPages.length > 0) {
     console.warn(
       `[enhance] ${path.basename(pdfPath)}: ${blankPages.length}/${doc.numPages} page(s) rendered blank` +

@@ -57,8 +57,8 @@ export const CRAWLERS = {
 };
 
 function currentCrawler() {
-  const c = document.documentElement.dataset.crawler;
-  return c in CRAWLERS ? c : 'sapphire';
+  const crawlerName = document.documentElement.dataset.crawler;
+  return crawlerName in CRAWLERS ? crawlerName : 'sapphire';
 }
 
 /** Active crawler + a setter that stamps data-crawler on <html> (persisted),

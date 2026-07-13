@@ -45,11 +45,11 @@ async function embedBatch(texts) {
   const extractor = await getExtractor();
   const output = await extractor(texts, { pooling: 'mean', normalize: true });
   const dims = output.data.length / texts.length;
-  const results = [];
-  for (let i = 0; i < texts.length; i++) {
-    results.push(Array.from(output.data.slice(i * dims, (i + 1) * dims)));
+  const vectors = [];
+  for (let textIdx = 0; textIdx < texts.length; textIdx++) {
+    vectors.push(Array.from(output.data.slice(textIdx * dims, (textIdx + 1) * dims)));
   }
-  return results;
+  return vectors;
 }
 
 // ---------------------------------------------------------------------------
@@ -59,8 +59,8 @@ async function embedBatch(texts) {
 export async function embedAll({ force = false } = {}) {
   let doclings;
   try {
-    const raw = await fs.readFile(DOCLINGS_PATH, 'utf-8');
-    doclings = JSON.parse(raw);
+    const doclingsJson = await fs.readFile(DOCLINGS_PATH, 'utf-8');
+    doclings = JSON.parse(doclingsJson);
   } catch {
     throw new Error('data/doclings.json not found — run extract.py first');
   }
@@ -81,16 +81,18 @@ export async function embedAll({ force = false } = {}) {
   // A doc counts as embedded only if its chunks are newer than its extraction
   // — presence alone would keep stale embeddings after a re-extract.
   const newestChunkAt = new Map();
-  for (const c of existing.chunks) {
-    const t = Date.parse(c.ingestedAt) || 0;
-    if (t > (newestChunkAt.get(c.docId) || 0)) newestChunkAt.set(c.docId, t);
+  for (const existingChunk of existing.chunks) {
+    const ingestedAtMs = Date.parse(existingChunk.ingestedAt) || 0;
+    if (ingestedAtMs > (newestChunkAt.get(existingChunk.docId) || 0)) {
+      newestChunkAt.set(existingChunk.docId, ingestedAtMs);
+    }
   }
-  const isFresh = (id) => {
-    if (!newestChunkAt.has(id)) return false;
-    const extractedAt = Date.parse(doclings[id].extractedAt) || 0;
-    return newestChunkAt.get(id) >= extractedAt;
+  const isFresh = (docId) => {
+    if (!newestChunkAt.has(docId)) return false;
+    const extractedAtMs = Date.parse(doclings[docId].extractedAt) || 0;
+    return newestChunkAt.get(docId) >= extractedAtMs;
   };
-  const toProcess = force ? docIds : docIds.filter((id) => !isFresh(id));
+  const toProcess = force ? docIds : docIds.filter((docId) => !isFresh(docId));
 
   if (toProcess.length === 0) {
     console.log('[embed] All documents already embedded. Use --force to re-embed.');
@@ -113,24 +115,24 @@ export async function embedAll({ force = false } = {}) {
       overlap:   CHUNK_OVERLAP,
     });
     const embeddings = [];
-    for (let i = 0; i < rawChunks.length; i += BATCH_SIZE) {
-      const batch = rawChunks.slice(i, i + BATCH_SIZE).map((c) => c.text);
-      embeddings.push(...await embedBatch(batch));
+    for (let batchStart = 0; batchStart < rawChunks.length; batchStart += BATCH_SIZE) {
+      const batchTexts = rawChunks.slice(batchStart, batchStart + BATCH_SIZE).map((chunk) => chunk.text);
+      embeddings.push(...await embedBatch(batchTexts));
     }
 
-    rawChunks.forEach((chunk, i) => {
+    rawChunks.forEach((chunk, chunkIdx) => {
       newChunks.push({
-        id:           `${docId}_${i}`,
+        id:           `${docId}_${chunkIdx}`,
         docId,
         filename:     entry.filename,
         pages:        chunk.pages ?? null,      // 1-based [first, last] in the source PDF
         prefixLen:    chunk.prefixLen ?? 0,     // chars of embedded heading prefix in text
-        chunkIndex:   i,
+        chunkIndex:   chunkIdx,
         heading:      chunk.heading,
         sectionIndex: chunk.sectionIndex,
         chunkType:    chunk.type,
         text:         chunk.text,
-        embedding:    embeddings[i],
+        embedding:    embeddings[chunkIdx],
         ingestedAt:   new Date().toISOString(),
       });
     });
@@ -140,8 +142,8 @@ export async function embedAll({ force = false } = {}) {
 
   // Merge: drop old chunks for re-processed docs, append new ones
   const reprocessedIds = new Set(toProcess);
-  const kept = existing.chunks.filter((c) => !reprocessedIds.has(c.docId));
-  const allChunks = [...kept, ...newChunks];
+  const keptChunks = existing.chunks.filter((chunk) => !reprocessedIds.has(chunk.docId));
+  const allChunks = [...keptChunks, ...newChunks];
 
   const store = {
     chunks: allChunks,
@@ -150,7 +152,7 @@ export async function embedAll({ force = false } = {}) {
       dimensions: DIMENSIONS,
       created:    existing.metadata?.created || new Date().toISOString(),
       updated:    new Date().toISOString(),
-      totalDocs:  new Set(allChunks.map((c) => c.docId)).size,
+      totalDocs:  new Set(allChunks.map((chunk) => chunk.docId)).size,
     },
   };
 

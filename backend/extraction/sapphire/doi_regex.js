@@ -32,9 +32,9 @@ export const DOI_RE = /\b10\.\d{4,9}\/[-._;()/:a-zA-Z0-9]+/g;
  */
 export function findDoi(text) {
   if (!text) return null;
-  const match = text.match(DOI_RE);
-  if (!match) return null;
-  return match[0].replace(/[.,;)\]]+$/, '') || null;
+  const doiMatches = text.match(DOI_RE);
+  if (!doiMatches) return null;
+  return doiMatches[0].replace(/[.,;)\]]+$/, '') || null;
 }
 
 const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -59,20 +59,20 @@ export async function annotateDois() {
     throw new Error('data/doclings.json not found — run extract.py first');
   }
 
-  const found = {};
-  for (const [docId, entry] of Object.entries(doclings)) {
-    entry.metadata = entry.metadata || {};
-    if (!entry.metadata.doi) {
-      entry.metadata.doi = findDoi((entry.text || '').slice(0, HEAD_CHARS));
+  const doiByDocId = {};
+  for (const [docId, doclingEntry] of Object.entries(doclings)) {
+    doclingEntry.metadata = doclingEntry.metadata || {};
+    if (!doclingEntry.metadata.doi) {
+      doclingEntry.metadata.doi = findDoi((doclingEntry.text || '').slice(0, HEAD_CHARS));
     }
-    found[docId] = entry.metadata.doi;
+    doiByDocId[docId] = doclingEntry.metadata.doi;
   }
 
   await fs.writeFile(DOCLINGS_PATH, JSON.stringify(doclings, null, 2), 'utf-8');
 
-  const hits = Object.values(found).filter(Boolean).length;
-  console.log(`[doi_regex] ${hits}/${Object.keys(found).length} documents have a DOI → ${DOCLINGS_PATH}`);
-  return found;
+  const docsWithDoi = Object.values(doiByDocId).filter(Boolean).length;
+  console.log(`[doi_regex] ${docsWithDoi}/${Object.keys(doiByDocId).length} documents have a DOI → ${DOCLINGS_PATH}`);
+  return doiByDocId;
 }
 
 // Run directly: node backend/extraction/sapphire/doi_regex.js

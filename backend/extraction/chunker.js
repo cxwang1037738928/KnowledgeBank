@@ -35,7 +35,7 @@ const DEFAULTS = {
 // Low-level helpers
 // ---------------------------------------------------------------------------
 
-const wordCount = (s) => (s.match(/\S+/g) || []).length;
+const wordCount = (text) => (text.match(/\S+/g) || []).length;
 
 /**
  * Split text into sentences. Deliberately conservative: splits on
@@ -45,21 +45,21 @@ const wordCount = (s) => (s.match(/\S+/g) || []).length;
  */
 function splitSentences(text) {
   const ABBREV = /(?:et al|e\.g|i\.e|cf|vs|fig|figs|eq|eqs|sec|ref|refs|no|vol|pp|dr|mr|ms|prof|jr|sr|approx)\.$/i;
-  const parts = [];
-  let start = 0;
-  const re = /[.!?]+["')\]]*\s+(?=[A-Z0-9("'\[])/g;
-  let m;
-  while ((m = re.exec(text)) !== null) {
-    const candidate = text.slice(start, m.index + m[0].length);
+  const sentences = [];
+  let sentenceStart = 0;
+  const sentenceBoundary = /[.!?]+["')\]]*\s+(?=[A-Z0-9("'\[])/g;
+  let boundary;
+  while ((boundary = sentenceBoundary.exec(text)) !== null) {
+    const candidate = text.slice(sentenceStart, boundary.index + boundary[0].length);
     const trimmed = candidate.trimEnd();
     // Don't split right after an abbreviation or a single-letter initial
     if (ABBREV.test(trimmed) || /\b[A-Z]\.$/.test(trimmed)) continue;
-    if (trimmed) parts.push(trimmed);
-    start = m.index + m[0].length;
+    if (trimmed) sentences.push(trimmed);
+    sentenceStart = boundary.index + boundary[0].length;
   }
-  const tail = text.slice(start).trim();
-  if (tail) parts.push(tail);
-  return parts.length ? parts : (text.trim() ? [text.trim()] : []);
+  const tail = text.slice(sentenceStart).trim();
+  if (tail) sentences.push(tail);
+  return sentences.length ? sentences : (text.trim() ? [text.trim()] : []);
 }
 
 /**
@@ -70,46 +70,46 @@ export function chunkText(text, chunkSize = DEFAULTS.chunkSize, overlap = DEFAUL
   if (!text || !text.trim()) return [];
   const sentences = splitSentences(text);
   const chunks = [];
-  let current = [];
-  let currentWords = 0;
+  let currentSentences = [];
+  let currentWordCount = 0;
 
   const flush = () => {
-    if (!current.length) return;
-    chunks.push(current.join(' '));
-    let carried = [];
-    let carriedWords = 0;
-    for (let i = current.length - 1; i >= 0 && carriedWords < overlap; i--) {
-      carried.unshift(current[i]);
-      carriedWords += wordCount(current[i]);
+    if (!currentSentences.length) return;
+    chunks.push(currentSentences.join(' '));
+    let carriedSentences = [];
+    let carriedWordCount = 0;
+    for (let sentenceIdx = currentSentences.length - 1; sentenceIdx >= 0 && carriedWordCount < overlap; sentenceIdx--) {
+      carriedSentences.unshift(currentSentences[sentenceIdx]);
+      carriedWordCount += wordCount(currentSentences[sentenceIdx]);
     }
     // Overlap must never be the whole chunk, or we'd loop forever
-    if (carriedWords >= currentWords) carried = [];
-    current = carried;
-    currentWords = current.reduce((s, sent) => s + wordCount(sent), 0);
+    if (carriedWordCount >= currentWordCount) carriedSentences = [];
+    currentSentences = carriedSentences;
+    currentWordCount = currentSentences.reduce((total, sentence) => total + wordCount(sentence), 0);
   };
 
   for (const sentence of sentences) {
-    const w = wordCount(sentence);
-    if (w >= chunkSize) {
+    const sentenceWordCount = wordCount(sentence);
+    if (sentenceWordCount >= chunkSize) {
       // Pathological sentence (equations, mangled OCR): hard-split by words
       flush();
       const words = sentence.split(/\s+/);
-      for (let i = 0; i < words.length; i += chunkSize - overlap) {
-        chunks.push(words.slice(i, i + chunkSize).join(' '));
+      for (let windowStart = 0; windowStart < words.length; windowStart += chunkSize - overlap) {
+        chunks.push(words.slice(windowStart, windowStart + chunkSize).join(' '));
       }
-      current = [];
-      currentWords = 0;
+      currentSentences = [];
+      currentWordCount = 0;
       continue;
     }
-    if (currentWords + w > chunkSize && currentWords > 0) flush();
+    if (currentWordCount + sentenceWordCount > chunkSize && currentWordCount > 0) flush();
     // After flush the carry is kept as overlap; if overlap + sentence still
     // overflows (large sentence near the chunk limit), drop the carry so the
     // final chunk stays within chunkSize.
-    if (currentWords + w > chunkSize) { current = []; currentWords = 0; }
-    current.push(sentence);
-    currentWords += w;
+    if (currentWordCount + sentenceWordCount > chunkSize) { currentSentences = []; currentWordCount = 0; }
+    currentSentences.push(sentence);
+    currentWordCount += sentenceWordCount;
   }
-  if (current.length) chunks.push(current.join(' '));
+  if (currentSentences.length) chunks.push(currentSentences.join(' '));
   return chunks;
 }
 
@@ -142,7 +142,8 @@ export function chunkText(text, chunkSize = DEFAULTS.chunkSize, overlap = DEFAUL
  */
 export function chunkDocument(entry, opts = {}) {
   const { chunkSize, overlap, minSectionMerge, maxTableWords } = { ...DEFAULTS, ...opts };
-  const sections = (entry.sections || []).filter((s) => (s.text || '').trim() || (s.heading || '').trim());
+  const sections = (entry.sections || []).filter(
+    (section) => (section.text || '').trim() || (section.heading || '').trim());
 
   if (sections.length === 0) {
     return chunkText(entry.text || '', chunkSize, overlap).map((text) => ({
@@ -155,42 +156,42 @@ export function chunkDocument(entry, opts = {}) {
     }));
   }
 
-  const mergePages = (a, b) => {
-    if (!a) return b || null;
-    if (!b) return a;
-    return [Math.min(a[0], b[0]), Math.max(a[1], b[1])];
+  const mergePages = (rangeA, rangeB) => {
+    if (!rangeA) return rangeB || null;
+    if (!rangeB) return rangeA;
+    return [Math.min(rangeA[0], rangeB[0]), Math.max(rangeA[1], rangeB[1])];
   };
 
   // --- 1. merge tiny adjacent sections -------------------------------------
   const units = []; // { heading, text, sectionIndex, pages }
-  for (let i = 0; i < sections.length; i++) {
-    const sec = sections[i];
-    const body = (sec.text || '').trim();
-    const heading = (sec.heading || '').trim();
-    const words = wordCount(body);
+  for (let sectionIdx = 0; sectionIdx < sections.length; sectionIdx++) {
+    const section = sections[sectionIdx];
+    const body = (section.text || '').trim();
+    const heading = (section.heading || '').trim();
+    const bodyWordCount = wordCount(body);
 
-    const last = units[units.length - 1];
-    if (last && wordCount(last.text) < minSectionMerge && words < minSectionMerge) {
-      last.text = [last.text, heading ? `${heading}. ${body}` : body]
+    const previousUnit = units[units.length - 1];
+    if (previousUnit && wordCount(previousUnit.text) < minSectionMerge && bodyWordCount < minSectionMerge) {
+      previousUnit.text = [previousUnit.text, heading ? `${heading}. ${body}` : body]
         .filter(Boolean).join(' ');
-      last.pages = mergePages(last.pages, sec.pages || null);
+      previousUnit.pages = mergePages(previousUnit.pages, section.pages || null);
     } else {
-      units.push({ heading, text: body, sectionIndex: i, pages: sec.pages || null });
+      units.push({ heading, text: body, sectionIndex: sectionIdx, pages: section.pages || null });
     }
   }
 
   // --- 2. chunk each unit, prefixing the heading ----------------------------
   const title = entry.metadata?.title || '';
-  const out = [];
+  const chunks = [];
   for (const unit of units) {
     const prefixParts = [title, unit.heading].filter(Boolean);
     const prefix = prefixParts.length ? `${prefixParts.join(' — ')}\n` : '';
-    const prefixWords = wordCount(prefix);
+    const prefixWordCount = wordCount(prefix);
 
-    const bodyChunks = chunkText(unit.text, Math.max(chunkSize - prefixWords, 50), overlap);
+    const bodyChunks = chunkText(unit.text, Math.max(chunkSize - prefixWordCount, 50), overlap);
     if (bodyChunks.length === 0 && unit.heading) continue;   // heading-only section
     for (const body of bodyChunks) {
-      out.push({
+      chunks.push({
         text: prefix + body,
         heading: unit.heading || null,
         sectionIndex: unit.sectionIndex,
@@ -204,16 +205,16 @@ export function chunkDocument(entry, opts = {}) {
   // --- 3. tables as standalone chunks ---------------------------------------
   // Tables are {text, page} since page provenance landed; older extracts
   // stored plain markdown strings.
-  (entry.tables || []).forEach((tbl) => {
-    const t = ((typeof tbl === 'string' ? tbl : tbl?.text) || '').trim();
-    if (!t) return;
-    const page = typeof tbl === 'object' ? tbl?.page ?? null : null;
-    const words = t.split(/\s+/);
-    const truncated = words.length > maxTableWords
-      ? words.slice(0, maxTableWords).join(' ') + ' …'
-      : t;
+  (entry.tables || []).forEach((table) => {
+    const tableText = ((typeof table === 'string' ? table : table?.text) || '').trim();
+    if (!tableText) return;
+    const page = typeof table === 'object' ? table?.page ?? null : null;
+    const tableWords = tableText.split(/\s+/);
+    const truncated = tableWords.length > maxTableWords
+      ? tableWords.slice(0, maxTableWords).join(' ') + ' …'
+      : tableText;
     const tablePrefix = title ? `${title} — Table\n` : '';
-    out.push({
+    chunks.push({
       text: tablePrefix + truncated,
       heading: 'Table',
       sectionIndex: null,
@@ -223,7 +224,7 @@ export function chunkDocument(entry, opts = {}) {
     });
   });
 
-  return out;
+  return chunks;
 }
 
 export default { chunkText, chunkDocument };

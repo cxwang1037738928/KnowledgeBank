@@ -27,14 +27,14 @@ const GRAPH_PATH     = path.join(DATA_DIR, 'graph.json');
 // Node / edge builders
 // ---------------------------------------------------------------------------
 
-function documentNode(docId, entry) {
+function documentNode(docId, doclingEntry) {
   return {
     id:       `doc:${docId}`,
     type:     'document',
     docId,
-    label:    entry.metadata?.title || entry.filename,
-    filename: entry.filename,
-    created:  entry.metadata?.created || null,   // {year, month|null} | null
+    label:    doclingEntry.metadata?.title || doclingEntry.filename,
+    filename: doclingEntry.filename,
+    created:  doclingEntry.metadata?.created || null,   // {year, month|null} | null
   };
 }
 
@@ -69,12 +69,12 @@ function citationEdge(sourceDocId, targetDocId) {
 // ---------------------------------------------------------------------------
 
 async function readJSON(filePath) {
-  const raw = await fs.readFile(filePath, 'utf-8');
-  return JSON.parse(raw);
+  const fileContents = await fs.readFile(filePath, 'utf-8');
+  return JSON.parse(fileContents);
 }
 
 export async function buildGraph() {
-  let doclings, heuristic;
+  let doclings, heuristicOutput;
 
   try {
     doclings = await readJSON(DOCLINGS_PATH);
@@ -83,14 +83,14 @@ export async function buildGraph() {
   }
 
   try {
-    heuristic = await readJSON(HEURISTIC_PATH);
+    heuristicOutput = await readJSON(HEURISTIC_PATH);
   } catch {
     throw new Error(`data/heuristic_output.json not found — run heuristic.py first`);
   }
 
-  const topKIds = new Set(heuristic.topK.map((d) => d.docId));
-  const citationEdges = heuristic.edges.filter(
-    (e) => topKIds.has(e.source) || topKIds.has(e.target)
+  const topKIds = new Set(heuristicOutput.topK.map((topDoc) => topDoc.docId));
+  const citationEdges = heuristicOutput.edges.filter(
+    (edge) => topKIds.has(edge.source) || topKIds.has(edge.target)
   );
 
   const nodes = [];
@@ -98,20 +98,20 @@ export async function buildGraph() {
 
   // Add document nodes and their section sub-nodes for all top-k docs
   for (const docId of topKIds) {
-    const entry = doclings[docId];
-    if (!entry) continue;
+    const doclingEntry = doclings[docId];
+    if (!doclingEntry) continue;
 
-    nodes.push(documentNode(docId, entry));
+    nodes.push(documentNode(docId, doclingEntry));
 
-    const sections = entry.sections || [];
-    sections.forEach((section, i) => {
+    const sections = doclingEntry.sections || [];
+    sections.forEach((section, sectionIdx) => {
       // Bibliographies aren't knowledge nodes: their "content" is raw
       // citation strings, which pollute the graph and any downstream
       // embedding/extraction over section nodes.
       if (REF_HEADINGS.has(normHeading(section.heading || ''))) return;
       if (section.heading || section.text.length > 50) {
-        nodes.push(sectionNode(docId, i, section));
-        edges.push(sectionEdge(docId, i));
+        nodes.push(sectionNode(docId, sectionIdx, section));
+        edges.push(sectionEdge(docId, sectionIdx));
       }
     });
   }
@@ -120,7 +120,7 @@ export async function buildGraph() {
   for (const { source, target } of citationEdges) {
     // Ensure the target doc node exists as at least a stub
     const targetNodeId = `doc:${target}`;
-    if (!nodes.find((n) => n.id === targetNodeId) && doclings[target]) {
+    if (!nodes.find((node) => node.id === targetNodeId) && doclings[target]) {
       nodes.push(documentNode(target, doclings[target]));
     }
     edges.push(citationEdge(source, target));

@@ -50,8 +50,8 @@ await new Promise((resolve, reject) => {
     stdio: 'inherit',
     cwd: ROOT,
   });
-  proc.on('close', (code) => {
-    if (code !== 0) reject(new Error(`extract.py exited with code ${code}`));
+  proc.on('close', (exitCode) => {
+    if (exitCode !== 0) reject(new Error(`extract.py exited with code ${exitCode}`));
     else resolve();
   });
   proc.on('error', (err) => reject(new Error(`Failed to spawn extract.py: ${err.message}`)));
@@ -89,31 +89,32 @@ if (entries.length === 0) {
 
 console.log(`\n[test_extract] Writing ${entries.length} .txt file(s) to tests/test-output/text/\n`);
 
-for (const entry of entries) {
-  const baseName = path.basename(entry.filename, '.pdf');
-  const outFile  = `${entry.docId}_${baseName}.txt`;
+for (const doclingEntry of entries) {
+  const baseName = path.basename(doclingEntry.filename, '.pdf');
+  const outFile  = `${doclingEntry.docId}_${baseName}.txt`;
   const outPath  = path.join(TEST_OUTPUT, outFile);
 
-  const meta    = entry.metadata || {};
-  const outline = (entry.sections || [])
-    .map((s, i) => `  [${i}] ${s.heading || '(no heading)'} — ${(s.text || '').split(/\s+/).length} words`)
+  const meta    = doclingEntry.metadata || {};
+  const outline = (doclingEntry.sections || [])
+    .map((section, sectionIdx) =>
+      `  [${sectionIdx}] ${section.heading || '(no heading)'} — ${(section.text || '').split(/\s+/).length} words`)
     .join('\n');
 
-  const refList = (entry.references || [])
-    .map((r, i) => `  [${i + 1}] ${r}`)
+  const refList = (doclingEntry.references || [])
+    .map((reference, refIdx) => `  [${refIdx + 1}] ${reference}`)
     .join('\n');
 
   const lines = [
-    `File:       ${entry.filename}`,
-    `DocId:      ${entry.docId}`,
-    `Extracted:  ${entry.extractedAt}`,
+    `File:       ${doclingEntry.filename}`,
+    `DocId:      ${doclingEntry.docId}`,
+    `Extracted:  ${doclingEntry.extractedAt}`,
     `Title:      ${meta.title || '(MISSING — citation matching cannot target this doc)'}`,
     `Authors:    ${(meta.authors || []).join('; ') || '(MISSING — citation matching cannot target this doc)'}`,
     `Abstract:   ${meta.abstract ? `${meta.abstract.split(/\s+/).length} words` : '(missing)'}`,
     `DOI:        ${meta.doi || '(none found)'}`,
-    `Sections:   ${entry.sections.length}`,
-    `Tables:     ${entry.tables.length}`,
-    `References: ${entry.references.length}`,
+    `Sections:   ${doclingEntry.sections.length}`,
+    `Tables:     ${doclingEntry.tables.length}`,
+    `References: ${doclingEntry.references.length}`,
     '',
     'Section outline:',
     outline || '  (none — chunker will fall back to plain sliding-window chunking)',
@@ -123,11 +124,11 @@ for (const entry of entries) {
     '',
     '='.repeat(72),
     '',
-    entry.text,
+    doclingEntry.text,
   ];
 
   await fs.writeFile(outPath, lines.join('\n'), 'utf-8');
-  console.log(`  → ${outFile}  (${entry.text.length} chars, ${entry.sections.length} sections, ${entry.references.length} refs)`);
+  console.log(`  → ${outFile}  (${doclingEntry.text.length} chars, ${doclingEntry.sections.length} sections, ${doclingEntry.references.length} refs)`);
 }
 
 // ---- Metadata coverage summary ----------------------------------------------
@@ -135,9 +136,11 @@ for (const entry of entries) {
 // edge; references on the SOURCE side. Low coverage here = sparse/empty
 // citation graph = uniform PageRank downstream.
 
-const withTitle   = entries.filter((e) => e.metadata?.title).length;
-const withAuthors = entries.filter((e) => (e.metadata?.authors || []).length > 0).length;
-const withRefs    = entries.filter((e) => (e.references || []).length > 0).length;
+const withTitle   = entries.filter((doclingEntry) => doclingEntry.metadata?.title).length;
+const withAuthors = entries.filter(
+  (doclingEntry) => (doclingEntry.metadata?.authors || []).length > 0).length;
+const withRefs    = entries.filter(
+  (doclingEntry) => (doclingEntry.references || []).length > 0).length;
 
 console.log('\n[test_extract] Metadata coverage (needed by heuristic.py citation matching):');
 console.log(`  title:      ${withTitle}/${entries.length}`);
@@ -148,11 +151,11 @@ if (withTitle < entries.length || withAuthors < entries.length) {
   console.warn('           PageRank degrades toward uniform. Check _extract_metadata in extract.py.');
 }
 
-const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+const elapsed   = ((Date.now() - start) / 1000).toFixed(2);
+const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 await fs.appendFile(
   path.join(ROOT, 'tests', 'test_log.txt'),
-  `[${ts}] test_extract             : ${elapsed}s\n`,
+  `[${timestamp}] test_extract             : ${elapsed}s\n`,
   'utf-8',
 );
 

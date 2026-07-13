@@ -22,24 +22,25 @@ const start = Date.now();
 const store  = JSON.parse(await fs.readFile(path.join(TEST_DATA, 'embeddings.json'), 'utf-8'));
 const chunks = store.chunks || [];
 
-const byDoc = new Map();
-for (const c of chunks) {
-  if (!byDoc.has(c.docId)) byDoc.set(c.docId, []);
-  byDoc.get(c.docId).push(c);
+const chunksByDoc = new Map();
+for (const chunk of chunks) {
+  if (!chunksByDoc.has(chunk.docId)) chunksByDoc.set(chunk.docId, []);
+  chunksByDoc.get(chunk.docId).push(chunk);
 }
 
-const wordCounts  = chunks.map((c) => (c.text.match(/\S+/g) || []).length);
-const avgWords    = wordCounts.reduce((s, w) => s + w, 0) / Math.max(chunks.length, 1);
-const oversized   = wordCounts.filter((w) => w > 220).length;
-const tableChunks = chunks.filter((c) => c.chunkType === 'table').length;
-const withHeading = chunks.filter((c) => c.heading && c.heading !== 'Table').length;
+const wordCounts  = chunks.map((chunk) => (chunk.text.match(/\S+/g) || []).length);
+const avgWords    = wordCounts.reduce((total, wordCount) => total + wordCount, 0)
+                    / Math.max(chunks.length, 1);
+const oversized   = wordCounts.filter((wordCount) => wordCount > 220).length;
+const tableChunks = chunks.filter((chunk) => chunk.chunkType === 'table').length;
+const withHeading = chunks.filter((chunk) => chunk.heading && chunk.heading !== 'Table').length;
 
 console.log('[test_chunking] Chunking stats:');
-console.log(`  ${chunks.length} chunks across ${byDoc.size} docs (model ${store.metadata.model}, ${store.metadata.dimensions}-dim)`);
+console.log(`  ${chunks.length} chunks across ${chunksByDoc.size} docs (model ${store.metadata.model}, ${store.metadata.dimensions}-dim)`);
 console.log(`  types: ${chunks.length - tableChunks} text, ${tableChunks} table`);
 console.log(`  heading coverage: ${withHeading}/${chunks.length} (${(100 * withHeading / Math.max(chunks.length, 1)).toFixed(0)}%)`);
 console.log(`  avg ${avgWords.toFixed(0)} words/chunk`);
-for (const [, docChunks] of byDoc) {
+for (const [, docChunks] of chunksByDoc) {
   console.log(`    ${docChunks[0].filename}: ${docChunks.length} chunks`);
 }
 if (oversized > 0) {
@@ -47,11 +48,11 @@ if (oversized > 0) {
   console.warn('           tokens, so their tails are NOT embedded. Lower CHUNK_SIZE (~200) in .env.');
 }
 
-const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+const elapsed   = ((Date.now() - start) / 1000).toFixed(2);
+const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 await fs.appendFile(
   path.join(ROOT, 'tests', 'test_log.txt'),
-  `[${ts}] test_chunking            : ${elapsed}s\n`,
+  `[${timestamp}] test_chunking            : ${elapsed}s\n`,
   'utf-8',
 );
 console.log(`\nDone in ${elapsed}s.`);

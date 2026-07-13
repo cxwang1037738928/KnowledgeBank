@@ -36,14 +36,14 @@ import { fileURLToPath } from 'url';
  * abstracts typically start with a literal 'Abstract' heading element — after
  * tag stripping that word leaks in as a prefix, so it is removed too.
  */
-export function stripJats(x) {
-  if (!x) return null;
-  const text = x
+export function stripJats(jatsMarkup) {
+  if (!jatsMarkup) return null;
+  const plainText = jatsMarkup
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/^abstract[\s:.]+/i, '');
-  return text || null;
+  return plainText || null;
 }
 
 const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -57,50 +57,50 @@ const USER_AGENT      = `OpenCrawl/1.0 (mailto:${MAILTO})`;
 const TIMEOUT_MS      = parseInt(process.env.CROSSREF_TIMEOUT_MS || '20000', 10);
 const POLITE_DELAY_MS = parseInt(process.env.CROSSREF_DELAY_MS || '250', 10);
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 // ---------------------------------------------------------------------------
 // Crossref response → normalized metadata
 // ---------------------------------------------------------------------------
 
 /** Map a Crossref `message` (work) object to our cached metadata shape. */
-function normalizeWork(m) {
-  const title = (Array.isArray(m.title) ? m.title[0] : m.title || '').trim() || null;
+function normalizeWork(work) {
+  const title = (Array.isArray(work.title) ? work.title[0] : work.title || '').trim() || null;
 
-  const author = (m.author || [])
-    .map((a) => [a.given, a.family].filter(Boolean).join(' ').trim())
+  const author = (work.author || [])
+    .map((crossrefAuthor) => [crossrefAuthor.given, crossrefAuthor.family].filter(Boolean).join(' ').trim())
     .filter(Boolean);
 
-  const reference = (m.reference || []).map((r) => ({
+  const reference = (work.reference || []).map((crossrefReference) => ({
     // Crossref reference entries frequently carry a DOI but no article title;
     // keep both so DOI-based matching stays possible even when title is blank.
-    title:   (r['article-title'] || r['volume-title'] || '').trim(),
-    authors: r.author ? [String(r.author).trim()] : [],
-    doi:     r.DOI || null,
-    raw:     (r.unstructured || '').trim(),
+    title:   (crossrefReference['article-title'] || crossrefReference['volume-title'] || '').trim(),
+    authors: crossrefReference.author ? [String(crossrefReference.author).trim()] : [],
+    doi:     crossrefReference.DOI || null,
+    raw:     (crossrefReference.unstructured || '').trim(),
   }));
 
-  const citedBy = Number.isFinite(m['is-referenced-by-count'])
-    ? m['is-referenced-by-count']
+  const citedBy = Number.isFinite(work['is-referenced-by-count'])
+    ? work['is-referenced-by-count']
     : null;
 
   // Publication date from `issued` date-parts [year, month, day]. Same
   // future-date cap as extract.py's text-scan fallback, for consistency.
   let created = null;
-  const parts = m.issued?.['date-parts']?.[0];
-  if (Array.isArray(parts) && Number.isFinite(parts[0])) {
-    const year  = parts[0];
-    const month = Number.isFinite(parts[1]) ? parts[1] : null;
+  const issuedDateParts = work.issued?.['date-parts']?.[0];
+  if (Array.isArray(issuedDateParts) && Number.isFinite(issuedDateParts[0])) {
+    const year  = issuedDateParts[0];
+    const month = Number.isFinite(issuedDateParts[1]) ? issuedDateParts[1] : null;
     const now = new Date();
-    const future = year > now.getFullYear()
+    const isFutureDate = year > now.getFullYear()
       || (year === now.getFullYear() && month !== null && month > now.getMonth() + 1);
-    if (!future) created = { year, month };
+    if (!isFutureDate) created = { year, month };
   }
 
   return {
     title,
     author,
-    abstract: stripJats(m.abstract),
+    abstract: stripJats(work.abstract),
     created,
     reference,
     citedBy,
@@ -114,23 +114,23 @@ function normalizeWork(m) {
  * transient failures (timeout, 5xx, network) so callers don't cache a miss.
  */
 export async function crossrefByDoi(doi) {
-  const url = `https://api.crossref.org/works/${encodeURIComponent(doi)}?mailto=${encodeURIComponent(MAILTO)}`;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
-  let resp;
+  const crossrefUrl = `https://api.crossref.org/works/${encodeURIComponent(doi)}?mailto=${encodeURIComponent(MAILTO)}`;
+  const abortController = new AbortController();
+  const timeoutTimer = setTimeout(() => abortController.abort(), TIMEOUT_MS);
+  let response;
   try {
-    resp = await fetch(url, {
+    response = await fetch(crossrefUrl, {
       headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-      signal: ctrl.signal,
+      signal: abortController.signal,
     });
   } finally {
-    clearTimeout(timer);
+    clearTimeout(timeoutTimer);
   }
 
-  if (resp.status === 404) return null;                 // definitive miss
-  if (!resp.ok) throw new Error(`Crossref HTTP ${resp.status} for ${doi}`);
+  if (response.status === 404) return null;             // definitive miss
+  if (!response.ok) throw new Error(`Crossref HTTP ${response.status} for ${doi}`);
 
-  const body = await resp.json();
+  const body = await response.json();
   if (!body || !body.message) return null;
   return normalizeWork(body.message);
 }
@@ -141,19 +141,19 @@ export async function crossrefByDoi(doi) {
 
 async function loadCache() {
   try {
-    const raw = await fs.readFile(META_PATH, 'utf-8');
-    return raw.trim() ? JSON.parse(raw) : {};
+    const cacheJson = await fs.readFile(META_PATH, 'utf-8');
+    return cacheJson.trim() ? JSON.parse(cacheJson) : {};
   } catch {
     return {};
   }
 }
 
-async function saveCache(cache) {
+async function saveCache(metaByDoi) {
   await fs.mkdir(CACHE_DIR, { recursive: true });
   // Temp + rename so a crash mid-write can't truncate the cache file.
-  const tmp = `${META_PATH}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(cache, null, 2), 'utf-8');
-  await fs.rename(tmp, META_PATH);
+  const tempPath = `${META_PATH}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(metaByDoi, null, 2), 'utf-8');
+  await fs.rename(tempPath, META_PATH);
 }
 
 // ---------------------------------------------------------------------------
@@ -173,45 +173,45 @@ export async function enrichDoclings() {
     throw new Error('data/doclings.json not found — run extract.py first');
   }
 
-  const cache = await loadCache();
-  let hits = 0;
-  let misses = 0;
-  let withDoi = 0;
+  const metaByDoi = await loadCache();
+  let matchedCount = 0;
+  let unmatchedCount = 0;
+  let doiDocCount = 0;
 
-  for (const entry of Object.values(doclings)) {
-    const doi = entry?.metadata?.doi;
+  for (const doclingEntry of Object.values(doclings)) {
+    const doi = doclingEntry?.metadata?.doi;
     if (!doi) continue;
-    withDoi++;
+    doiDocCount++;
 
-    let meta;
-    if (Object.prototype.hasOwnProperty.call(cache, doi)) {
-      meta = cache[doi];                       // cache hit (object or known miss)
+    let crossrefMeta;
+    if (Object.prototype.hasOwnProperty.call(metaByDoi, doi)) {
+      crossrefMeta = metaByDoi[doi];           // cache hit (object or known miss)
     } else {
       try {
-        meta = await crossrefByDoi(doi);
+        crossrefMeta = await crossrefByDoi(doi);
       } catch (err) {
         console.warn(`[search_doi] ${doi}: ${err.message} — leaving previous metadata`);
         continue;
       }
-      cache[doi] = meta;
-      await saveCache(cache);                  // persist incrementally
+      metaByDoi[doi] = crossrefMeta;
+      await saveCache(metaByDoi);              // persist incrementally
       await sleep(POLITE_DELAY_MS);            // be polite between live calls
     }
 
-    if (!meta) { misses++; continue; }         // no Crossref match → keep previous
-    hits++;
+    if (!crossrefMeta) { unmatchedCount++; continue; }   // no match → keep previous
+    matchedCount++;
 
-    entry.metadata = entry.metadata || {};
-    if (meta.title)                        entry.metadata.title    = meta.title;
-    if (meta.author && meta.author.length) entry.metadata.authors  = meta.author;
-    if (meta.abstract)                     entry.metadata.abstract = meta.abstract;
-    if (meta.created?.year)                entry.metadata.created  = meta.created;
-    if (meta.citedBy != null)              entry.metadata.citedBy  = meta.citedBy;
-    if (meta.reference && meta.reference.length) entry.crossrefReferences = meta.reference;
+    doclingEntry.metadata = doclingEntry.metadata || {};
+    if (crossrefMeta.title)                                    doclingEntry.metadata.title    = crossrefMeta.title;
+    if (crossrefMeta.author && crossrefMeta.author.length)     doclingEntry.metadata.authors  = crossrefMeta.author;
+    if (crossrefMeta.abstract)                                 doclingEntry.metadata.abstract = crossrefMeta.abstract;
+    if (crossrefMeta.created?.year)                            doclingEntry.metadata.created  = crossrefMeta.created;
+    if (crossrefMeta.citedBy != null)                          doclingEntry.metadata.citedBy  = crossrefMeta.citedBy;
+    if (crossrefMeta.reference && crossrefMeta.reference.length) doclingEntry.crossrefReferences = crossrefMeta.reference;
   }
 
   await fs.writeFile(DOCLINGS_PATH, JSON.stringify(doclings, null, 2), 'utf-8');
-  console.log(`[search_doi] Crossref: ${hits} matched, ${misses} unmatched of ${withDoi} DOI'd doc(s) → ${DOCLINGS_PATH}`);
+  console.log(`[search_doi] Crossref: ${matchedCount} matched, ${unmatchedCount} unmatched of ${doiDocCount} DOI'd doc(s) → ${DOCLINGS_PATH}`);
   return doclings;
 }
 

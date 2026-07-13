@@ -9,8 +9,12 @@
  * backend (/models), which keeps the embedding in-browser and the cache off
  * while removing the external dependency.
  *
- * Also copies onnxruntime's wasm out of node_modules — transformers.js
- * otherwise pulls it from cdn.jsdelivr.net at runtime.
+ * Also copies out of node_modules:
+ *   - onnxruntime's wasm (transformers.js otherwise pulls it from
+ *     cdn.jsdelivr.net at runtime)
+ *   - pdf.js's wasm image decoders + standard fonts. Scanned PDFs (e.g.
+ *     JBIG2-compressed scans) render as blank white pages without the wasm
+ *     decoders, and pdf.js can't resolve them itself in a bundled app.
  *
  * Run: npm run fetch:model     (idempotent; skips files already present)
  */
@@ -35,43 +39,63 @@ const FILES = [
 const ORT_SRC = path.join(ROOT, 'frontend', 'node_modules', '@xenova', 'transformers', 'dist');
 const ORT_WASM = ['ort-wasm.wasm', 'ort-wasm-simd.wasm', 'ort-wasm-threaded.wasm', 'ort-wasm-simd-threaded.wasm'];
 
-const mb = (n) => `${(n / 1048576).toFixed(1)} MB`;
+const megabytes = (byteCount) => `${(byteCount / 1048576).toFixed(1)} MB`;
 
-async function exists(p) {
-  return fs.access(p).then(() => true).catch(() => false);
+async function exists(filePath) {
+  return fs.access(filePath).then(() => true).catch(() => false);
 }
 
 async function download(relPath) {
-  const dest = path.join(MODELS_DIR, MODEL_ID, relPath);
-  if (await exists(dest)) {
+  const destPath = path.join(MODELS_DIR, MODEL_ID, relPath);
+  if (await exists(destPath)) {
     console.log(`  = ${relPath} (already present)`);
     return;
   }
   const url = `${BASE}/${relPath}`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`${url} → HTTP ${resp.status}`);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  await fs.mkdir(path.dirname(dest), { recursive: true });
-  await fs.writeFile(dest, buf);
-  console.log(`  ↓ ${relPath} (${mb(buf.length)})`);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} → HTTP ${response.status}`);
+  const fileBytes = Buffer.from(await response.arrayBuffer());
+  await fs.mkdir(path.dirname(destPath), { recursive: true });
+  await fs.writeFile(destPath, fileBytes);
+  console.log(`  ↓ ${relPath} (${megabytes(fileBytes.length)})`);
 }
 
 console.log(`[fetch_model] ${MODEL_ID} → models/`);
-for (const f of FILES) await download(f);
+for (const modelFile of FILES) await download(modelFile);
 
 console.log('[fetch_model] onnxruntime wasm → models/ort/');
 const ortDest = path.join(MODELS_DIR, 'ort');
 await fs.mkdir(ortDest, { recursive: true });
-for (const w of ORT_WASM) {
-  const src = path.join(ORT_SRC, w);
-  if (!(await exists(src))) {
-    console.warn(`  ! ${w} not in node_modules — run npm run install:web first`);
+for (const wasmFile of ORT_WASM) {
+  const srcPath = path.join(ORT_SRC, wasmFile);
+  if (!(await exists(srcPath))) {
+    console.warn(`  ! ${wasmFile} not in node_modules — run npm run install:web first`);
     continue;
   }
-  const dst = path.join(ortDest, w);
-  if (await exists(dst)) { console.log(`  = ${w} (already present)`); continue; }
-  await fs.copyFile(src, dst);
-  console.log(`  → ${w} (${mb((await fs.stat(dst)).size)})`);
+  const destPath = path.join(ortDest, wasmFile);
+  if (await exists(destPath)) { console.log(`  = ${wasmFile} (already present)`); continue; }
+  await fs.copyFile(srcPath, destPath);
+  console.log(`  → ${wasmFile} (${megabytes((await fs.stat(destPath)).size)})`);
+}
+
+console.log('[fetch_model] pdf.js wasm decoders + standard fonts → models/pdfjs/');
+const PDFJS_SRC = path.join(ROOT, 'frontend', 'node_modules', 'pdfjs-dist');
+for (const assetDir of ['wasm', 'standard_fonts']) {
+  const srcDir = path.join(PDFJS_SRC, assetDir);
+  if (!(await exists(srcDir))) {
+    console.warn(`  ! pdfjs-dist/${assetDir} not in node_modules — run npm run install:web first`);
+    continue;
+  }
+  const destDir = path.join(MODELS_DIR, 'pdfjs', assetDir);
+  await fs.mkdir(destDir, { recursive: true });
+  let copiedCount = 0;
+  for (const assetFile of await fs.readdir(srcDir)) {
+    const destPath = path.join(destDir, assetFile);
+    if (await exists(destPath)) continue;
+    await fs.copyFile(path.join(srcDir, assetFile), destPath);
+    copiedCount++;
+  }
+  console.log(`  → pdfjs/${assetDir} (${copiedCount} file(s) copied)`);
 }
 
 console.log('[fetch_model] Done. The backend serves these at /models.');

@@ -42,7 +42,7 @@ try {
   process.exit(1);
 }
 
-const pdfs = entries.filter((e) => e.toLowerCase().endsWith('.pdf'));
+const pdfs = entries.filter((entry) => entry.toLowerCase().endsWith('.pdf'));
 if (pdfs.length === 0) {
   console.log('No PDFs found in tests/test-input/ — add some and re-run.');
   process.exit(0);
@@ -81,9 +81,11 @@ for (const filename of pdfs) {
   try {
     const report = await processDocument(filePath, { docId, dpi: 300 });
 
-    const scanned = report.pages.filter((p) => p.pageType !== 'digital').length;
-    const route   = report.pages.length && scanned / report.pages.length < 0.3 ? 'digital' : 'ocr';
-    console.log(`  [enhance] ${report.numPages} page(s) done — ${scanned} scanned/mixed → extract.py will use the ${route.toUpperCase()} converter`);
+    const scannedPageCount = report.pages.filter((page) => page.pageType !== 'digital').length;
+    const converter = report.pages.length && scannedPageCount / report.pages.length < 0.3
+      ? 'digital'
+      : 'ocr';
+    console.log(`  [enhance] ${report.numPages} page(s) done — ${scannedPageCount} scanned/mixed → extract.py will use the ${converter.toUpperCase()} converter`);
 
     for (const page of report.pages) {
       console.log(

@@ -4,19 +4,24 @@
  * The sidebar (via portal) lists every indexed document; the main pane renders
  * the selected PDF with pdf.js, pages lazily rendered on scroll.
  *
- * Citation deep-links: App passes `target` = { docId, chunkId, nonce } when a
- * [n] marker (or source chip) is clicked in Chat. The viewer opens that
- * document, locates the chunk's text in the PDF text layer and lays a light
- * yellow highlight over it, scrolled into view. Location strategy: strip the
- * chunk's embedded heading prefix (prefixLen), normalize both sides, search
- * the chunk's recorded page range first (±1), then the whole document —
- * chunks indexed before page provenance existed still resolve.
+ * Citation deep-links: App passes `target` = { docId, chunkId, query, nonce }
+ * when a [n] marker (or source chip) is clicked in Chat. The viewer opens
+ * that document, locates the chunk's text in the PDF text layer and lays a
+ * light yellow highlight over it, scrolled into view. Location strategy:
+ * strip the chunk's embedded heading prefix (prefixLen), normalize both
+ * sides, search the chunk's recorded page range first (±1), then the whole
+ * document — chunks indexed before page provenance existed still resolve.
+ *
+ * With `query` ({text, embedding}) present, only the chunk sentences scoring
+ * above threshold against it (in-browser cosine + keyword bonus) are
+ * highlighted, not the whole chunk.
  */
 
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import * as pdfjsLib from 'pdfjs-dist';
 import { getDocuments, getChunk, documentPdfUrl } from '../api.js';
+import { embedTexts } from '../lib/embedder.js';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
@@ -31,8 +36,8 @@ const HIGHLIGHT_COLOR = 'rgba(255, 235, 59, 0.42)';   // light yellow
 // Matching is done over SPACE-FREE normalized text: PDF text layers break
 // words at line-end hyphens ("informa- tion") and tokenize differently from
 // docling, so comparing with spaces removed sidesteps both.
-const normWords = (s) =>
-  (s || '')
+const normWords = (text) =>
+  (text || '')
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[̀-ͯ]/g, '')
@@ -43,60 +48,114 @@ const normWords = (s) =>
 
 /** Space-free page text + char-range per text item, for offset→item mapping. */
 function indexPage(textContent) {
-  const spans = [];
-  let joined = '';
-  textContent.items.forEach((item, i) => {
-    const n = normWords(item.str).join('');
-    if (!n) return;
-    spans.push({ item: i, start: joined.length, end: joined.length + n.length });
-    joined += n;
+  const itemSpans = [];
+  let joinedText = '';
+  textContent.items.forEach((textItem, itemIdx) => {
+    const normalized = normWords(textItem.str).join('');
+    if (!normalized) return;
+    itemSpans.push({ item: itemIdx, start: joinedText.length, end: joinedText.length + normalized.length });
+    joinedText += normalized;
   });
-  return { joined, spans };
+  return { joined: joinedText, spans: itemSpans };
 }
 
-/** Item indices whose normalized range overlaps [from, to). */
-const itemsInRange = (index, from, to) =>
-  index.spans.filter((s) => s.end > from && s.start < to).map((s) => s.item);
+/** Item indices whose normalized range overlaps [rangeStart, rangeEnd). */
+const itemsInRange = (pageIndex, rangeStart, rangeEnd) =>
+  pageIndex.spans
+    .filter((span) => span.end > rangeStart && span.start < rangeEnd)
+    .map((span) => span.item);
 
 /**
  * Find the chunk body on one page. Tries the full body, then word-window
  * anchors at a few offsets (front matter and equations often diverge from
  * the text layer even when the rest of the chunk is present verbatim).
- * Returns { itemIds } or null.
+ * Returns the matched char range in index.joined, or null.
  */
-function matchOnPage(index, bodyWords) {
-  if (!index.joined) return null;
-  const W = bodyWords.length;
-  const tries = [[0, W]];
-  for (const off of [0, 8, 20]) {
-    for (const take of [30, 15, 8]) {
-      if (off + take <= W) tries.push([off, take]);
+function matchOnPage(pageIndex, bodyWords) {
+  if (!pageIndex.joined) return null;
+  const bodyWordCount = bodyWords.length;
+  const anchors = [[0, bodyWordCount]];
+  for (const wordOffset of [0, 8, 20]) {
+    for (const anchorLength of [30, 15, 8]) {
+      if (wordOffset + anchorLength <= bodyWordCount) anchors.push([wordOffset, anchorLength]);
     }
   }
 
-  for (const [off, take] of tries) {
-    const needle = bodyWords.slice(off, off + take).join('');
-    if (needle.length < 16) continue;   // too short to trust (e.g. "By C. E. SHANNON.")
-    const at = index.joined.indexOf(needle);
-    if (at === -1) continue;
+  for (const [wordOffset, anchorLength] of anchors) {
+    const anchorText = bodyWords.slice(wordOffset, wordOffset + anchorLength).join('');
+    if (anchorText.length < 16) continue;   // too short to trust (e.g. "By C. E. SHANNON.")
+    const anchorAt = pageIndex.joined.indexOf(anchorText);
+    if (anchorAt === -1) continue;
 
     // Extend the match to the chunk's tail if it appears later on the page.
-    let start = at;
-    let end = at + needle.length;
-    if (off > 0 || take < W) {
-      const tail = bodyWords.slice(-10).join('');
-      const tailAt = index.joined.indexOf(tail, end);
-      if (tailAt !== -1) end = tailAt + tail.length;
+    let start = anchorAt;
+    let end = anchorAt + anchorText.length;
+    if (wordOffset > 0 || anchorLength < bodyWordCount) {
+      const tailText = bodyWords.slice(-10).join('');
+      const tailAt = pageIndex.joined.indexOf(tailText, end);
+      if (tailAt !== -1) end = tailAt + tailText.length;
     }
     // If the anchor skipped the head, pull the start back to it when nearby.
-    if (off > 0) {
-      const head = bodyWords.slice(0, 6).join('');
-      const headAt = index.joined.lastIndexOf(head, at);
-      if (headAt !== -1 && at - headAt < 600) start = headAt;
+    if (wordOffset > 0) {
+      const headText = bodyWords.slice(0, 6).join('');
+      const headAt = pageIndex.joined.lastIndexOf(headText, anchorAt);
+      if (headAt !== -1 && anchorAt - headAt < 600) start = headAt;
     }
-    return { itemIds: itemsInRange(index, start, end) };
+    return { start, end };
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Sentence selection — highlight only what answers the query
+// ---------------------------------------------------------------------------
+
+const splitSentences = (text) =>
+  text.split(/(?<=[.!?])\s+(?=[A-Z0-9("'[])/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length >= 25);
+
+const dot = (vecA, vecB) => {
+  let sum = 0;
+  for (let dim = 0; dim < vecA.length; dim++) sum += vecA[dim] * vecB[dim];
+  return sum;
+};
+
+// Plural-insensitive content tokens for the keyword bonus.
+const kwTokens = (text) => new Set(
+  (text || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, ' ')
+    .split(' ')
+    .filter((word) => word.length >= 3)
+    .map((word) => (word.endsWith('s') ? word.slice(0, -1) : word)),
+);
+
+const KW_BONUS   = 0.1;    // per distinct query token found in the sentence
+const KEEP_RATIO = 0.6;    // keep sentences scoring ≥ 60% of the best one
+
+/**
+ * Score each sentence of the chunk body against the query (cosine of
+ * in-browser embeddings + keyword-match bonus) and return the ones above
+ * threshold — the best sentence always survives. Empty on any failure, and
+ * the caller falls back to whole-chunk highlighting.
+ */
+async function pickSentences(body, query, onStatus) {
+  try {
+    const sentences = splitSentences(body);
+    if (sentences.length <= 1) return sentences;
+    onStatus('scoring the cited passage…');
+    const sentenceVectors = await embedTexts(sentences, onStatus);
+    const queryTokens = kwTokens(query.text);
+    const scores = sentences.map((sentence, sentenceIdx) => {
+      const keywordHits = [...kwTokens(sentence)].filter((token) => queryTokens.has(token)).length;
+      return dot(sentenceVectors[sentenceIdx], query.embedding) + KW_BONUS * keywordHits;
+    });
+    const bestScore = Math.max(...scores);
+    return sentences.filter(
+      (_, sentenceIdx) => scores[sentenceIdx] >= bestScore * KEEP_RATIO && scores[sentenceIdx] > 0);
+  } catch (err) {
+    console.warn('[viewer] sentence scoring failed, highlighting whole chunk:', err);
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -108,8 +167,8 @@ function PdfPage({ pdf, pageNum, size, highlightIds, pageRef }) {
   const [rendered, setRendered] = useState(null);   // { canvasUrl?, rects }
 
   useEffect(() => {
-    const el = holderRef.current;
-    if (!el) return;
+    const holderEl = holderRef.current;
+    if (!holderEl) return;
     let cancelled = false;
 
     const observer = new IntersectionObserver(async ([entry]) => {
@@ -124,44 +183,44 @@ function PdfPage({ pdf, pageNum, size, highlightIds, pageRef }) {
       await page.render({ canvas, canvasContext: canvas.getContext('2d'), viewport }).promise;
       if (cancelled) return;
 
-      let rects = [];
+      let highlightRects = [];
       if (highlightIds?.length) {
-        const tc = await page.getTextContent();
-        rects = highlightIds
-          .map((i) => tc.items[i])
+        const textContent = await page.getTextContent();
+        highlightRects = highlightIds
+          .map((itemIdx) => textContent.items[itemIdx])
           .filter(Boolean)
-          .map((item) => {
-            const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-            const h = Math.hypot(tx[2], tx[3]);
+          .map((textItem) => {
+            const deviceTransform = pdfjsLib.Util.transform(viewport.transform, textItem.transform);
+            const glyphHeight = Math.hypot(deviceTransform[2], deviceTransform[3]);
             return {
-              left: tx[4],
-              top: tx[5] - h,
-              width: item.width * viewport.scale,
-              height: h * 1.18,
+              left: deviceTransform[4],
+              top: deviceTransform[5] - glyphHeight,
+              width: textItem.width * viewport.scale,
+              height: glyphHeight * 1.18,
             };
           });
       }
-      if (!cancelled) setRendered({ canvasUrl: canvas.toDataURL('image/png'), rects });
+      if (!cancelled) setRendered({ canvasUrl: canvas.toDataURL('image/png'), rects: highlightRects });
     }, { rootMargin: '600px' });
 
-    observer.observe(el);
+    observer.observe(holderEl);
     return () => { cancelled = true; observer.disconnect(); };
   }, [pdf, pageNum, highlightIds]);
 
   return (
     <div
       className="pdf-page"
-      ref={(el) => { holderRef.current = el; if (pageRef) pageRef(pageNum, el); }}
+      ref={(holderEl) => { holderRef.current = holderEl; if (pageRef) pageRef(pageNum, holderEl); }}
       style={{ width: size.width, height: size.height }}
     >
       {rendered ? (
         <>
           <img src={rendered.canvasUrl} alt={`Page ${pageNum}`} width={size.width} height={size.height} />
-          {rendered.rects.map((r, i) => (
+          {rendered.rects.map((highlightRect, rectIdx) => (
             <div
-              key={i}
+              key={rectIdx}
               className="pdf-highlight"
-              style={{ ...r, background: HIGHLIGHT_COLOR }}
+              style={{ ...highlightRect, background: HIGHLIGHT_COLOR }}
             />
           ))}
         </>
@@ -188,7 +247,9 @@ export default function DocumentViewer({ controlsEl, active, target }) {
   const scrollTo = useRef(null);                        // pageNum pending scroll
 
   useEffect(() => {
-    getDocuments().then((r) => setDocs(r.documents)).catch((e) => setError(e.message));
+    getDocuments()
+      .then((response) => setDocs(response.documents))
+      .catch((err) => setError(err.message));
   }, []);
 
   // Load the selected PDF and measure every page for stable lazy-scroll.
@@ -201,18 +262,24 @@ export default function DocumentViewer({ controlsEl, active, target }) {
       try {
         // pdf.js v6 only reads src.url — the positional-string form of
         // getDocument(url) from v4 silently resolves to "no url given".
-        const doc = await pdfjsLib.getDocument({ url: documentPdfUrl(selected) }).promise;
+        // wasmUrl: JBIG2/JPX scans decode in wasm; without it scanned pages
+        // render blank white. Vendored by npm run fetch:model.
+        const doc = await pdfjsLib.getDocument({
+          url: documentPdfUrl(selected),
+          wasmUrl: '/models/pdfjs/wasm/',
+          standardFontDataUrl: '/models/pdfjs/standard_fonts/',
+        }).promise;
         if (cancelled) return;
         const sizes = [];
-        for (let n = 1; n <= doc.numPages; n++) {
-          const vp = (await doc.getPage(n)).getViewport({ scale: SCALE });
-          sizes.push({ width: vp.width, height: vp.height });
+        for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+          const viewport = (await doc.getPage(pageNum)).getViewport({ scale: SCALE });
+          sizes.push({ width: viewport.width, height: viewport.height });
         }
         if (cancelled) return;
         setPdf(doc);
         setPageSizes(sizes);
-      } catch (e) {
-        if (!cancelled) setStatus(`could not load PDF: ${e.message}`);
+      } catch (err) {
+        if (!cancelled) setStatus(`could not load PDF: ${err.message}`);
       }
     })();
     return () => { cancelled = true; };
@@ -241,46 +308,71 @@ export default function DocumentViewer({ controlsEl, active, target }) {
         const bodyWords = normWords(body);
 
         // Recorded page range (±1) first, then everything else.
-        const candidates = [];
+        const candidatePages = [];
         if (chunk.pages) {
-          for (let p = Math.max(1, chunk.pages[0] - 1);
-               p <= Math.min(pdf.numPages, chunk.pages[1] + 1); p++) candidates.push(p);
+          for (let pageNum = Math.max(1, chunk.pages[0] - 1);
+               pageNum <= Math.min(pdf.numPages, chunk.pages[1] + 1); pageNum++) {
+            candidatePages.push(pageNum);
+          }
         }
-        for (let p = 1; p <= pdf.numPages; p++) {
-          if (!candidates.includes(p)) candidates.push(p);
+        for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+          if (!candidatePages.includes(pageNum)) candidatePages.push(pageNum);
         }
 
-        for (const pageNum of candidates) {
-          const tc = await (await pdf.getPage(pageNum)).getTextContent();
+        for (const pageNum of candidatePages) {
+          const textContent = await (await pdf.getPage(pageNum)).getTextContent();
           if (cancelled) return;
-          const found = matchOnPage(indexPage(tc), bodyWords);
-          if (found) {
-            setHighlights({ [pageNum]: found.itemIds });
+          const pageIndex = indexPage(textContent);
+          const bodyRange = matchOnPage(pageIndex, bodyWords);
+          if (bodyRange) {
+            // Default: the whole chunk. With the query available, narrow to
+            // the sentences that actually score against it.
+            let highlightItemIds = itemsInRange(pageIndex, bodyRange.start, bodyRange.end);
+            if (target.query?.embedding) {
+              const pickedSentences = await pickSentences(body, target.query, setStatus);
+              if (cancelled) return;
+              const sentenceItemIds = [];
+              for (const sentence of pickedSentences) {
+                const sentenceText = normWords(sentence).join('');
+                if (sentenceText.length < 12) continue;
+                const sentenceAt = pageIndex.joined.indexOf(
+                  sentenceText, Math.max(0, bodyRange.start - 300));
+                if (sentenceAt !== -1 && sentenceAt < bodyRange.end + 300) {
+                  sentenceItemIds.push(
+                    ...itemsInRange(pageIndex, sentenceAt, sentenceAt + sentenceText.length));
+                }
+              }
+              if (sentenceItemIds.length) highlightItemIds = [...new Set(sentenceItemIds)];
+            }
+            setHighlights({ [pageNum]: highlightItemIds });
             setStatus(null);
             scrollTo.current = pageNum;
-            const el = pageEls.current.get(pageNum);
-            if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); scrollTo.current = null; }
+            const pageEl = pageEls.current.get(pageNum);
+            if (pageEl) {
+              pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              scrollTo.current = null;
+            }
             return;
           }
         }
         // Text not locatable (scanned page, heavy equations): land on the page.
-        const fallback = chunk.pages?.[0] ?? 1;
+        const fallbackPage = chunk.pages?.[0] ?? 1;
         setStatus('passage could not be pinpointed — showing its page');
-        scrollTo.current = fallback;
-        pageEls.current.get(fallback)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      } catch (e) {
-        if (!cancelled) setStatus(`citation lookup failed: ${e.message}`);
+        scrollTo.current = fallbackPage;
+        pageEls.current.get(fallbackPage)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (err) {
+        if (!cancelled) setStatus(`citation lookup failed: ${err.message}`);
       }
     })();
     return () => { cancelled = true; };
   }, [target?.nonce, pdf]);   // eslint-disable-line react-hooks/exhaustive-deps
 
-  const registerPage = (pageNum, el) => {
-    if (el) pageEls.current.set(pageNum, el);
+  const registerPage = (pageNum, pageEl) => {
+    if (pageEl) pageEls.current.set(pageNum, pageEl);
     else pageEls.current.delete(pageNum);
-    if (el && scrollTo.current === pageNum) {
+    if (pageEl && scrollTo.current === pageNum) {
       scrollTo.current = null;
-      el.scrollIntoView({ block: 'start' });
+      pageEl.scrollIntoView({ block: 'start' });
     }
   };
 
@@ -288,16 +380,16 @@ export default function DocumentViewer({ controlsEl, active, target }) {
     <div className="doc-list">
       <div className="control-label">Documents</div>
       {error && <div className="doc-list-error">{error}</div>}
-      {docs?.map((d) => (
+      {docs?.map((doc) => (
         <button
-          key={d.docId}
-          className={`doc-item ${selected === d.docId ? 'active' : ''}`}
-          onClick={() => { setHighlights({}); setStatus(null); setSelected(d.docId); }}
-          title={d.filename}
+          key={doc.docId}
+          className={`doc-item ${selected === doc.docId ? 'active' : ''}`}
+          onClick={() => { setHighlights({}); setStatus(null); setSelected(doc.docId); }}
+          title={doc.filename}
         >
-          <span className="doc-item-title">{d.title}</span>
-          {d.authors?.length > 0 && (
-            <span className="doc-item-authors">{d.authors.slice(0, 3).join(', ')}</span>
+          <span className="doc-item-title">{doc.title}</span>
+          {doc.authors?.length > 0 && (
+            <span className="doc-item-authors">{doc.authors.slice(0, 3).join(', ')}</span>
           )}
         </button>
       ))}
@@ -318,13 +410,13 @@ export default function DocumentViewer({ controlsEl, active, target }) {
         <div className="viz-empty"><p>loading PDF…</p></div>
       ) : (
         <div className="pdf-scroll">
-          {pageSizes.map((size, i) => (
+          {pageSizes.map((size, pageIdx) => (
             <PdfPage
-              key={`${selected}_${i + 1}`}
+              key={`${selected}_${pageIdx + 1}`}
               pdf={pdf}
-              pageNum={i + 1}
+              pageNum={pageIdx + 1}
               size={size}
-              highlightIds={highlights[i + 1] || null}
+              highlightIds={highlights[pageIdx + 1] || null}
               pageRef={registerPage}
             />
           ))}

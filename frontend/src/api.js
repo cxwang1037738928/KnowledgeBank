@@ -1,9 +1,9 @@
 // Thin fetch wrappers over the Express /api/corpus routes.
 
 async function request(url, options) {
-  const resp = await fetch(url, options);
-  const body = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(body.error || `HTTP ${resp.status}`);
+  const response = await fetch(url, options);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
   return body;
 }
 

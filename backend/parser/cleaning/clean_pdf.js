@@ -54,9 +54,9 @@ async function writeMeta(store) {
   await fs.mkdir(path.dirname(META_PATH), { recursive: true });
   // Write-to-temp + rename: a crash mid-write can never leave a truncated
   // documents.json behind (rename is atomic on the same volume).
-  const tmp = `${META_PATH}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(store, null, 2), 'utf-8');
-  await fs.rename(tmp, META_PATH);
+  const tempPath = `${META_PATH}.tmp`;
+  await fs.writeFile(tempPath, JSON.stringify(store, null, 2), 'utf-8');
+  await fs.rename(tempPath, META_PATH);
 }
 
 // ---------------------------------------------------------------------------
@@ -100,9 +100,9 @@ async function hasPDFMagicBytes(filePath) {
   let handle;
   try {
     handle = await fs.open(filePath, 'r');
-    const buf = Buffer.alloc(4);
-    await handle.read(buf, 0, 4, 0);
-    return buf.toString('ascii') === '%PDF';
+    const headerBytes = Buffer.alloc(4);
+    await handle.read(headerBytes, 0, 4, 0);
+    return headerBytes.toString('ascii') === '%PDF';
   } catch {
     return false;
   } finally {
@@ -136,8 +136,8 @@ export async function validatePDF(filePath) {
     return { valid: false, error: 'File is empty.' };
   }
   if (stat.size > MAX_FILE_SIZE) {
-    const mb = (stat.size / 1024 / 1024).toFixed(1);
-    return { valid: false, error: `File size ${mb} MB exceeds the ${process.env.MAX_PDF_SIZE_MB || 50} MB limit.` };
+    const sizeMb = (stat.size / 1024 / 1024).toFixed(1);
+    return { valid: false, error: `File size ${sizeMb} MB exceeds the ${process.env.MAX_PDF_SIZE_MB || 50} MB limit.` };
   }
 
   const isRealPDF = await hasPDFMagicBytes(filePath);
@@ -147,7 +147,7 @@ export async function validatePDF(filePath) {
 
   const hash = await computeHash(filePath);
   const store = await readMeta();
-  const duplicate = Object.values(store.documents).find((d) => d.sha256 === hash);
+  const duplicate = Object.values(store.documents).find((doc) => doc.sha256 === hash);
   if (duplicate) {
     return {
       valid: false,
@@ -273,9 +273,9 @@ export async function listDocuments(filter = {}) {
   const store = await readMeta();
   let docs = Object.values(store.documents);
   if (filter.status) {
-    docs = docs.filter((d) => d.status === filter.status);
+    docs = docs.filter((doc) => doc.status === filter.status);
   }
-  return docs.sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt));
+  return docs.sort((docA, docB) => docB.uploadedAt.localeCompare(docA.uploadedAt));
 }
 
 /**
@@ -292,7 +292,7 @@ export async function scanAndIngestDirectory() {
     return [{ filename: DOCUMENTS_DIR, error: 'Documents directory not found or not readable.' }];
   }
 
-  const pdfs = entries.filter((f) => path.extname(f).toLowerCase() === '.pdf');
+  const pdfs = entries.filter((entry) => path.extname(entry).toLowerCase() === '.pdf');
   if (pdfs.length === 0) return [];
 
   // Sequential on purpose: ingestDocument rewrites documents.json whole, so

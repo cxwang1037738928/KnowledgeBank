@@ -29,17 +29,17 @@ await fs.mkdir(TEST_DATA, { recursive: true });
 const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'heuristic.py');
 const PYTHON       = process.env.PYTHON || 'python';
 
-const argv = process.argv;
-const i    = argv.indexOf('--k');
-const k    = i !== -1 ? argv[i + 1] : '5';
+const argv    = process.argv;
+const kArgIdx = argv.indexOf('--k');
+const k       = kArgIdx !== -1 ? argv[kArgIdx + 1] : '5';
 
 const start = Date.now();
 console.log(`[test_heuristic] Spawning heuristic.py --k ${k} (${PYTHON}; GROBID parsedReferences, no LLM) ...\n`);
 
 await new Promise((resolve, reject) => {
   const proc = spawn(PYTHON, [HEURISTIC_PY, '--k', k], { stdio: 'inherit', cwd: ROOT });
-  proc.on('close', (code) => code !== 0
-    ? reject(new Error(`heuristic.py exited with code ${code}`))
+  proc.on('close', (exitCode) => exitCode !== 0
+    ? reject(new Error(`heuristic.py exited with code ${exitCode}`))
     : resolve());
   proc.on('error', (err) => reject(new Error(`Failed to spawn heuristic.py: ${err.message}`)));
 });
@@ -47,10 +47,10 @@ await new Promise((resolve, reject) => {
 const heuristic = JSON.parse(await fs.readFile(path.join(TEST_DATA, 'heuristic_output.json'), 'utf-8'));
 
 console.log('\n[test_heuristic] Top-k breakdown (final = 0.25·bm25 + 0.75·pagerank):');
-for (const d of heuristic.topK) {
+for (const rankedDoc of heuristic.topK) {
   console.log(
-    `  ${d.finalScore.toFixed(4)}  ${d.filename}` +
-    `  (repr=${d.bm25Representativeness} novelty=${d.bm25Novelty} pr=${d.pagerankScore})`
+    `  ${rankedDoc.finalScore.toFixed(4)}  ${rankedDoc.filename}` +
+    `  (repr=${rankedDoc.bm25Representativeness} novelty=${rankedDoc.bm25Novelty} pr=${rankedDoc.pagerankScore})`
   );
 }
 console.log(`  ${heuristic.edges.length} citation edge(s) across the corpus`);
@@ -61,11 +61,11 @@ if (heuristic.edges.length === 0) {
   console.warn('           parsedReferences arrays (GROBID down during extraction).');
 }
 
-const elapsed = ((Date.now() - start) / 1000).toFixed(2);
-const ts      = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
+const elapsed   = ((Date.now() - start) / 1000).toFixed(2);
+const timestamp = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, ' UTC');
 await fs.appendFile(
   path.join(ROOT, 'tests', 'test_log.txt'),
-  `[${ts}] test_heuristic           : ${elapsed}s\n`,
+  `[${timestamp}] test_heuristic           : ${elapsed}s\n`,
   'utf-8',
 );
 console.log(`\nDone in ${elapsed}s. Run test_build_graph.js next.`);

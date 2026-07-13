@@ -10,77 +10,38 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { postChat } from '../api.js';
-
-const EMBED_MODEL = 'Xenova/all-MiniLM-L12-v2';   // must match the corpus embedder
-
-let _embedder = null;
-
-async function getEmbedder(onStatus) {
-  if (!_embedder) {
-    _embedder = (async () => {
-      onStatus('loading embedding model…');
-      const { pipeline, env } = await import('@xenova/transformers');
-
-      // The browser cache is off by design, so the model is re-fetched every
-      // session. Serve it from our own backend (npm run fetch:model) rather
-      // than huggingface.co — otherwise every chat depends on the public
-      // internet and dies with an opaque network error when HF is slow,
-      // rate-limiting, or unreachable. Same for onnxruntime's wasm, which
-      // otherwise comes from cdn.jsdelivr.net.
-      env.useBrowserCache = false;
-      env.allowLocalModels = true;
-      env.localModelPath = '/models/';
-      env.backends.onnx.wasm.wasmPaths = '/models/ort/';
-
-      try {
-        return await pipeline('feature-extraction', EMBED_MODEL, { quantized: true });
-      } catch (err) {
-        // models/ not vendored yet — fall back to the HF hub so chat still
-        // works, but say so, since this is the flaky path.
-        console.warn('[chat] local model load failed, falling back to huggingface.co:', err);
-        onStatus('downloading embedding model from huggingface…');
-        env.allowLocalModels = false;
-        return pipeline('feature-extraction', EMBED_MODEL, { quantized: true });
-      }
-    })().catch((e) => {
-      _embedder = null;       // allow retry after a failed download
-      throw e;
-    });
-  }
-  return _embedder;
-}
+import { embedTexts } from '../lib/embedder.js';
 
 async function embedQuery(text, onStatus) {
-  const extractor = await getEmbedder(onStatus);
   onStatus('embedding your question…');
-  const out = await extractor([text], { pooling: 'mean', normalize: true });
-  return Array.from(out.data);
+  const [queryVector] = await embedTexts([text], onStatus);
+  return queryVector;
 }
 
-/**
- * Render reply text with [n] citation markers as clickable links that jump
- * to the cited chunk in the Documents tab ([1, 3] style groups included).
- */
-function CitedText({ text, sources, onCitation }) {
+// Small models drift off the [n] format even when told not to; the backend
+// normalizes what it can, and this accepts the leftovers ([n1], [#1], [ref 1]).
+const CITE_RE = /(\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*\d+(?:\s*,\s*\d+)*\s*\])/g;
+
+/** [n] markers → buttons that open the cited chunk in the Documents tab. */
+function citeInline(text, sources, query, onCitation, keyBase) {
   if (!sources?.length || !onCitation) return text;
-  const parts = text.split(/(\[\d+(?:\s*,\s*\d+)*\])/g);
-  return parts.map((part, i) => {
-    const m = part.match(/^\[(\d+(?:\s*,\s*\d+)*)\]$/);
-    if (!m) return part;
-    const nums = m[1].split(',').map((n) => parseInt(n, 10));
-    if (nums.some((n) => n < 1 || n > sources.length)) return part;
+  return text.split(CITE_RE).map((part, partIdx) => {
+    const citeMatch = part.match(/^\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*(\d+(?:\s*,\s*\d+)*)\s*\]$/);
+    if (!citeMatch) return part;
+    const sourceNumbers = citeMatch[1].split(',').map((number) => parseInt(number, 10));
+    if (sourceNumbers.some((sourceNumber) => sourceNumber < 1 || sourceNumber > sources.length)) return part;
     return (
-      <span className="citation-group" key={i}>
-        {nums.map((n) => {
-          const src = sources[n - 1];
+      <span className="citation-group" key={`${keyBase}c${partIdx}`}>
+        {sourceNumbers.map((sourceNumber) => {
+          const source = sources[sourceNumber - 1];
           return (
             <button
-              key={n}
+              key={sourceNumber}
               className="citation-link"
-              title={`${src.filename}${src.heading ? ` — ${src.heading}` : ''}${src.pages ? ` · p.${src.pages[0]}` : ''}`}
-              onClick={() => onCitation(src)}
+              title={`${source.filename}${source.heading ? ` — ${source.heading}` : ''}${source.pages ? ` · p.${source.pages[0]}` : ''}`}
+              onClick={() => onCitation(source, query)}
             >
-              {n}
+              {sourceNumber}
             </button>
           );
         })}
@@ -89,23 +50,129 @@ function CitedText({ text, sources, onCitation }) {
   });
 }
 
-function Sources({ sources, onCitation }) {
+/** Inline markdown the models actually emit: **bold**, *italic*, `code`. */
+function inlineMd(text, keyBase, cite) {
+  const nodes = [];
+  const emphasisPattern = /\*\*(.+?)\*\*|(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)|`([^`]+)`/g;
+  let plainStart = 0;
+  let emphasisMatch;
+  while ((emphasisMatch = emphasisPattern.exec(text)) !== null) {
+    if (emphasisMatch.index > plainStart) {
+      nodes.push(cite(text.slice(plainStart, emphasisMatch.index), `${keyBase}t${plainStart}`));
+    }
+    const key = `${keyBase}m${emphasisMatch.index}`;
+    const [whole, boldText, italicText, codeText] = emphasisMatch;
+    if (boldText !== undefined)        nodes.push(<strong key={key}>{cite(boldText, key)}</strong>);
+    else if (italicText !== undefined) nodes.push(<em key={key}>{cite(italicText, key)}</em>);
+    else                               nodes.push(<code key={key}>{codeText}</code>);
+    plainStart = emphasisMatch.index + whole.length;
+  }
+  if (plainStart < text.length) nodes.push(cite(text.slice(plainStart), `${keyBase}t${plainStart}`));
+  return nodes;
+}
+
+/**
+ * Minimal markdown renderer for assistant replies — headings, bullet and
+ * numbered lists, blockquotes, paragraphs, plus inline emphasis. The models
+ * emit markdown whether or not we ask, and raw ### / ** in the bubble reads
+ * as garbage. Citation markers stay clickable inside all of it.
+ */
+function CitedText({ text, sources, query, onCitation }) {
+  const cite = (segment, key) => citeInline(segment, sources, query, onCitation, key);
+  const blocks = [];
+  const lines = (text || '').split('\n');
+
+  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
+    const line = lines[lineIdx];
+    if (!line.trim()) continue;
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      const [, , headingText] = headingMatch;
+      blocks.push(
+        <div className="md-h" key={lineIdx}>{inlineMd(headingText, `h${lineIdx}`, cite)}</div>
+      );
+      continue;
+    }
+
+    if (/^\s*>\s?/.test(line)) {
+      const quoteLines = [];
+      while (lineIdx < lines.length && /^\s*>\s?/.test(lines[lineIdx])) {
+        quoteLines.push(lines[lineIdx].replace(/^\s*>\s?/, ''));
+        lineIdx++;
+      }
+      lineIdx--;
+      blocks.push(
+        <blockquote key={lineIdx}>{inlineMd(quoteLines.join(' '), `q${lineIdx}`, cite)}</blockquote>
+      );
+      continue;
+    }
+
+    if (/^\s*(?:[-*+]|\d+[.)])\s+/.test(line)) {
+      const listItems = [];
+      const isOrdered = /^\s*\d+[.)]\s+/.test(line);
+      while (lineIdx < lines.length && /^\s*(?:[-*+]|\d+[.)])\s+/.test(lines[lineIdx])) {
+        listItems.push(lines[lineIdx].replace(/^\s*(?:[-*+]|\d+[.)])\s+/, ''));
+        lineIdx++;
+      }
+      lineIdx--;
+      const List = isOrdered ? 'ol' : 'ul';
+      blocks.push(
+        <List key={lineIdx}>
+          {listItems.map((listItem, itemIdx) => (
+            <li key={itemIdx}>{inlineMd(listItem, `l${lineIdx}_${itemIdx}`, cite)}</li>
+          ))}
+        </List>
+      );
+      continue;
+    }
+
+    // Paragraph: absorb following non-blank, non-structural lines.
+    const paragraphLines = [line];
+    while (lineIdx + 1 < lines.length && lines[lineIdx + 1].trim() &&
+           !/^\s*(?:[-*+]|\d+[.)])\s+|^\s*>|^#{1,6}\s/.test(lines[lineIdx + 1])) {
+      paragraphLines.push(lines[++lineIdx]);
+    }
+    blocks.push(<p key={lineIdx}>{inlineMd(paragraphLines.join(' '), `p${lineIdx}`, cite)}</p>);
+  }
+
+  return blocks;
+}
+
+/** Excerpt numbers the reply actually cites (post-repair, so they're verified). */
+function citedNumbers(text) {
+  const numbers = new Set();
+  for (const marker of (text || '').matchAll(new RegExp(CITE_RE.source, 'g'))) {
+    for (const number of marker[0].replace(/[^\d,]/g, '').split(',')) {
+      if (number) numbers.add(parseInt(number, 10));
+    }
+  }
+  return numbers;
+}
+
+function Sources({ sources, reply, query, onCitation }) {
   if (!sources?.length) return null;
+  // Chips are the sources the answer cites — a retrieved but uncited chunk is
+  // not a source, and linking it sent people to passages nothing referenced.
+  const cited = citedNumbers(reply);
+  const citedSources = sources.filter((_, sourceIdx) => cited.has(sourceIdx + 1));
+  if (!citedSources.length) return null;
+
   // One chip per document, best-scoring chunk first.
-  const byDoc = [];
-  for (const s of sources) {
-    if (!byDoc.some((d) => d.docId === s.docId)) byDoc.push(s);
+  const bestSourcePerDoc = [];
+  for (const source of citedSources) {
+    if (!bestSourcePerDoc.some((kept) => kept.docId === source.docId)) bestSourcePerDoc.push(source);
   }
   return (
     <div className="msg-sources">
-      {byDoc.map((s) => (
+      {bestSourcePerDoc.map((source) => (
         <button
           className="source-chip"
-          key={s.docId}
-          title={`${s.heading || 'document'} · score ${s.score} — open in Documents`}
-          onClick={() => onCitation?.(s)}
+          key={source.docId}
+          title={`${source.heading || 'document'} · score ${source.score} — open in Documents`}
+          onClick={() => onCitation?.(source, query)}
         >
-          {s.filename.replace(/\.pdf$/i, '')}
+          {source.filename.replace(/\.pdf$/i, '')}
         </button>
       ))}
     </div>
@@ -142,17 +209,21 @@ export default function Chat({ active, onCitation }) {
         messages: history.map(({ role, content }) => ({ role, content })),
         queryEmbedding,
       });
-      setMessages((m) => [...m, { role: 'assistant', content: reply, sources, model }]);
-    } catch (e) {
-      setMessages((m) => [...m, { role: 'assistant', error: e.message }]);
+      // Keep the query with the reply: citation clicks pass it to the PDF
+      // viewer, which scores the chunk's sentences against it to decide
+      // what to highlight.
+      const query = { text: question, embedding: queryEmbedding };
+      setMessages((thread) => [...thread, { role: 'assistant', content: reply, sources, model, query }]);
+    } catch (err) {
+      setMessages((thread) => [...thread, { role: 'assistant', error: err.message }]);
     } finally {
       setStatus(null);
     }
   }
 
-  function onKeyDown(e) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
+  function onKeyDown(event) {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
       send();
     }
   }
@@ -171,17 +242,27 @@ export default function Chat({ active, onCitation }) {
         )}
 
         <div className="chat-thread">
-          {messages.map((m, i) =>
-            m.role === 'user' ? (
-              <div className="msg user" key={i}>{m.content}</div>
-            ) : m.error ? (
-              <div className="msg assistant error" key={i}>{m.error}</div>
+          {messages.map((message, messageIdx) =>
+            message.role === 'user' ? (
+              <div className="msg user" key={messageIdx}>{message.content}</div>
+            ) : message.error ? (
+              <div className="msg assistant error" key={messageIdx}>{message.error}</div>
             ) : (
-              <div className="msg assistant" key={i}>
+              <div className="msg assistant" key={messageIdx}>
                 <div className="msg-body">
-                  <CitedText text={m.content} sources={m.sources} onCitation={onCitation} />
+                  <CitedText
+                    text={message.content}
+                    sources={message.sources}
+                    query={message.query}
+                    onCitation={onCitation}
+                  />
                 </div>
-                <Sources sources={m.sources} onCitation={onCitation} />
+                <Sources
+                  sources={message.sources}
+                  reply={message.content}
+                  query={message.query}
+                  onCitation={onCitation}
+                />
               </div>
             )
           )}
@@ -195,7 +276,7 @@ export default function Chat({ active, onCitation }) {
           rows={1}
           placeholder="Ask about your documents…"
           value={input}
-          onChange={(e) => setInput(e.target.value)}
+          onChange={(event) => setInput(event.target.value)}
           onKeyDown={onKeyDown}
           disabled={!!status}
         />
