@@ -1,20 +1,19 @@
 /**
  * routes/pipeline.js — /api/pipeline/*
  *
- * Controls the extraction and ranking pipeline.  Each route is a thin wrapper
- * around the corresponding module function or Python subprocess; all heavy
- * logic lives in backend/extraction/ and backend/parser/.
+ * Controls the extraction and ranking pipeline. Every stage is a runner in
+ * STAGES keyed by name; the per-stage POST routes validate params and call
+ * their runner, and POST /run iterates the same runners in STAGE_ORDER.
+ * Swapping a stage implementation = replacing one runner.
  *
  * Stage order and dependencies:
- *   1. enhance      — rasterize + denoise + deskew + binarize (per-document)
- *   2. extract      — docling PDF → text/sections/refs/metadata  (needs: docs + enhanced/)
- *   3. embed        — chunk + MiniLM encode                      (needs: doclings.json)
- *   4. categorize   — cosine-similarity cluster + keyword/medoid index (needs: doclings.json)
- *   5. heuristic    — BM25 + PageRank top-k                      (needs: doclings + categories)
- *   6. build-graph  — document/section/citation graph            (needs: doclings + heuristic_output)
- *
- * POST /run executes stages 2–6 in order (enhancement is per-document and
- * excluded; run it individually for each uploaded file before calling /run).
+ *   1. enhance      — rasterize + denoise + deskew + binarize (per-document,
+ *                     excluded from /run)
+ *   2. extract      — docling PDF → text/sections/refs/metadata
+ *   3. embed        — chunk + MiniLM encode
+ *   4. categorize   — cosine-similarity cluster + keyword/medoid index
+ *   5. heuristic    — BM25 + PageRank top-k
+ *   6. graph        — document/section/citation graph
  */
 
 import 'dotenv/config';
@@ -37,49 +36,31 @@ import { getDocumentStatus }  from '../parser/cleaning/clean_pdf.js';
 const __dirname  = path.dirname(fileURLToPath(import.meta.url));
 const ROOT       = path.resolve(__dirname, '..', '..');
 const DATA_DIR   = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const EXTRACT_PY  = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'extract.py');
+const EXTRACT_PY   = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'extract.py');
 const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'heuristic.py');
 const PYTHON     = process.env.PYTHON || 'python';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/**
- * Wraps an async route handler so unhandled rejections reach Express's error
- * middleware instead of crashing the process.
- */
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-/**
- * Creates an Error with an HTTP status code attached.
- * @param {number} status
- * @param {string} message
- */
 function httpError(status, message) {
   const err = new Error(message);
   err.status = status;
   return err;
 }
 
-/**
- * Spawns a child process and resolves when it exits 0.
- * Pipes stdout/stderr to the server console in real time.
- * Rejects with an error (including stderr tail) on non-zero exit.
- *
- * @param {string}   cmd
- * @param {string[]} args
- * @returns {Promise<{ stdout: string, stderr: string }>}
- */
+/** Spawn a child process; resolve on exit 0, reject (status 502) otherwise. */
 function spawnAsync(cmd, args) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, {
       cwd: ROOT,
-      env: process.env,   // DATA_DIR, PYTHON, Ollama config, etc. all pass through
+      env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
-    let stdout = '';
     let stderr = '';
-    proc.stdout.on('data', d => { const s = d.toString(); stdout += s; process.stdout.write(s); });
+    proc.stdout.on('data', d => process.stdout.write(d.toString()));
     proc.stderr.on('data', d => { const s = d.toString(); stderr += s; process.stderr.write(s); });
 
     proc.on('close', code => {
@@ -89,7 +70,7 @@ function spawnAsync(cmd, args) {
         err.detail = stderr.slice(-500);
         return reject(err);
       }
-      resolve({ stdout, stderr });
+      resolve();
     });
 
     proc.on('error', err => {
@@ -99,89 +80,105 @@ function spawnAsync(cmd, args) {
   });
 }
 
-/**
- * Safely reads a JSON file and extracts a timestamp field.
- * Returns null if the file doesn't exist or the field is absent.
- *
- * @param {string}          filePath
- * @param {(obj: any) => string|null} getter
- */
-async function fileTimestamp(filePath, getter) {
-  try {
-    const obj = JSON.parse(await fs.readFile(filePath, 'utf-8'));
-    return getter(obj) ?? null;
-  } catch {
-    return null;
-  }
+async function readData(filename) {
+  return JSON.parse(await fs.readFile(path.join(DATA_DIR, filename), 'utf-8'));
 }
 
-/**
- * Returns the most recent extractedAt timestamp across all entries in
- * doclings.json (the file has no top-level generatedAt).
- */
-async function doclingsTimestamp(filePath) {
-  try {
-    const entries = JSON.parse(await fs.readFile(filePath, 'utf-8'));
-    const times = Object.values(entries).map(e => e.extractedAt).filter(Boolean);
-    return times.length ? times.reduce((a, b) => (a > b ? a : b)) : null;
-  } catch {
-    return null;
-  }
+/** Missing-input errors become 503 (run the earlier stage first). */
+function toHttp(err) {
+  if (!err.status && /not found/i.test(err.message)) err.status = 503;
+  return err;
 }
+
+// ── Stage runners ─────────────────────────────────────────────────────────────
+//
+// Each runner takes validated params and returns the JSON summary the route
+// responds with. /run reuses them verbatim.
+
+export const STAGE_ORDER = ['extract', 'embed', 'categorize', 'heuristic', 'graph'];
+
+export const STAGES = {
+  async extract({ force = false } = {}) {
+    await spawnAsync(PYTHON, [EXTRACT_PY, ...(force ? ['--force'] : [])]);
+    await annotateDois();
+    try {
+      await enrichDoclings();               // network enrichment — never fatal
+    } catch (err) {
+      console.warn(`[pipeline] Crossref enrichment skipped: ${err.message}`);
+    }
+    const report = await readData('extract_report.json');
+    return { extracted: report.extracted.length, skipped: report.skipped, errors: report.errors };
+  },
+
+  async embed({ force = false } = {}) {
+    await embedAll({ force });
+    const store = await readData('embeddings.json');
+    return {
+      chunks:     store.chunks.length,
+      docs:       store.metadata.totalDocs,
+      model:      store.metadata.model,
+      dimensions: store.metadata.dimensions,
+    };
+  },
+
+  async categorize({ threshold } = {}) {
+    const result = await generateCategories(threshold);
+    return {
+      threshold:  result.threshold,
+      categories: result.categories.length,
+      docs:       result.categories.reduce((n, c) => n + c.members.length, 0),
+    };
+  },
+
+  async heuristic({ k = 2 } = {}) {
+    await spawnAsync(PYTHON, [HEURISTIC_PY, '--k', String(k)]);
+    const output = await readData('heuristic_output.json');
+    return { k: output.k, topK: output.topK, edges: output.edges.length };
+  },
+
+  async graph() {
+    const g = await buildGraph();
+    return {
+      nodes:        g.nodes.length,
+      edges:        g.edges.length,
+      docNodes:     g.nodes.filter(n => n.type === 'document').length,
+      sectionNodes: g.nodes.filter(n => n.type === 'section').length,
+      citeEdges:    g.edges.filter(e => e.type === 'cites').length,
+      sectionEdges: g.edges.filter(e => e.type === 'has_section').length,
+    };
+  },
+};
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
 export const pipelineRouter = Router();
 
-// ── GET /api/pipeline/status ─────────────────────────────────────────────────
-//
-// Returns the last-run timestamp for every pipeline stage by reading the
-// generatedAt/createdAt/updated field from each output file.  null means the
-// stage has never been run (output file absent or unreadable).
-//
-// Response shape:
-//   {
-//     doclings:   string|null,   // max extractedAt across all entries
-//     embeddings: string|null,   // embeddings.json → metadata.updated
-//     categories: string|null,   // categories.json → generatedAt
-//     heuristic:  string|null,   // heuristic_output.json → generatedAt
-//     graph:      string|null    // graph.json → createdAt
-//   }
-
+// GET /status — last-run timestamp per stage (null = never ran).
 pipelineRouter.get('/status', wrap(async (req, res) => {
+  const timestamp = async (filename, getter) => {
+    try {
+      return getter(await readData(filename)) ?? null;
+    } catch {
+      return null;
+    }
+  };
+
   const [doclings, embeddings, categories, heuristic, graph] = await Promise.all([
-    doclingsTimestamp(path.join(DATA_DIR, 'doclings.json')),
-    fileTimestamp(path.join(DATA_DIR, 'embeddings.json'),       o => o?.metadata?.updated),
-    fileTimestamp(path.join(DATA_DIR, 'categories.json'),       o => o?.generatedAt),
-    fileTimestamp(path.join(DATA_DIR, 'heuristic_output.json'), o => o?.generatedAt),
-    fileTimestamp(path.join(DATA_DIR, 'graph.json'),            o => o?.createdAt),
+    timestamp('doclings.json', o => {
+      const times = Object.values(o).map(e => e.extractedAt).filter(Boolean);
+      return times.length ? times.reduce((a, b) => (a > b ? a : b)) : null;
+    }),
+    timestamp('embeddings.json',       o => o?.metadata?.updated),
+    timestamp('categories.json',       o => o?.generatedAt),
+    timestamp('heuristic_output.json', o => o?.generatedAt),
+    timestamp('graph.json',            o => o?.createdAt),
   ]);
 
   res.json({ doclings, embeddings, categories, heuristic, graph });
 }));
 
-// ── POST /api/pipeline/enhance ───────────────────────────────────────────────
-//
-// Rasterizes one document's pages at the requested DPI and runs the full
-// enhancement chain: denoise → contrast-normalize → deskew → Otsu binarize.
-// Writes the per-page report to data/enhanced/<docId>.json and saves each
-// enhanced page as data/enhanced/<docId>/page_<N>.png.
-//
-// extract.py reads this report to decide between the digital and OCR
-// converters — a doc where < 30% of pages are scanned uses the faster digital
-// pipeline.  Run enhance before extract.
-//
-// Request body:
-//   { docId: string, dpi?: number }     dpi defaults to 300
-//
-// Response (200):
-//   { docId, numPages, pages: [{ pageNumber, pageType, dimensions, enhancement }] }
-//
-// Errors:
-//   400 — missing docId
-//   404 — docId not found in documents.json
-//   500 — enhancement failed (rasterization or sharp error)
-
+// POST /enhance { docId, dpi? } — per-document page enhancement; run before
+// extract so extract.py can route scanned pages to the OCR converter.
 pipelineRouter.post('/enhance', wrap(async (req, res) => {
   const { docId, dpi = 300 } = req.body ?? {};
   if (!docId) throw httpError(400, '"docId" is required');
@@ -189,256 +186,44 @@ pipelineRouter.post('/enhance', wrap(async (req, res) => {
   const record = await getDocumentStatus(docId);
   if (!record) throw httpError(404, `Document "${docId}" not found`);
 
-  const report = await processDocument(record.filePath, { docId, dpi });
-  res.json(report);
+  res.json(await processDocument(record.filePath, { docId, dpi }));
 }));
 
-// ── POST /api/pipeline/extract ───────────────────────────────────────────────
-//
-// Spawns extract.py, which converts every PDF in documents.json that has not
-// yet been extracted (or all of them when force=true).  Uses the enhancement
-// report in data/enhanced/<docId>.json to choose the converter; falls back to
-// the OCR converter if the report is absent.
-//
-// Writes each document's full text, markdown, sections array, tables array,
-// references array, and docling metadata to data/doclings.json.
-//
-// Request body:
-//   { force?: boolean }     re-extract already-processed docs (default false)
-//
-// Response (200):
-//   { extracted: number, skipped: number, errors: [{ docId, filename, error }] }
-//
-// Errors:
-//   502 — extract.py exited non-zero (Python/docling error)
-
+// POST /extract { force? }
 pipelineRouter.post('/extract', wrap(async (req, res) => {
-  const { force = false } = req.body ?? {};
-  const args = [EXTRACT_PY, ...(force ? ['--force'] : [])];
-
-  await spawnAsync(PYTHON, args);
-
-  // Stamp metadata.doi on every extracted document (regex over the doc head)
-  await annotateDois();
-
-  // Overlay Crossref metadata for DOI'd docs (network; never fatal)
-  try {
-    await enrichDoclings();
-  } catch (err) {
-    console.warn(`[pipeline] Crossref enrichment skipped: ${err.message}`);
-  }
-
-  // extract.py writes a per-run summary — doclings.json alone can't
-  // distinguish this run's work from historical entries, and failed docs
-  // never appear in it (the old code here reported errors: [] always).
-  const report = JSON.parse(
-    await fs.readFile(path.join(DATA_DIR, 'extract_report.json'), 'utf-8'));
-
-  res.json({
-    extracted: report.extracted.length,
-    skipped:   report.skipped,
-    errors:    report.errors,
-  });
+  res.json(await STAGES.extract({ force: req.body?.force === true }));
 }));
 
-// ── POST /api/pipeline/embed ─────────────────────────────────────────────────
-//
-// Runs embed.js.  Reads doclings.json, splits each document's text into
-// structure-aware chunks (section boundaries + heading prefixes + standalone
-// table chunks), and encodes each chunk with Xenova/all-MiniLM-L12-v2
-// (384-dim).  Writes the full embedding store to data/embeddings.json.
-//
-// Incremental by default: only documents not already in embeddings.json are
-// processed.  Pass force=true to discard existing embeddings and re-encode all.
-//
-// Request body:
-//   { force?: boolean }     re-embed all documents (default false)
-//
-// Response (200):
-//   { chunks: number, docs: number, model: string, dimensions: number }
-//
-// Errors:
-//   503 — doclings.json not found (run extract first)
-
+// POST /embed { force? }
 pipelineRouter.post('/embed', wrap(async (req, res) => {
-  const { force = false } = req.body ?? {};
-
-  try {
-    await embedAll({ force });
-  } catch (err) {
-    if (err.message.includes('doclings.json not found')) throw httpError(503, err.message);
-    throw err;
-  }
-
-  const store = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'embeddings.json'), 'utf-8'));
-  res.json({
-    chunks:     store.chunks.length,
-    docs:       store.metadata.totalDocs,
-    model:      store.metadata.model,
-    dimensions: store.metadata.dimensions,
-  });
+  res.json(await STAGES.embed({ force: req.body?.force === true }).catch(err => { throw toHttp(err); }));
 }));
 
-// ── POST /api/pipeline/categorize ────────────────────────────────────────────
-//
-// Runs generate_categories.js.  Embeds each document's title + abstract (or
-// first 200 body words when both are absent), clusters with Union-Find
-// single-linkage at the given cosine similarity threshold, then indexes each
-// cluster with its top BM25-IDF keywords and centroid medoid (no LLM).
-//
-// Writes data/categories.json:
-//   { threshold, generatedAt,
-//     categories: [{ index, members, keywords, medoid }] }
-//
-// Request body:
-//   { threshold: number }   cosine similarity in (0, 1] — required
-//
-// Response (200):
-//   { threshold: number, categories: number, docs: number }
-//
-// Errors:
-//   400 — missing or out-of-range threshold
-//   503 — doclings.json not found (run extract first)
-
+// POST /categorize { threshold } — cosine similarity in (0, 1], required.
 pipelineRouter.post('/categorize', wrap(async (req, res) => {
   const { threshold } = req.body ?? {};
-
-  if (threshold === undefined || threshold === null) {
-    throw httpError(400, '"threshold" is required');
-  }
   if (typeof threshold !== 'number' || isNaN(threshold) || threshold <= 0 || threshold > 1) {
     throw httpError(400, '"threshold" must be a number in (0, 1]');
   }
-
-  let result;
-  try {
-    result = await generateCategories(threshold);
-  } catch (err) {
-    if (err.message.includes('doclings.json not found')) throw httpError(503, err.message);
-    throw err;
-  }
-
-  res.json({
-    threshold:  result.threshold,
-    categories: result.categories.length,
-    docs: result.categories.reduce((n, c) => n + c.members.length, 0),
-  });
+  res.json(await STAGES.categorize({ threshold }).catch(err => { throw toHttp(err); }));
 }));
 
-// ── POST /api/pipeline/heuristic ─────────────────────────────────────────────
-//
-// Spawns heuristic.py.  Scores every document with BM25 top-m chunk
-// representativeness (normalised within its cluster) + IDF novelty, builds
-// the citation graph from GROBID parsedReferences (DOI + indexed fuzzy title
-// matching; no LLM), computes PageRank over that graph, and blends:
-//   final = 0.25 × BM25 + 0.75 × PageRank
-// Top-k slots are apportioned across clusters proportionally to cluster size.
-//
-// Writes data/heuristic_output.json:
-//   { k, generatedAt, topK: [...], edges: [...] }
-//
-// Run categorize before heuristic so cluster keywords are available.
-//
-// Request body:
-//   { k?: number }    number of top documents to select (default 2)
-//
-// Response (200):
-//   { k, topK: [{ docId, filename, cluster, finalScore, bm25Score,
-//                 bm25Representativeness, bm25Novelty, pagerankScore }],
-//     edges: number }
-//
-// Errors:
-//   502 — heuristic.py exited non-zero
-
+// POST /heuristic { k? }
 pipelineRouter.post('/heuristic', wrap(async (req, res) => {
   const k = parseInt(req.body?.k ?? '2', 10);
   if (!Number.isInteger(k) || k < 1) throw httpError(400, '"k" must be a positive integer');
-
-  await spawnAsync(PYTHON, [HEURISTIC_PY, '--k', String(k)]);
-
-  const output = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'heuristic_output.json'), 'utf-8'));
-  res.json({
-    k:      output.k,
-    topK:   output.topK,
-    edges:  output.edges.length,
-  });
+  res.json(await STAGES.heuristic({ k }));
 }));
 
-// ── POST /api/pipeline/build-graph ───────────────────────────────────────────
-//
-// Runs build_graph.js.  Creates document nodes and section sub-nodes for the
-// top-k documents from heuristic_output.json, adds citation edges from the
-// connectivity analysis, and adds has_section edges.
-//
-// Writes data/graph.json:
-//   { createdAt, topKDocIds, nodes: [...], edges: [...] }
-//
-// Request body:  (none)
-//
-// Response (200):
-//   { nodes: number, edges: number, docNodes: number, sectionNodes: number,
-//     citeEdges: number, sectionEdges: number }
-//
-// Errors:
-//   503 — doclings.json or heuristic_output.json not found
-
+// POST /build-graph
 pipelineRouter.post('/build-graph', wrap(async (req, res) => {
-  let graph;
-  try {
-    graph = await buildGraph();
-  } catch (err) {
-    if (/not found/i.test(err.message)) throw httpError(503, err.message);
-    throw err;
-  }
-
-  const docNodes     = graph.nodes.filter(n => n.type === 'document').length;
-  const sectionNodes = graph.nodes.filter(n => n.type === 'section').length;
-  const citeEdges    = graph.edges.filter(e => e.type === 'cites').length;
-  const sectionEdges = graph.edges.filter(e => e.type === 'has_section').length;
-
-  res.json({
-    nodes:        graph.nodes.length,
-    edges:        graph.edges.length,
-    docNodes,
-    sectionNodes,
-    citeEdges,
-    sectionEdges,
-  });
+  res.json(await STAGES.graph().catch(err => { throw toHttp(err); }));
 }));
 
-// ── POST /api/pipeline/run ───────────────────────────────────────────────────
-//
-// Runs the full pipeline in order: extract → embed → categorize → heuristic
-// → build-graph.
-//
-// Enhancement is excluded — it is per-document and must be run individually
-// via POST /enhance before uploading documents, or via the BullMQ worker.
-//
-// Stages are run sequentially; a failure in any stage stops the run and
-// returns a partial summary showing which stages completed.
-//
-// Request body:
-//   {
-//     threshold?: number,   cosine similarity for categorize (default 0.75)
-//     k?:         number,   top-k for heuristic              (default 2)
-//     force?:     boolean,  re-extract and re-embed          (default false)
-//   }
-//
-// Response (200):
-//   {
-//     stages: {
-//       extract:    { ok: boolean, extracted?: number, error?: string },
-//       embed:      { ok: boolean, chunks?: number, docs?: number, error?: string },
-//       categorize: { ok: boolean, categories?: number, error?: string },
-//       heuristic:  { ok: boolean, topK?: number, edges?: number, error?: string },
-//       graph:      { ok: boolean, nodes?: number, edges?: number, error?: string }
-//     }
-//   }
-
+// POST /run { threshold?, k?, force? } — stages 2–6 in order; a failing stage
+// stops the run and the response shows how far it got.
 pipelineRouter.post('/run', wrap(async (req, res) => {
   const {
-    // Same default the tests use: CLUSTER_SIMILARITY from .env is the single
-    // source of truth, so API runs and test runs cluster identically.
     threshold = parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
     k         = 2,
     force     = false,
@@ -448,69 +233,22 @@ pipelineRouter.post('/run', wrap(async (req, res) => {
     throw httpError(400, '"threshold" must be a number in (0, 1]');
   }
 
+  const params = {
+    extract:    { force },
+    embed:      { force },
+    categorize: { threshold },
+    heuristic:  { k },
+    graph:      {},
+  };
+
   const stages = {};
-
-  // 1 — Extract
-  try {
-    const args = [EXTRACT_PY, ...(force ? ['--force'] : [])];
-    await spawnAsync(PYTHON, args);
-    await annotateDois();
+  for (const name of STAGE_ORDER) {
     try {
-      await enrichDoclings();
+      stages[name] = { ok: true, ...(await STAGES[name](params[name])) };
     } catch (err) {
-      console.warn(`[pipeline] Crossref enrichment skipped: ${err.message}`);
+      stages[name] = { ok: false, error: err.message };
+      break;
     }
-    const report = JSON.parse(
-      await fs.readFile(path.join(DATA_DIR, 'extract_report.json'), 'utf-8'));
-    // ok = the stage ran; per-document failures are reported in errors[]
-    // without aborting the run (the successful docs still flow downstream).
-    stages.extract = {
-      ok:        true,
-      extracted: report.extracted.length,
-      skipped:   report.skipped,
-      errors:    report.errors,
-    };
-  } catch (err) {
-    stages.extract = { ok: false, error: err.message };
-    return res.json({ stages });
-  }
-
-  // 2 — Embed
-  try {
-    await embedAll({ force });
-    const store = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'embeddings.json'), 'utf-8'));
-    stages.embed = { ok: true, chunks: store.chunks.length, docs: store.metadata.totalDocs };
-  } catch (err) {
-    stages.embed = { ok: false, error: err.message };
-    return res.json({ stages });
-  }
-
-  // 3 — Categorize
-  try {
-    const result = await generateCategories(threshold);
-    stages.categorize = { ok: true, categories: result.categories.length };
-  } catch (err) {
-    stages.categorize = { ok: false, error: err.message };
-    return res.json({ stages });
-  }
-
-  // 4 — Heuristic
-  try {
-    await spawnAsync(PYTHON, [HEURISTIC_PY, '--k', String(k)]);
-    const output = JSON.parse(await fs.readFile(path.join(DATA_DIR, 'heuristic_output.json'), 'utf-8'));
-    stages.heuristic = { ok: true, topK: output.topK.length, edges: output.edges.length };
-  } catch (err) {
-    stages.heuristic = { ok: false, error: err.message };
-    return res.json({ stages });
-  }
-
-  // 5 — Build graph
-  try {
-    const graph = await buildGraph();
-    stages.graph = { ok: true, nodes: graph.nodes.length, edges: graph.edges.length };
-  } catch (err) {
-    stages.graph = { ok: false, error: err.message };
-    return res.json({ stages });
   }
 
   res.json({ stages });

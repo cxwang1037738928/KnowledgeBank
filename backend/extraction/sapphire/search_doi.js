@@ -21,7 +21,6 @@
  *
  * Exports:
  *   crossrefByDoi(doi)  — live fetch + normalize; null on definitive miss
- *   getMeta(doi)        — cache-aware single lookup (reads/writes meta.json)
  *   enrichDoclings()    — apply Crossref data to every DOI'd doc in doclings.json
  *
  * Run directly: node backend/extraction/sapphire/search_doi.js
@@ -157,39 +156,14 @@ async function saveCache(cache) {
   await fs.rename(tmp, META_PATH);
 }
 
-/**
- * Cache-aware single-DOI lookup. Returns the cached/fetched metadata object,
- * or null (a known or fresh miss). Transient errors return null WITHOUT
- * caching, so the DOI is retried on a later run.
- */
-export async function getMeta(doi) {
-  if (!doi) return null;
-  const cache = await loadCache();
-  if (Object.prototype.hasOwnProperty.call(cache, doi)) return cache[doi];
-
-  let meta;
-  try {
-    meta = await crossrefByDoi(doi);
-  } catch (err) {
-    console.warn(`[search_doi] ${doi}: ${err.message} — not cached`);
-    return null;
-  }
-  cache[doi] = meta;            // object, or null for a known miss
-  await saveCache(cache);
-  return meta;
-}
-
 // ---------------------------------------------------------------------------
 // Batch enrichment of doclings.json
 // ---------------------------------------------------------------------------
 
 /**
- * For every document in doclings.json that has metadata.doi, overlay Crossref
- * data: title / authors / abstract / citedBy replace the PDF-derived values
- * when Crossref provides them (otherwise the previous value is kept), and the
- * Crossref reference list is attached as `crossrefReferences`. The GROBID
- * `parsedReferences` used for title-based citation matching are left intact,
- * since Crossref references often lack article titles.
+ * Overlay Crossref data on every DOI'd doclings.json entry. GROBID
+ * parsedReferences stay intact — Crossref references often lack article
+ * titles, which the citation matcher needs.
  */
 export async function enrichDoclings() {
   let doclings;

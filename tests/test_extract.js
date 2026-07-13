@@ -8,17 +8,10 @@
  * Prerequisite: run test_cleaning.js first so data/documents.json and
  * data/enhanced/ are populated.
  *
- * CHANGED to match the current pipeline — two downstream stages now depend
- * on fields this test previously ignored, so it surfaces them:
- *   - metadata.title / metadata.authors — heuristic.py's citation matching
- *     (build_connectivity) requires BOTH a title and an author match to
- *     create an edge. Docs missing these produce zero incoming edges and a
- *     dead PageRank term. This test prints a corpus-wide coverage summary
- *     and warns loudly when coverage is low.
- *   - sections — chunker.js chunks along section boundaries and prefixes
- *     headings. Each .txt now includes the section outline so you can
- *     eyeball whether docling recovered real structure or one giant blob
- *     (blob docs fall back to plain sliding-window chunking).
+ * Also prints metadata coverage (title/authors/references) — low coverage
+ * means a sparse citation graph and near-uniform PageRank downstream — and
+ * each doc's section outline, to eyeball whether docling recovered real
+ * structure or one giant blob.
  *
  * Outputs:
  *   tests/test-output/text/<docId>_<name>.txt — metadata header + section

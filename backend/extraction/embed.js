@@ -71,7 +71,6 @@ export async function embedAll({ force = false } = {}) {
     return;
   }
 
-  // Load existing store to support incremental updates
   let existing = { chunks: [], metadata: {} };
   if (!force) {
     try {
@@ -79,10 +78,8 @@ export async function embedAll({ force = false } = {}) {
     } catch { /* first run */ }
   }
 
-  // A doc is "already embedded" only if its chunks are NEWER than its
-  // extraction — a re-extract (force) followed by a non-force embed used to
-  // silently keep embeddings of the old text. Compare timestamps, not just
-  // presence.
+  // A doc counts as embedded only if its chunks are newer than its extraction
+  // — presence alone would keep stale embeddings after a re-extract.
   const newestChunkAt = new Map();
   for (const c of existing.chunks) {
     const t = Date.parse(c.ingestedAt) || 0;
@@ -111,9 +108,6 @@ export async function embedAll({ force = false } = {}) {
       continue;
     }
 
-    // Structure-aware chunking: respects section boundaries, prefixes
-    // headings, emits tables whole. Falls back to plain sliding-window
-    // internally when the entry has no sections.
     const rawChunks = chunkDocument(entry, {
       chunkSize: CHUNK_SIZE,
       overlap:   CHUNK_OVERLAP,

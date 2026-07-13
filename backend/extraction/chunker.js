@@ -70,13 +70,12 @@ export function chunkText(text, chunkSize = DEFAULTS.chunkSize, overlap = DEFAUL
   if (!text || !text.trim()) return [];
   const sentences = splitSentences(text);
   const chunks = [];
-  let current = [];   // sentences in the chunk being built
+  let current = [];
   let currentWords = 0;
 
   const flush = () => {
     if (!current.length) return;
     chunks.push(current.join(' '));
-    // Carry trailing sentences forward as overlap
     let carried = [];
     let carriedWords = 0;
     for (let i = current.length - 1; i >= 0 && carriedWords < overlap; i--) {
@@ -140,9 +139,8 @@ export function chunkDocument(entry, opts = {}) {
   const { chunkSize, overlap, minSectionMerge, maxTableWords } = { ...DEFAULTS, ...opts };
   const sections = (entry.sections || []).filter((s) => (s.text || '').trim() || (s.heading || '').trim());
 
-  // Fallback: no structure available (e.g. OCR doc where docling found no headers)
   if (sections.length === 0) {
-    return chunkText(entry.text || '', chunkSize, overlap).map((text, i) => ({
+    return chunkText(entry.text || '', chunkSize, overlap).map((text) => ({
       text,
       heading: null,
       sectionIndex: null,
@@ -160,8 +158,6 @@ export function chunkDocument(entry, opts = {}) {
 
     const last = units[units.length - 1];
     if (last && wordCount(last.text) < minSectionMerge && words < minSectionMerge) {
-      // Fold this tiny section into the previous tiny one, keeping its
-      // heading inline so no structural signal is lost.
       last.text = [last.text, heading ? `${heading}. ${body}` : body]
         .filter(Boolean).join(' ');
     } else {
@@ -173,17 +169,12 @@ export function chunkDocument(entry, opts = {}) {
   const title = entry.metadata?.title || '';
   const out = [];
   for (const unit of units) {
-    // Heading prefix: "Title — Heading\n" gives the embedder document +
-    // section context without eating much of the token budget.
     const prefixParts = [title, unit.heading].filter(Boolean);
     const prefix = prefixParts.length ? `${prefixParts.join(' — ')}\n` : '';
     const prefixWords = wordCount(prefix);
 
     const bodyChunks = chunkText(unit.text, Math.max(chunkSize - prefixWords, 50), overlap);
-    if (bodyChunks.length === 0 && unit.heading) {
-      // Heading-only section (e.g. "Appendix") — still worth a stub? No: skip.
-      continue;
-    }
+    if (bodyChunks.length === 0 && unit.heading) continue;   // heading-only section
     for (const body of bodyChunks) {
       out.push({
         text: prefix + body,

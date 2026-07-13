@@ -7,3 +7,7 @@ uploads/
 /tests/test-output
 .venv/
 __pycache__/
+
+# Test artifacts + frontend build output
+tests/test_log.txt
+frontend/dist/

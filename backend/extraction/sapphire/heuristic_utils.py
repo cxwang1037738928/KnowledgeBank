@@ -9,8 +9,7 @@ writes files.
 Contents:
   Tokenisation      tokenise
   BM25              BM25, top_terms
-  Doc scoring       topm_chunk_representativeness, whole_doc_representativeness,
-                    novelty_score
+  Doc scoring       topm_chunk_representativeness, novelty_score
   Normalization     percentile_normalize
   Citation graph    build_connectivity, compute_pagerank
 """
@@ -107,43 +106,18 @@ def top_terms(bm25: BM25, n: int) -> list[str]:
 # Document scoring
 # ---------------------------------------------------------------------------
 
-def whole_doc_representativeness(bm25: BM25, doc_tokens: list[str],
-                                 query: list[str]) -> float:
-    """Original behavior: one BM25 score over the entire document. Kept for
-    comparison runs; biased toward long documents via keyword coverage."""
-    return bm25.score_tokens(doc_tokens, query)
-
-
 def topm_chunk_representativeness(bm25: BM25, doc_tokens: list[str],
                                   query: list[str], chunk_words: int,
                                   top_m: int) -> float:
     """
-    Length-robust representativeness: mean of the top-m chunk scores.
+    Mean of the top-m fixed-window BM25 scores (avgdl pinned to the window
+    size). Ranks a document on the density of its best material: whole-doc
+    scoring rewards keyword coverage, which grows with length.
 
-    The document's token stream is split into fixed windows of
-    `chunk_words` tokens; each window is BM25-scored against the cluster
-    keywords with avgdl pinned to the window size (so length
-    normalization is calibrated to chunks, not full documents); the final
-    score is the mean of the `top_m` best windows.
-
-    Why this beats whole-doc scoring: a whole-doc score rewards keyword
-    COVERAGE, which grows with length — a 100-page document contains more
-    of any keyword set than a 10-pager, even with perfect per-term length
-    normalization. Scoring fixed-size windows and keeping only the best m
-    means a document ranks on the density of its BEST material: long docs
-    get no credit for sheer volume, and (unlike a plain mean over all
-    chunks) genuinely broad documents are not punished for having
-    off-topic appendices diluting their average.
-
-    The divisor is ALWAYS top_m (missing windows count as zero), so every
-    document is graded on the same scale: "how much on-topic material do
-    you have, up to m windows' worth." Dividing by the actual window
-    count instead would hand short documents an artificial boost — a
-    150-word note with one dense window would be scored on that window
-    alone, while a paper whose equally-dense section sits among m windows
-    gets averaged down. Fixed-divisor semantics give bounded breadth
-    credit: material beyond the best m windows earns nothing, and a tiny
-    fragment cannot outrank a paper with m strong sections.
+    The divisor is ALWAYS top_m (missing windows count as zero) so every
+    document is graded on the same scale — dividing by the actual window
+    count would let a 150-word fragment with one dense window outrank a
+    paper with m strong sections.
     """
     if not doc_tokens:
         return 0.0
@@ -163,15 +137,9 @@ def topm_chunk_representativeness(bm25: BM25, doc_tokens: list[str],
 
 def novelty_score(bm25: BM25, doc_tokens: list[str]) -> float:
     """
-    Corpus-wide novelty: average IDF of a document's unique vocabulary,
-    against the full corpus. Counterweight to representativeness, which
-    on its own rewards the most TYPICAL member of a cluster.
-
-    Hapax terms (df == 1) are excluded: they carry maximum IDF but are
-    dominated by OCR artifacts, typos, and ligature damage rather than
-    genuine vocabulary — on a scanned corpus, unfiltered novelty is
-    effectively an OCR-noise detector. A term must appear in at least two
-    documents to count as novel vocabulary rather than noise.
+    Average IDF of a document's unique vocabulary — counterweight to
+    representativeness, which rewards typicality. Hapax terms (df == 1) are
+    excluded: on scanned corpora they're OCR artifacts, not vocabulary.
     """
     scoreable = [t for t in set(doc_tokens) if bm25.df.get(t, 0) >= 2]
     if not scoreable:
@@ -185,16 +153,9 @@ def novelty_score(bm25: BM25, doc_tokens: list[str]) -> float:
 
 def percentile_normalize(scores: dict[str, float]) -> dict[str, float]:
     """
-    Percentile-rank normalization to [0, 1]. Used instead of
-    max-normalization because heavy-tailed signals (PageRank especially)
-    compress everyone but the top outlier toward zero under score/max,
-    erasing the blend weights for the bulk of the corpus.
-
-    Tied raw scores receive the AVERAGE of the ranks they span (fractional
-    ranking). Without this, docs tied at PageRank's teleport floor were
-    spread across 0..k/(n-1) by dict insertion order — an arbitrary and
-    ranking-distorting tiebreak at 75% blend weight. Values are compared
-    after rounding to 12 decimals so float noise from iterative solvers
+    Percentile-rank normalization to [0, 1] (max-normalization compresses
+    heavy-tailed signals like PageRank toward zero). Ties get the average of
+    the ranks they span, compared at 12 decimals so solver float noise
     doesn't split a genuine tie.
     """
     if not scores:
@@ -222,10 +183,7 @@ def percentile_normalize(scores: dict[str, float]) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 
 def _surname(name: str) -> str:
-    """Normalized surname for author matching. Handles both citation-style
-    'Last, First' (surname before the comma) and corpus-style 'First Last'
-    (surname is the final token). Initials and punctuation are stripped so
-    'Gomez, Aidan N.' and 'Aidan N. Gomez' both yield 'gomez'."""
+    """Normalized surname: 'Gomez, Aidan N.' and 'Aidan N. Gomez' → 'gomez'."""
     name = name.strip().lower()
     if "," in name:
         name = name.split(",", 1)[0]
@@ -234,32 +192,21 @@ def _surname(name: str) -> str:
 
 
 def _norm_title(s: str) -> str:
-    """Normalize a title for containment matching: lowercase, fold all
-    punctuation/hyphens to single spaces, collapse whitespace. So
-    'BERT: Pre-training…' and 'BERT Pre training …' compare equal, and
-    double-spaced OCR titles ('ON  COMPUTABLE  NUMBERS') normalize cleanly."""
+    """Lowercase, fold punctuation to spaces, collapse whitespace."""
     return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
 
 
 def _norm_doi(doi: str) -> str:
-    """Normalize a DOI for exact comparison: lowercase (DOIs are
-    case-insensitive), strip a URL / 'doi:' prefix and trailing punctuation.
-    So 'https://doi.org/10.3762/BJOC.19.8' and '10.3762/bjoc.19.8' compare
-    equal."""
+    """Lowercase; strip URL/'doi:' prefix and trailing punctuation."""
     d = doi.strip().lower()
     d = re.sub(r"^(https?://(dx\.)?doi\.org/|doi:\s*)", "", d)
     return d.strip().rstrip(".")
 
 
 def _titles_match(key: str, ref_title: str, min_contained: int) -> bool:
-    """Bidirectional title containment with a length guard on the CONTAINED
-    side. Exact equality always matches. Proper containment only matches when
-    the contained string is at least `min_contained` chars — otherwise a short
-    generic title ('networks') spuriously hits every longer title containing
-    that word. The guard is an absolute length, not a percentage: the reverse
-    direction exists to let a clean short reference title match a corpus title
-    polluted with prefixed boilerplate, where the real title may be a small
-    fraction of the stored string."""
+    """Bidirectional containment; the contained side must be at least
+    `min_contained` chars so short generic titles ('networks') don't hit
+    every longer title containing the word."""
     if key == ref_title:
         return True
     if key in ref_title and len(key) >= min_contained:
@@ -270,10 +217,8 @@ def _titles_match(key: str, ref_title: str, min_contained: int) -> bool:
 
 
 def _index_tokens(norm_title: str) -> set[str]:
-    """Informative tokens of a normalized title, for the inverted index.
-    Stopwords and 1-2 char tokens are dropped so posting lists stay short;
-    titles made entirely of such tokens fall back to all their tokens (the
-    exact-title hash join covers them regardless)."""
+    """Informative tokens (no stopwords / 1-2 char tokens) for the inverted
+    index; all-stopword titles fall back to their full token set."""
     tokens = {t for t in norm_title.split()
               if len(t) > 2 and t not in _STOPWORDS}
     return tokens or set(norm_title.split())
@@ -282,38 +227,20 @@ def _index_tokens(norm_title: str) -> set[str]:
 def build_connectivity(doclings: dict, min_key_length: int,
                        min_contained_length: int = 15) -> dict[str, set[str]]:
     """
-    Directed citation adjacency: source_docId -> set of target_docIds it
-    cites. Edges are found in two phases, unioned together:
+    Directed citation adjacency: source_docId -> target_docIds it cites.
+    Two phases, unioned:
 
-      Phase 1 — exact DOI match (highest confidence). Crossref reference
-        lists (search_doi.js -> crossrefReferences) carry each cited work's
-        DOI; when it equals another corpus document's DOI the edge is
-        certain, needing no title/author agreement.
-      Phase 2 — fuzzy title match (fallback) over GROBID's structured
-        parsedReferences (extract.py). The reference's title must match a
-        target by bidirectional containment (via _titles_match: exact
-        equality, or proper containment where the contained side is at
-        least `min_contained_length` chars) AND — when both sides have
-        extracted authors — share at least one author surname (via
-        _surname, which bridges 'Last, First' vs 'First Last'). Keys
-        shorter than `min_key_length` are skipped as too ambiguous.
-        When both sides carry a created year (metadata.created), edges
-        pointing forward in time are rejected: a paper cannot cite a
-        target created more than a year after it (the +1 absorbs
-        preprint-vs-published skew).
+      Phase 1 — exact DOI match on crossrefReferences (certain edges).
+      Phase 2 — fuzzy title match on GROBID parsedReferences: bidirectional
+        containment (_titles_match) + shared author surname when both sides
+        have authors + created-year sanity check (a paper can't cite a
+        target created more than a year after it).
 
-    Docs without parsedReferences contribute no phase-2 edges — the old
-    Ollama fallback for raw reference strings is gone (at 10k docs it meant
-    tens of thousands of LLM calls; GROBID is the only supported parser).
-
-    Phase-2 candidates come from indexes rather than scanning every corpus
-    title per reference (O(refs x titles) dies at 10k docs): an exact hash
-    join on the normalized title, plus an inverted token index — only
-    corpus titles sharing >= 2 informative tokens with the reference title
-    (>= 1 when either side has a single informative token) are verified
-    with _titles_match. Containment implies the contained side's tokens
-    all appear in the containing side, so the token filter never drops a
-    true containment match with >= 2 informative tokens.
+    Phase-2 candidates come from an exact-title hash join plus an inverted
+    token index (>= 2 shared informative tokens, or 1 for single-token
+    titles) — never a full O(refs x titles) scan. Containment implies the
+    contained side's tokens all appear in the containing side, so the
+    token filter can't drop a true match.
     """
     title_lookup: dict[str, str] = {}          # normalized title -> doc_id
     doi_lookup: dict[str, str] = {}
@@ -325,9 +252,7 @@ def build_connectivity(doclings: dict, min_key_length: int,
         title = _norm_title(meta.get("title") or "")
         if title and len(title) >= min_key_length:
             if title in title_lookup:
-                # Two corpus docs normalize to the same title (e.g. arXiv +
-                # published version). Keep the first deterministically; edges
-                # will only ever point at that one.
+                # e.g. arXiv + published version — keep the first, deterministically
                 print(f"[heuristic] WARNING: duplicate corpus title {title!r} — "
                       f"keeping {title_lookup[title]}, ignoring {doc_id} as a citation target",
                       file=sys.stderr)
@@ -354,16 +279,12 @@ def build_connectivity(doclings: dict, min_key_length: int,
         for t in tokens:
             token_index[t].add(target_id)
         if len(tokens) == 1:
-            # A 1-token corpus title contained in a longer reference title
-            # shares only that token — it can never reach the 2-token bar.
+            # can never reach the 2-shared-token bar — tracked separately
             single_token_targets[next(iter(tokens))].add(target_id)
 
     adjacency: dict[str, set[str]] = {doc_id: set() for doc_id in doclings}
 
-    # --- Phase 1: exact DOI matching -----------------------------------------
-    # Crossref reference DOIs that resolve to a corpus document are certain
-    # citations. References without a resolvable DOI fall through to the fuzzy
-    # title phase below; the two edge sets are unioned in `adjacency`.
+    # Phase 1: exact DOI matching
     for doc_id, entry in doclings.items():
         for ref in (entry.get("crossrefReferences") or []):
             ref_doi = _norm_doi(ref.get("doi") or "")
@@ -373,7 +294,7 @@ def build_connectivity(doclings: dict, min_key_length: int,
             if target_id and target_id != doc_id:
                 adjacency[doc_id].add(target_id)
 
-    # --- Phase 2: fuzzy title matching (fallback) ----------------------------
+    # Phase 2: fuzzy title matching
     for doc_id, entry in doclings.items():
         src_year = year_of.get(doc_id)
         for ref in (entry.get("parsedReferences") or []):
@@ -381,10 +302,6 @@ def build_connectivity(doclings: dict, min_key_length: int,
             if not ref_title or len(ref_title) < min_key_length:
                 continue
 
-            # Candidate targets from the indexes: exact hash join, plus corpus
-            # titles sharing enough informative tokens for containment to be
-            # possible. Verified below with _titles_match, so candidate
-            # generation only needs recall.
             ref_tokens = _index_tokens(ref_title)
             need = 1 if len(ref_tokens) == 1 else 2
             counts = Counter()
@@ -406,24 +323,14 @@ def build_connectivity(doclings: dict, min_key_length: int,
             for target_id in candidates:
                 if target_id == doc_id:
                     continue
-                # Bidirectional containment: the corpus title inside the
-                # reference title OR vice-versa (see _titles_match). The
-                # reverse direction rescues targets whose stored title carries
-                # extra text (e.g. a copyright banner GROBID glued onto the
-                # real title); the contained-side length guard stops short
-                # generic titles ('networks') from hitting every longer title.
                 if not _titles_match(key_of[target_id], ref_title, min_contained_length):
                     continue
-                # A source can't cite a target created after it. Only enforced
-                # when both years are known; +1 year of slack absorbs
-                # preprint-vs-published and month-unknown skew.
+                # +1 year of slack absorbs preprint-vs-published skew
                 tgt_year = year_of.get(target_id)
                 if src_year and tgt_year and tgt_year > src_year + 1:
                     continue
-                # If the corpus doc has no extracted authors we can't verify
-                # via author matching — accept the title match alone rather
-                # than silently dropping the edge. If both sides have authors,
-                # require at least one surname in common.
+                # No extracted authors on the target → accept the title match
+                # alone rather than silently dropping the edge.
                 target_surnames = surnames_of.get(target_id, set())
                 if target_surnames and ref_surnames:
                     if not (ref_surnames & target_surnames):

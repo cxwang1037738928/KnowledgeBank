@@ -41,12 +41,9 @@ from datetime import datetime, timezone
 
 import requests
 
-# Force UTF-8 on our own console streams. Windows defaults stdout/stderr to
-# cp1252, so a single "→" (or any non-Latin-1 char in a title/filename) raises
-# UnicodeEncodeError mid-print. When that print sits inside the per-document
-# try/except below, the already-converted doc gets misfiled as an extraction
-# error, corrupting extract_report.json. Reconfiguring here fixes the whole
-# class of bug rather than escaping individual characters.
+# Force UTF-8 console streams: Windows defaults to cp1252, and a non-Latin-1
+# char in a print inside the per-document try/except misfiles a converted doc
+# as an extraction error.
 for _stream in (sys.stdout, sys.stderr):
     _reconfigure = getattr(_stream, "reconfigure", None)
     if callable(_reconfigure):
@@ -56,7 +53,7 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 # ---------------------------------------------------------------------------
-# Paths (resolve relative to project root — two levels up from this file)
+# Paths
 # ---------------------------------------------------------------------------
 
 ROOT         = Path(__file__).resolve().parents[3]
@@ -197,10 +194,7 @@ def _extract_tables(doc) -> list[str]:
 # ---------------------------------------------------------------------------
 # References — shared constants
 # ---------------------------------------------------------------------------
-# Single canonical definition (lowercase, for membership checks).  NOTE: the
-# old file defined this twice — once as a lowercase frozenset and once as a
-# capitalized list.  The list silently overwrote the frozenset, which broke
-# every `text.lower() in _REF_SECTION_HEADINGS` membership check.
+
 _REF_SECTION_HEADINGS = frozenset({
     "references", "bibliography", "works cited", "literature cited", "citations",
 })
@@ -283,18 +277,9 @@ _NOT_TITLE_RE = re.compile(
 
 
 def _clean_boilerplate_title(title: str) -> str | None:
-    """Strip leading copyright/publisher boilerplate sentences from a title.
-
-    GROBID's header model sometimes glues a first-page banner onto the real
-    title (the Attention Is All You Need PDF prepends 'Provided proper
-    attribution is provided, Google hereby grants permission…'). A polluted
-    title poisons everything downstream: it is prefixed into every chunk's
-    embedding, embedded into the category vector, printed in prompts, and
-    used as the citation-matching key. Split on sentence boundaries and drop
-    leading sentences that match the boilerplate patterns; only matching
-    segments are dropped, so titles that merely contain '. ' are safe.
-    Returns None when nothing survives (caller falls back to other sources).
-    """
+    """Strip leading copyright/publisher boilerplate GROBID sometimes glues
+    onto a title — a polluted title poisons chunk embeddings, category
+    vectors, and citation matching. Returns None when nothing survives."""
     parts = re.split(r'(?<=[.!?])\s+', title.strip())
     while parts and _NOT_TITLE_RE.match(parts[0]):
         parts.pop(0)
@@ -303,20 +288,12 @@ def _clean_boilerplate_title(title: str) -> str | None:
 
 
 def _llm_extract_metadata(sections: list[dict], need_authors: bool = True) -> dict | None:
-    """Extract title, authors, and abstract from the first few sections.
-
-    Title and abstract are extracted structurally (deterministic).  Small LLMs
-    are unreliable at answering "is this first heading the title?", so we don't
-    ask them — we just take the first non-skip, non-publisher heading.  Authors
-    are harder to separate from affiliations, so the LLM handles those alone.
-    Pass need_authors=False to skip the Ollama call when the caller already
-    has authors from a better source (GROBID) and only needs title/abstract.
-    """
+    """Title/abstract structurally (small LLMs are unreliable at 'is this the
+    title?'); authors via Ollama, which separates them from affiliations.
+    need_authors=False skips the LLM call when GROBID already found authors."""
     if not sections:
         return None
 
-    # Title: first non-empty heading that is not a known section keyword and
-    # does not look like a copyright/publisher notice.
     title: str | None = None
     for s in sections[:7]:
         heading = (s.get("heading") or "").strip()
@@ -326,16 +303,12 @@ def _llm_extract_metadata(sections: list[dict], need_authors: bool = True) -> di
             title = heading
             break
 
-    # Abstract: first section whose heading starts with "abstract".
     abstract: str | None = None
     for s in sections:
         if (s.get("heading") or "").lower().strip().startswith("abstract"):
             abstract = (s.get("text") or "").strip() or None
             break
 
-    # Authors: LLM on the text of the first 1-2 non-empty sections.  Author
-    # names typically appear just below the title heading.  Focused prompt so
-    # the model isn't distracted by also finding title / abstract.
     authors: list[str] = []
     candidate_parts: list[str] = []
     if need_authors:
@@ -849,11 +822,8 @@ def convert_document(doc_meta: dict) -> dict:
     full_text = doc.export_to_text()
     sections  = _extract_sections(doc)
 
-    # Metadata: GROBID (CRF) is the primary parser, merged PER FIELD — a
-    # partial GROBID header (e.g. title but authors=[]) still gets its gaps
-    # filled by the structural/LLM path, then by docling labels. The old
-    # all-or-nothing fallback kept empty GROBID fields even when the
-    # fallbacks could recover them (Turing/Shannon authors).
+    # Metadata: GROBID first, merged PER FIELD — a partial GROBID header still
+    # gets its gaps filled by the structural/LLM path, then by docling labels.
     grobid_meta = (grobid or {}).get("metadata") or {}
     title    = grobid_meta.get("title")
     authors  = grobid_meta.get("authors") or []
@@ -870,13 +840,10 @@ def convert_document(doc_meta: dict) -> dict:
         authors  = authors  or fb.get("authors") or []
         abstract = abstract or fb.get("abstract")
 
-    # Last-resort abstract: first 200 words of body text, persisted so every
-    # downstream consumer (clustering, cluster keywords) sees the same fallback
-    # instead of each re-deriving it. Crossref enrichment (search_doi.js) runs
-    # later and overwrites this whenever it has a real abstract. Title
-    # deliberately gets NO body-text fallback: the
-    # citation graph matches titles by containment, and a long snippet posing
-    # as a title would fabricate edges.
+    # Last-resort abstract: first 200 words of body text (Crossref enrichment
+    # overwrites it later). Title deliberately gets NO body-text fallback —
+    # citation matching is by containment, and a snippet posing as a title
+    # would fabricate edges.
     if not abstract:
         snippet = " ".join(full_text.split()[:200])
         if snippet:
@@ -884,10 +851,8 @@ def convert_document(doc_meta: dict) -> dict:
             print("[extract]   no abstract found — using first 200 words of body text",
                   file=sys.stderr)
 
-    # Created date: GROBID's TEI header date, else the earliest plausible date
-    # in the first-page region (NOT the whole body — in-text citation years
-    # would date every paper by its oldest reference). Crossref's issued date
-    # (search_doi.js) overwrites this when available.
+    # Created date: GROBID TEI date, else first-page scan (NOT the whole body
+    # — in-text citation years would date every paper by its oldest reference).
     created = grobid_meta.get("created") or _scan_created(full_text[:3000])
 
     metadata = {"title": title, "authors": authors, "abstract": abstract,
@@ -960,9 +925,8 @@ def run(force: bool = False) -> None:
     DOCLINGS_OUT.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8')
     print(f"[extract] Wrote {len(results)} documents to {DOCLINGS_OUT}")
 
-    # Per-run summary for the API: doclings.json can't distinguish "extracted
-    # this run" from historical entries, and failed docs never appear in it
-    # at all — the /extract route used to report errors:[] unconditionally.
+    # Per-run summary for the API: doclings.json can't distinguish this run's
+    # work from historical entries, and failed docs never appear in it.
     report = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "force":       force,

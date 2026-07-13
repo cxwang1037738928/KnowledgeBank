@@ -78,28 +78,26 @@ async function embedBatch(texts) {
   );
 }
 
-// Build the text to embed for a single document entry from doclings.json.
+// Text to embed for one doclings.json entry: title+abstract, else the first
+// 200 body words.
 function metaText(entry) {
   const title    = (entry.metadata?.title    || '').trim();
   const abstract = (entry.metadata?.abstract || '').trim();
   if (title || abstract) return [title, abstract].filter(Boolean).join('\n');
+  console.warn(`[generate_categories]   no title/abstract: ${entry.filename} — falling back to first 200 words of body text`);
   return (entry.text || '').split(/\s+/).slice(0, 200).join(' ');
 }
 
 // ---------------------------------------------------------------------------
 // TF-IDF cluster keywords — the single source of keyword truth (heuristic.py
-// reads them from categories.json rather than recomputing). Summed IDF alone
-// works for multi-doc clusters (shared distinctive terms accumulate) but
-// degenerates for single-doc clusters — every corpus-rare term ties at max
-// IDF, so the tiebreak surfaces noise. Weighting IDF by in-cluster term
-// frequency (what BM25 fundamentally does) surfaces readable keywords in both
-// cases: a distinctive term repeated within the cluster outranks a rare term
-// seen once. IDF is the same corpus statistic heuristic.py uses.
+// reads them from categories.json rather than recomputing). TF weighting
+// matters: summed IDF alone degenerates for single-doc clusters, where every
+// corpus-rare term ties at max IDF.
 // ---------------------------------------------------------------------------
 
 function bodyText(entry) {
-  // normHeading strips leading numbering ('7. References') so numbered
-  // bibliography headings don't leak reference text into the keyword pool.
+  // normHeading strips numbering ('7. References') so numbered bibliography
+  // headings don't leak reference text into the keyword pool.
   const sections = (entry?.sections || []).filter(
     (s) => !REF_HEADINGS.has(normHeading(s.heading)) && (s.text || '').trim()
   );
@@ -163,13 +161,7 @@ function dotProduct(a, b) {
   return sum;
 }
 
-/**
- * The "file closest to the category centroid": the member whose title+abstract
- * vector has the highest cosine similarity to the (L2-normalised) mean of the
- * cluster's member vectors. Reuses the vectors already embedded for clustering
- * — no chunk embeddings or extra file loads needed. Single-member clusters
- * return that lone member.
- */
+/** Member whose vector is closest to the L2-normalised cluster centroid. */
 function clusterMedoid(memberIds, vectors) {
   if (memberIds.length === 1) return memberIds[0];
 
@@ -218,17 +210,8 @@ export async function generateCategories(threshold) {
     return empty;
   }
 
-  // Embed title+abstract for every document
   console.log(`[generate_categories] Embedding title+abstract for ${docIds.length} doc(s) ...`);
-  const texts = docIds.map(id => {
-    const entry    = doclings[id];
-    const title    = (entry.metadata?.title    || '').trim();
-    const abstract = (entry.metadata?.abstract || '').trim();
-    if (!title && !abstract) {
-      console.warn(`[generate_categories]   no title/abstract: ${entry.filename || id} — falling back to first 200 words of body text`);
-    }
-    return metaText(entry);
-  });
+  const texts = docIds.map(id => metaText(doclings[id]));
   const vectors = {};
   for (let i = 0; i < docIds.length; i += BATCH_SIZE) {
     const batchIds   = docIds.slice(i, i + BATCH_SIZE);
@@ -237,14 +220,9 @@ export async function generateCategories(threshold) {
     embeddings.forEach((vec, j) => { vectors[batchIds[j]] = vec; });
   }
 
-  // Single-linkage clustering with a mutual-kNN gate: merge a pair only when
-  // cosine similarity >= threshold AND each doc is in the other's top
-  // MUTUAL_K nearest neighbours. Plain single-linkage chains at moderate
-  // thresholds — doc A links B, B links C, and a corpus-sized transitive
-  // blob forms even though A and C are unrelated. The mutuality requirement
-  // caps each doc's merge fan-out at its genuinely closest peers, so chains
-  // can only form through pairs that both sides consider near. Memory is
-  // O(n * MUTUAL_K) instead of a full similarity matrix.
+  // Single-linkage gated by mutual-kNN: merge only when sim >= threshold AND
+  // each doc is in the other's top MUTUAL_K neighbours — plain single-linkage
+  // transitively chains unrelated docs into one blob at corpus scale.
   const n = docIds.length;
   const neighbours = []; // per doc: Map(otherIdx -> sim) of its top MUTUAL_K
   for (let i = 0; i < n; i++) {
@@ -265,7 +243,6 @@ export async function generateCategories(threshold) {
     }
   }
 
-  // Collect members per cluster root
   const clusters = {};
   for (let i = 0; i < docIds.length; i++) {
     const root = uf.find(i);
@@ -273,11 +250,9 @@ export async function generateCategories(threshold) {
     clusters[root].push(docIds[i]);
   }
 
-  // Corpus-wide IDF for cluster keywords (body text, reference sections dropped)
   const tokenised = new Map(docIds.map((d) => [d, tokenise(bodyText(doclings[d]))]));
   const idf = buildIdf([...tokenised.values()]);
 
-  // Index each cluster with keywords + centroid medoid — no LLM
   const categories = Object.values(clusters).map((members, index) => {
     const medoidId = clusterMedoid(members, vectors);
     return {
@@ -303,8 +278,8 @@ export async function generateCategories(threshold) {
   await fs.mkdir(path.dirname(CATEGORIES_OUT), { recursive: true });
   await fs.writeFile(CATEGORIES_OUT, JSON.stringify(output, null, 2), 'utf-8');
 
-  // Persist the vectors for the frontend embedding-space view (corpus.js):
-  // projection + live re-clustering at any threshold, without re-embedding.
+  // Persisted so the frontend embedding view can re-cluster at any threshold
+  // without re-embedding.
   const docVectors = {
     generatedAt: output.generatedAt,
     model:       EMBED_MODEL,

@@ -110,14 +110,12 @@ def run(k: int = K) -> None:
     doc_ids   = list(doclings.keys())
     filenames = {d: doclings[d]["filename"] for d in doc_ids}
 
-    # Tokenize body text only — exclude reference sections so author names and
-    # cited-paper titles don't inflate keyword scores. Headings are normalized
-    # first ('7. References', 'REFERENCES.' → 'references') — an exact-string
-    # check silently let numbered bibliography headings through, leaking
-    # rare-author-name tokens into BM25 novelty and cluster keywords.
+    # Tokenize body text only — reference sections would leak author names and
+    # cited titles into BM25 novelty. Headings are normalized so numbered
+    # bibliography headings ('7. References') don't slip through.
     def _norm_heading(text: str) -> str:
         t = text.lower().strip()
-        t = re.sub(r'^[\divxlc]+[\.\)]?\s+', '', t)   # '7. ' / 'vii. ' / '7) '
+        t = re.sub(r'^[\divxlc]+[\.\)]?\s+', '', t)
         return t.rstrip(' .:')
 
     def _body_text(entry: dict) -> str:
@@ -131,12 +129,9 @@ def run(k: int = K) -> None:
 
     bm25 = BM25([tokenised[d] for d in doc_ids], k1=BM25_K1, b=BM25_B)
 
-    # --- Clusters + keywords from categories.json ----------------------------
-    # generate_categories.js is the single source of keyword truth (TF-IDF over
-    # cluster body text) — recomputing them here with a different formula made
-    # the two stages disagree about what each cluster is about. Docs absent
-    # from categories.json (stale file, or no file at all) form one pseudo-
-    # cluster graded against corpus-wide fallback keywords.
+    # Clusters + keywords come from categories.json (single source of keyword
+    # truth). Docs absent from it form one pseudo-cluster graded against
+    # corpus-wide fallback keywords.
     fallback_kws = top_terms(bm25, n=KEYWORDS_N)
     clusters: list[list[str]] = []      # member doc_ids per cluster
     cluster_kws: list[list[str]] = []   # keywords per cluster (parallel)
@@ -154,13 +149,8 @@ def run(k: int = K) -> None:
         clusters.append(leftover)
         cluster_kws.append(fallback_kws)
 
-    # --- BM25 component: top-m chunk representativeness + novelty ------------
-    # Representativeness is percentile-normalized WITHIN each cluster: every
-    # doc is scored against its own cluster's keywords, so raw scores are not
-    # comparable across clusters (a singleton is graded on an exam its own
-    # vocabulary wrote and trivially scores highest — its within-cluster
-    # percentile is 1.0 by definition, which the per-cluster quotas below
-    # neutralize). Novelty is a corpus-level signal, normalized globally.
+    # Representativeness: percentile-normalized within each cluster (see file
+    # header). Novelty: corpus-level, normalized globally.
     norm_repr: dict[str, float] = {}
     cluster_of: dict[str, int] = {}
     for ci, members in enumerate(clusters):
@@ -182,7 +172,6 @@ def run(k: int = K) -> None:
         for d in doc_ids
     }
 
-    # --- Citation graph + PageRank -------------------------------------------
     print("[heuristic] Building citation connectivity graph ...")
     adjacency = build_connectivity(doclings, min_key_length=MIN_KEY_LENGTH,
                                    min_contained_length=MIN_CONTAINED_TITLE)
@@ -194,7 +183,6 @@ def run(k: int = K) -> None:
         compute_pagerank(adjacency, doc_ids, damping=PAGERANK_DAMPING)
     )
 
-    # --- Combine, apportion, rank, write --------------------------------------
     scored = [
         {
             "docId":                  d,
@@ -210,18 +198,13 @@ def run(k: int = K) -> None:
     ]
 
     # Per-cluster quotas, proportional to cluster size (largest-remainder
-    # apportionment, capacity-capped): a cluster with 40% of the docs gets
-    # ~40% of the k slots, each filled by its highest-scoring members. This
-    # is what actually neutralizes the singleton bias — a singleton's
-    # within-cluster repr is 1.0 by construction, but it only competes for
-    # remainder slots.
+    # apportionment — see file header for why this neutralizes singletons).
     k = min(k, len(doc_ids))
     sizes = [len(members) for members in clusters]
     exact = [k * s / len(doc_ids) for s in sizes]
     quota = [int(e) for e in exact]
     remaining = k - sum(quota)
-    # Largest fractional remainder first; ties broken by larger cluster,
-    # then cluster index, so apportionment is deterministic run-to-run.
+    # Ties broken by larger cluster, then index — deterministic run-to-run.
     order = sorted(range(len(clusters)),
                    key=lambda ci: (-(exact[ci] - quota[ci]), -sizes[ci], ci))
     while remaining > 0:

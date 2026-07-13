@@ -1,3 +1,9 @@
+/**
+ * clean_pdf.js — PDF ingestion: validate → hash-derived docId → persist to
+ * data/documents.json → enqueue for processing (BullMQ, optional).
+ * Crawler-agnostic: any PDF enters the pipeline through here.
+ */
+
 import 'dotenv/config';
 import fs from 'fs/promises';
 import { createReadStream } from 'fs';
@@ -109,32 +115,22 @@ async function hasPDFMagicBytes(filePath) {
 // ---------------------------------------------------------------------------
 
 /**
- * Validates a PDF file without modifying any state.
- *
- * Checks:
- *  - File exists and is readable
- *  - Extension is .pdf
- *  - File size is within MAX_FILE_SIZE
- *  - Magic bytes confirm it is a real PDF (not a renamed file)
- *  - SHA-256 hash is not already present in the metadata store (duplicate guard)
- *
+ * Validates a PDF (existence, extension, size, magic bytes, duplicate hash)
+ * without modifying any state.
  * @param {string} filePath - absolute path to the file
  * @returns {Promise<{ valid: boolean, error?: string, hash?: string, fileSize?: number }>}
  */
 export async function validatePDF(filePath) {
-  // Existence + readability
   try {
     await fs.access(filePath, fs.constants.R_OK);
   } catch {
     return { valid: false, error: 'File not found or not readable.' };
   }
 
-  // Extension
   if (path.extname(filePath).toLowerCase() !== '.pdf') {
     return { valid: false, error: 'File does not have a .pdf extension.' };
   }
 
-  // File size
   const stat = await fs.stat(filePath);
   if (stat.size === 0) {
     return { valid: false, error: 'File is empty.' };
@@ -144,13 +140,11 @@ export async function validatePDF(filePath) {
     return { valid: false, error: `File size ${mb} MB exceeds the ${process.env.MAX_PDF_SIZE_MB || 50} MB limit.` };
   }
 
-  // Magic bytes
   const isRealPDF = await hasPDFMagicBytes(filePath);
   if (!isRealPDF) {
     return { valid: false, error: 'File does not appear to be a valid PDF (bad magic bytes).' };
   }
 
-  // Duplicate detection
   const hash = await computeHash(filePath);
   const store = await readMeta();
   const duplicate = Object.values(store.documents).find((d) => d.sha256 === hash);
@@ -167,53 +161,40 @@ export async function validatePDF(filePath) {
 }
 
 /**
- * Extracts PDF metadata using pdf-parse. Only pageCount is kept — the PDF Info
- * dictionary's Title/Author are unreliable (often null or junk) and unused
- * downstream; authoritative title/authors come from extract.py (GROBID → LLM →
- * docling → Crossref) into doclings.json. The parse also serves as a deeper
- * corruption check.
- * Returns null if the PDF cannot be parsed (treat as corrupted).
- *
+ * Page count via pdf-parse (doubles as a deeper corruption check). The PDF
+ * Info dictionary's Title/Author are junk-prone and unused — authoritative
+ * metadata comes from extraction. Null when the PDF cannot be parsed.
  * @param {string} filePath
  * @returns {Promise<{ pageCount: number } | null>}
  */
 export async function extractPDFMeta(filePath) {
   try {
     const buffer = await fs.readFile(filePath);
-    const result = await pdfParse(buffer, { max: 0 }); // max:0 = parse metadata only, skip full text
-    return {
-      pageCount: result.numpages,
-    };
+    const result = await pdfParse(buffer, { max: 0 }); // metadata only, skip full text
+    return { pageCount: result.numpages };
   } catch {
     return null;
   }
 }
 
 /**
- * Full ingestion pipeline for a single PDF:
- *   validate → assign doc_id → extract metadata → persist to documents.json → enqueue
- *
- * The doc_id is derived from the file's SHA-256 hash so it is stable — the same
- * physical file always produces the same ID regardless of filename or upload time.
- *
+ * Ingest one PDF: validate → docId from SHA-256 (stable across re-uploads) →
+ * persist to documents.json → enqueue.
  * @param {string} filePath - absolute path to the PDF
  * @returns {Promise<{ docId: string, status: string } | { error: string }>}
  */
 export async function ingestDocument(filePath, { enqueue = true } = {}) {
-  // 1. Validate
   const validation = await validatePDF(filePath);
   if (!validation.valid) {
     return { error: validation.error };
   }
 
-  // 2. Extract PDF metadata (also serves as a deeper corruption check)
   const pdfMeta = await extractPDFMeta(filePath);
   if (!pdfMeta) {
     return { error: 'PDF appears corrupted — could not extract page metadata.' };
   }
 
-  // 3. Build the doc record
-  const docId = validation.hash.slice(0, 16); // first 16 hex chars of SHA-256
+  const docId = validation.hash.slice(0, 16);
   const now = new Date().toISOString();
 
   /** @type {DocRecord} */
@@ -231,12 +212,11 @@ export async function ingestDocument(filePath, { enqueue = true } = {}) {
     error: null,
   };
 
-  // 4. Persist to documents.json
   const store = await readMeta();
   store.documents[docId] = record;
   await writeMeta(store);
 
-  // 5. Enqueue — skipped when enqueue:false (e.g. tests driving the pipeline directly)
+  // enqueue:false lets tests drive the pipeline directly
   if (enqueue) {
     try {
       const queue = getPDFQueue();
@@ -315,12 +295,8 @@ export async function scanAndIngestDirectory() {
   const pdfs = entries.filter((f) => path.extname(f).toLowerCase() === '.pdf');
   if (pdfs.length === 0) return [];
 
-  // Sequential on purpose. ingestDocument does read documents.json → add its
-  // record → write the whole file back; running these concurrently is a
-  // classic lost-update race — two ingests read the same snapshot and the
-  // second write erases the first one's record (and the duplicate-hash check
-  // races the same way). Ingestion is not a hot path: SHA-256 hashing
-  // dominates, so serializing costs little.
+  // Sequential on purpose: ingestDocument rewrites documents.json whole, so
+  // concurrent ingests are a lost-update race.
   const results = [];
   for (const filename of pdfs) {
     try {
