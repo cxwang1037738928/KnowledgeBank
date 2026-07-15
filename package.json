@@ -7,9 +7,10 @@
   "scripts": {
     "start": "node backend/server.js",
     "start:test": "cross-env DATA_DIR=tests/test-output node backend/server.js",
-    "dev": "node --watch backend/server.js",
-    "dev:test": "cross-env DATA_DIR=tests/test-output node --watch backend/server.js",
+    "dev": "node --watch-path=backend backend/server.js",
+    "dev:test": "cross-env DATA_DIR=tests/test-output node --watch-path=backend backend/server.js",
     "dev:web": "npm --prefix frontend run dev",
+    "dev:all": "node scripts/dev.mjs",
     "build:web": "npm --prefix frontend run build",
     "install:web": "npm --prefix frontend install",
     "install:py": ".venv\\Scripts\\python.exe -m pip install -r backend/extraction/requirements.txt",
