@@ -596,6 +596,69 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   color: var(--accent-hover);
 }
 
+/* Delete a Q/A pair — bottom-right of the reply, quiet until hovered. */
+.msg-actions { display: flex; justify-content: flex-end; margin-top: 8px; min-height: 20px; }
+
+.delete-pair {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 1px 6px;
+  cursor: pointer;
+  opacity: 0.45;
+}
+
+.delete-pair:hover, .delete-pair:focus-visible {
+  opacity: 1;
+  color: var(--danger);
+  border-color: var(--border);
+  gap: 5px;
+}
+
+.delete-mark { font-size: 14px; line-height: 1; }
+
+/* The label is the "expand": zero-width until the button is hovered. */
+.delete-label {
+  max-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  transition: max-width 0.15s ease;
+}
+
+.delete-pair:hover .delete-label, .delete-pair:focus-visible .delete-label { max-width: 120px; }
+
+.delete-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--ink-secondary);
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 8px;
+}
+
+.delete-yes, .delete-no {
+  font: inherit;
+  font-size: 11.5px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+
+.delete-yes { color: var(--danger); }
+.delete-no  { color: var(--ink-muted); }
+.delete-yes:hover, .delete-no:hover { border-color: var(--border-strong); }
+
 /* Inline [n] citation markers in assistant replies */
 .citation-group { white-space: nowrap; }
 
@@ -617,6 +680,76 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
 .citation-link:hover {
   border-color: var(--accent);
   color: var(--accent-hover);
+}
+
+/* [!] — a claim the retriever could not trace to any retrieved excerpt.
+   Sized and aligned like a citation pill so it reads as one of the family. */
+.citation-unsupported {
+  position: relative;
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--danger);
+  background: rgba(230, 103, 103, 0.14);
+  border: 1px solid var(--danger);
+  border-radius: 6px;
+  padding: 0 5px;
+  margin: 0 1.5px;
+  vertical-align: 2px;
+  line-height: 1.5;
+  cursor: help;
+}
+
+/* Hover/focus tooltip explaining the flag. A real element, not title=, so it
+   shows instantly and reads at chat-bubble size. */
+.unsupported-tip {
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%) translateY(2px);
+  width: 235px;
+  padding: 7px 10px;
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.45;
+  text-align: left;
+  color: var(--ink);
+  background: var(--elevated);
+  border: 1px solid var(--danger);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  z-index: 40;
+}
+
+/* Arrow: border-colored wedge with the surface-colored wedge inset 1.5px. */
+.unsupported-tip::before,
+.unsupported-tip::after {
+  content: '';
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  margin-left: -5px;
+  border: 5px solid transparent;
+  border-top-color: var(--danger);
+}
+.unsupported-tip::after {
+  margin-top: -1.5px;
+  border-top-color: var(--elevated);
+}
+
+.citation-unsupported:hover .unsupported-tip,
+.citation-unsupported:focus-visible .unsupported-tip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateX(-50%) translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .unsupported-tip { transition: none; }
 }
 
 .chat-status {
@@ -727,6 +860,22 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   min-height: 0;
   overflow-y: auto;
 }
+
+/* Title/author filter above the list */
+.doc-search {
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+}
+
+.doc-search::placeholder { color: var(--ink-muted); }
+/* No focus outline: the list scrolls, which clips it. The border marks focus. */
+.doc-search:focus-visible { outline: none; border-color: var(--border-strong); }
 
 .doc-item {
   font: inherit;

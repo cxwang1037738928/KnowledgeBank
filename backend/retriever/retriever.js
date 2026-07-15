@@ -29,6 +29,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { tokenise } from '../extraction/regex_utils.js';
+import { getPrompt } from '../prompts.js';
 
 const ROOT            = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR        = path.resolve(ROOT, process.env.DATA_DIR || 'data');
@@ -218,7 +219,8 @@ export async function retrieve(queryEmbedding, queryText, { topK = DEFAULT_TOP_K
  * Answer the conversation using the retrieved chunks as grounding context.
  * @param {{role: string, content: string}[]} messages — chat history, last = question
  * @param {Awaited<ReturnType<typeof retrieve>>} chunks
- * @returns {Promise<{reply: string, model: string}>}
+ * @returns {Promise<{reply: string, model: string, quotesByChunk: string[][]}>}
+ *          quotesByChunk[i] = verbatim quotes in the reply grounded by chunks[i]
  */
 export async function answer(messages, chunks) {
   const model = (process.env.REASONING_MODEL || '').trim();
@@ -233,16 +235,10 @@ export async function answer(messages, chunks) {
       `[${chunkIdx + 1}] ${chunk.filename}${chunk.heading ? ` — ${chunk.heading}` : ''}\n${chunk.text}`)
     .join('\n\n');
 
-  // The citation format is load-bearing: the frontend turns [n] into a link
-  // into the PDF, so a model that writes [n1] or names the file inline
-  // produces an answer with no working citations. Be blunt about it.
-  const system =
-    'You answer questions about a document corpus.\n\n' +
-    'Ground every claim in the context excerpts below. Cite each claim with the ' +
-    'excerpt\'s number in square brackets — exactly like [1] or [2], or [1, 3] for ' +
-    'several. Write the number alone: never [n1], never [source 1], never the ' +
-    'filename. If the context does not contain the answer, say so plainly.\n\n' +
-    'Context:\n' + context;
+  // The citation format the prompt demands is load-bearing: the frontend
+  // turns [n] into a link into the PDF, so a model that writes [n1] or names
+  // the file inline produces an answer with no working citations.
+  const system = getPrompt('chat_system', { context });
 
   // Stream so the timeout can be based on inactivity rather than total time:
   // a slow model writing a long answer is working, not hung.
@@ -316,7 +312,9 @@ export async function answer(messages, chunks) {
   }
 
   // Repair before returning: the model's numbering is a guess, not an index.
-  return { reply: repairCitations(normalizeCitations(reply.trim(), chunks.length), chunks), model };
+  const { text: repairedReply, quotesByChunk } =
+    repairCitations(normalizeCitations(reply.trim(), chunks.length), chunks);
+  return { reply: repairedReply, model, quotesByChunk };
 }
 
 // ---------------------------------------------------------------------------
@@ -335,17 +333,20 @@ const spaceless = (text) => tokenise(text || '').join('');
 
 /**
  * Which retrieved chunk does this claim actually come from?
- * A literal run of VERBATIM_RUN words outranks any amount of loose word overlap.
+ * A literal run of VERBATIM_RUN words (or the whole claim, when shorter)
+ * outranks any amount of loose word overlap; `verbatim` reports whether the
+ * winning chunk contains such a run, since quotes are only trustable verbatim.
  */
 function bestChunkFor(claim, chunkIndex) {
   const claimTokens = tokenise(claim);
-  if (claimTokens.length < 4) return { chunkIdx: -1, score: 0 };
+  if (claimTokens.length < 4) return { chunkIdx: -1, score: 0, verbatim: false };
+  const runLength = Math.min(VERBATIM_RUN, claimTokens.length);
 
-  let best = { chunkIdx: -1, score: 0 };
+  let best = { chunkIdx: -1, score: 0, verbatim: false };
   chunkIndex.forEach((indexed, chunkIdx) => {
     let verbatim = 0;
-    for (let start = 0; start + VERBATIM_RUN <= claimTokens.length; start++) {
-      if (indexed.spaceless.includes(claimTokens.slice(start, start + VERBATIM_RUN).join(''))) {
+    for (let start = 0; start + runLength <= claimTokens.length; start++) {
+      if (indexed.spaceless.includes(claimTokens.slice(start, start + runLength).join(''))) {
         verbatim = 1;
         break;
       }
@@ -353,7 +354,7 @@ function bestChunkFor(claim, chunkIndex) {
     const overlap = claimTokens.filter((token) => indexed.tokens.has(token)).length
       / claimTokens.length;
     const score = verbatim + overlap;
-    if (score > best.score) best = { chunkIdx, score };
+    if (score > best.score) best = { chunkIdx, score, verbatim: verbatim === 1 };
   });
   return best;
 }
@@ -396,13 +397,23 @@ function sentenceAround(text, markerStart, markerEnd) {
 }
 
 /**
- * Re-point every [n] at the chunk whose text the claim actually came from, and
- * delete markers no chunk supports. The model quotes one excerpt and cites
- * another (and copies the source paper's own [12]-style refs verbatim), so a
- * number in the reply cannot be trusted as an index into `chunks`.
+ * Re-point every [n] at the chunk whose text the claim actually came from. The
+ * model quotes one excerpt and cites another (and copies the source paper's own
+ * [12]-style refs verbatim), so a number in the reply cannot be trusted as an
+ * index into `chunks`.
+ *
+ * A marker no chunk supports becomes UNSUPPORTED_MARKER rather than vanishing:
+ * a silently deleted marker is indistinguishable from a claim the model simply
+ * never cited, and the reader deserves to know which claims we could not ground.
+ *
+ * Returns { text, quotesByChunk } — quotesByChunk[i] lists the verbatim quotes
+ * that grounded chunk i, so the PDF viewer can highlight the quoted lines
+ * themselves instead of guessing from query similarity.
  */
-function repairCitations(text, chunks) {
-  if (!chunks.length) return text;
+export const UNSUPPORTED_MARKER = '[!]';
+export function repairCitations(text, chunks) {
+  const quotesByChunk = chunks.map(() => []);
+  if (!chunks.length) return { text, quotesByChunk };
   const chunkIndex = chunks.map((chunk) => ({
     spaceless: spaceless(chunk.text),
     tokens: new Set(tokenise(chunk.text || '')),
@@ -424,10 +435,18 @@ function repairCitations(text, chunks) {
 
     let target = -1;
     if (quote) {
-      // A quote claims to be verbatim, so it must literally appear in a chunk.
-      // If none contains it, the model made it up — drop the marker entirely.
+      // A quote claims to be verbatim, so it must literally appear in a chunk —
+      // verbatim run required. Loose word overlap is NOT enough: a quote built
+      // from common words overlaps ~100% with many chunks, and the tie used to
+      // resolve to excerpt [1], pointing readers at an unrelated first-page
+      // passage. If no chunk contains the quote, the model made it up.
       const best = bestChunkFor(quote.span.text, chunkIndex);
-      if (best.score >= 1) target = best.chunkIdx;
+      if (best.verbatim) {
+        target = best.chunkIdx;
+        if (!quotesByChunk[target].includes(quote.span.text)) {
+          quotesByChunk[target].push(quote.span.text);
+        }
+      }
     } else {
       // Paraphrase: no literal text to match, so fall back to word overlap.
       const best = bestChunkFor(sentenceAround(text, markerStart, markerEnd), chunkIndex);
@@ -435,13 +454,18 @@ function repairCitations(text, chunks) {
     }
 
     repaired += text.slice(cursor, markerStart);
-    if (target >= 0) repaired += `[${target + 1}]`;
+    // Grounded → the real excerpt number; ungrounded → a flag the UI renders as
+    // a warning, so an unsupported claim is visible instead of silently unmarked.
+    repaired += target >= 0 ? `[${target + 1}]` : UNSUPPORTED_MARKER;
     cursor = markerEnd;
   }
   repaired += text.slice(cursor);
 
-  // Tidy what dropped markers left behind: doubled spaces, space before punctuation.
-  return repaired.replace(/ {2,}/g, ' ').replace(/ ([.,;:)])/g, '$1');
+  // Tidy spacing the rewrite may have doubled up.
+  return {
+    text: repaired.replace(/ {2,}/g, ' ').replace(/ ([.,;:)])/g, '$1'),
+    quotesByChunk,
+  };
 }
 
 /**

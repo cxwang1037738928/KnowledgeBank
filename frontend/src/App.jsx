@@ -69,18 +69,19 @@ function ComingSoon({ crawler }) {
 export default function App() {
   const [tab, setTab] = useState('chat');
   const [controlsEl, setControlsEl] = useState(null);
-  const [docTarget, setDocTarget] = useState(null);   // { docId, chunkId, nonce }
+  const [docTarget, setDocTarget] = useState(null);   // { docId, chunkId, quotes, query, nonce }
   const { crawler, setCrawler } = useCrawler();
   const live = crawler === 'sapphire';
 
   // A [n] citation (or source chip) was clicked in Chat: jump to the cited
-  // chunk in the Documents tab. query = {text, embedding} of the question
-  // that produced it — the viewer highlights only the sentences that score
-  // above threshold against it.
+  // chunk in the Documents tab. quotes = the reply's verbatim quotes this
+  // source grounds — the viewer highlights exactly those; otherwise it falls
+  // back to the chunk sentences scoring best against query = {text, embedding}.
   const openCitation = (source, query) => {
     setDocTarget({
       docId: source.docId,
       chunkId: source.chunkId,
+      quotes: source.quotes?.length ? source.quotes : null,
       query: query || null,
       nonce: Date.now(),
     });

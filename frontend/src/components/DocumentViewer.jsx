@@ -4,17 +4,19 @@
  * The sidebar (via portal) lists every indexed document; the main pane renders
  * the selected PDF with pdf.js, pages lazily rendered on scroll.
  *
- * Citation deep-links: App passes `target` = { docId, chunkId, query, nonce }
- * when a [n] marker (or source chip) is clicked in Chat. The viewer opens
- * that document, locates the chunk's text in the PDF text layer and lays a
- * light yellow highlight over it, scrolled into view. Location strategy:
+ * Citation deep-links: App passes `target` = { docId, chunkId, quotes, query,
+ * nonce } when a [n] marker (or source chip) is clicked in Chat. The viewer
+ * opens that document, locates the chunk's text in the PDF text layer and lays
+ * a light yellow highlight over it, scrolled into view. Location strategy:
  * strip the chunk's embedded heading prefix (prefixLen), normalize both
  * sides, search the chunk's recorded page range first (±1), then the whole
  * document — chunks indexed before page provenance existed still resolve.
  *
- * With `query` ({text, embedding}) present, only the chunk sentences scoring
- * above threshold against it (in-browser cosine + keyword bonus) are
- * highlighted, not the whole chunk.
+ * Highlight priority: `quotes` (the reply's verbatim quotes this citation
+ * grounds, per the backend's repair pass) when they locate on the page; else,
+ * with `query` ({text, embedding}) present, the chunk sentences scoring above
+ * threshold against it (in-browser cosine + keyword bonus); else the whole
+ * chunk.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -243,6 +245,7 @@ export default function DocumentViewer({ controlsEl, active, target }) {
   const [pageSizes, setPageSizes] = useState([]);
   const [highlights, setHighlights] = useState({});     // pageNum -> itemIds
   const [status, setStatus] = useState(null);
+  const [search, setSearch] = useState('');             // sidebar filter text
   const pageEls = useRef(new Map());
   const scrollTo = useRef(null);                        // pageNum pending scroll
 
@@ -325,10 +328,25 @@ export default function DocumentViewer({ controlsEl, active, target }) {
           const pageIndex = indexPage(textContent);
           const bodyRange = matchOnPage(pageIndex, bodyWords);
           if (bodyRange) {
-            // Default: the whole chunk. With the query available, narrow to
-            // the sentences that actually score against it.
+            // Default: the whole chunk. Best: the reply's verbatim quotes this
+            // citation grounds (backend citation repair) — highlight exactly
+            // what was quoted. Fallback: sentences scoring against the query,
+            // which for "quote me some lines" questions picks arbitrary text.
             let highlightItemIds = itemsInRange(pageIndex, bodyRange.start, bodyRange.end);
-            if (target.query?.embedding) {
+            const quoteItemIds = [];
+            for (const quoteText of target.quotes || []) {
+              const quoteJoined = normWords(quoteText).join('');
+              if (quoteJoined.length < 12) continue;
+              const quoteAt = pageIndex.joined.indexOf(
+                quoteJoined, Math.max(0, bodyRange.start - 300));
+              if (quoteAt !== -1 && quoteAt < bodyRange.end + 300) {
+                quoteItemIds.push(
+                  ...itemsInRange(pageIndex, quoteAt, quoteAt + quoteJoined.length));
+              }
+            }
+            if (quoteItemIds.length) {
+              highlightItemIds = [...new Set(quoteItemIds)];
+            } else if (target.query?.embedding) {
               const pickedSentences = await pickSentences(body, target.query, setStatus);
               if (cancelled) return;
               const sentenceItemIds = [];
@@ -376,11 +394,28 @@ export default function DocumentViewer({ controlsEl, active, target }) {
     }
   };
 
+  // Plain lexical filter: the search text must appear literally in the title or
+  // in one of the authors (case-insensitive). No stemming, no fuzziness.
+  const needle = search.trim().toLowerCase();
+  const shownDocs = (docs || []).filter((doc) => {
+    if (!needle) return true;
+    const titleAndAuthors = [doc.title || '', ...(doc.authors || [])].join(' ').toLowerCase();
+    return titleAndAuthors.includes(needle);
+  });
+
   const controls = (
     <div className="doc-list">
       <div className="control-label">Documents</div>
       {error && <div className="doc-list-error">{error}</div>}
-      {docs?.map((doc) => (
+      <input
+        className="doc-search"
+        type="search"
+        value={search}
+        placeholder="Search title or author…"
+        aria-label="Search documents by title or author"
+        onChange={(event) => setSearch(event.target.value)}
+      />
+      {shownDocs.map((doc) => (
         <button
           key={doc.docId}
           className={`doc-item ${selected === doc.docId ? 'active' : ''}`}
@@ -393,6 +428,9 @@ export default function DocumentViewer({ controlsEl, active, target }) {
           )}
         </button>
       ))}
+      {docs?.length > 0 && shownDocs.length === 0 && (
+        <div className="doc-list-error">No document matches “{search.trim()}”.</div>
+      )}
       {docs && docs.length === 0 && <div className="doc-list-error">No documents indexed yet.</div>}
     </div>
   );

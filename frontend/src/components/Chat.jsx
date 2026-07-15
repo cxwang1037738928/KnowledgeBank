@@ -20,13 +20,36 @@ async function embedQuery(text, onStatus) {
 
 // Small models drift off the [n] format even when told not to; the backend
 // normalizes what it can, and this accepts the leftovers ([n1], [#1], [ref 1]).
-const CITE_RE = /(\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*\d+(?:\s*,\s*\d+)*\s*\])/g;
+const CITE_BODY = /\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*\d+(?:\s*,\s*\d+)*\s*\]/;
+const CITE_NUMBERS_RE = /^\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*(\d+(?:\s*,\s*\d+)*)\s*\]$/;
 
-/** [n] markers → buttons that open the cited chunk in the Documents tab. */
+// The backend stamps this where a citation could not be traced to any retrieved
+// excerpt (retriever.js UNSUPPORTED_MARKER) — the claim is ungrounded.
+const UNSUPPORTED_MARKER = '[!]';
+const UNSUPPORTED_TIP =
+  'This information is hallucinated: no retrieved excerpt contains it — the model fabricated this claim.';
+
+// One capture group, so split() hands markers back interleaved with the prose.
+const SEGMENT_RE = new RegExp(`(${CITE_BODY.source}|\\[!\\])`, 'g');
+
+/** [n] markers → buttons that open the cited chunk; [!] → a fabrication warning. */
 function citeInline(text, sources, query, onCitation, keyBase) {
-  if (!sources?.length || !onCitation) return text;
-  return text.split(CITE_RE).map((part, partIdx) => {
-    const citeMatch = part.match(/^\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*(\d+(?:\s*,\s*\d+)*)\s*\]$/);
+  return text.split(SEGMENT_RE).map((part, partIdx) => {
+    if (part === UNSUPPORTED_MARKER) {
+      // Custom tooltip (not title=): the native one takes a second to appear
+      // and is easy to miss; this needs to be readable on a quick hover.
+      return (
+        <span className="citation-unsupported" key={`${keyBase}u${partIdx}`}
+              tabIndex={0} role="img" aria-label={UNSUPPORTED_TIP}>
+          !
+          <span className="unsupported-tip" role="tooltip" aria-hidden="true">
+            {UNSUPPORTED_TIP}
+          </span>
+        </span>
+      );
+    }
+    if (!sources?.length || !onCitation) return part;
+    const citeMatch = part.match(CITE_NUMBERS_RE);
     if (!citeMatch) return part;
     const sourceNumbers = citeMatch[1].split(',').map((number) => parseInt(number, 10));
     if (sourceNumbers.some((sourceNumber) => sourceNumber < 1 || sourceNumber > sources.length)) return part;
@@ -142,7 +165,7 @@ function CitedText({ text, sources, query, onCitation }) {
 /** Excerpt numbers the reply actually cites (post-repair, so they're verified). */
 function citedNumbers(text) {
   const numbers = new Set();
-  for (const marker of (text || '').matchAll(new RegExp(CITE_RE.source, 'g'))) {
+  for (const marker of (text || '').matchAll(new RegExp(CITE_BODY.source, 'g'))) {
     for (const number of marker[0].replace(/[^\d,]/g, '').split(',')) {
       if (number) numbers.add(parseInt(number, 10));
     }
@@ -179,12 +202,46 @@ function Sources({ sources, reply, query, onCitation }) {
   );
 }
 
+/**
+ * Delete control on a reply: a small × that widens on hover, then asks to
+ * confirm before removing the question/answer pair.
+ */
+function DeletePair({ confirming, onAsk, onConfirm, onCancel }) {
+  return (
+    <div className="msg-actions">
+      {confirming ? (
+        <div className="delete-confirm" role="dialog" aria-label="Confirm delete">
+          <span>Delete this response?</span>
+          <button className="delete-yes" onClick={onConfirm}>Yes</button>
+          <button className="delete-no" onClick={onCancel}>Cancel</button>
+        </div>
+      ) : (
+        <button className="delete-pair" onClick={onAsk} aria-label="Delete this pair">
+          <span className="delete-mark">×</span>
+          <span className="delete-label">delete this pair?</span>
+        </button>
+      )}
+    </div>
+  );
+}
+
 export default function Chat({ active, onCitation }) {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [status, setStatus] = useState(null);   // busy string | null
+  const [confirmingIdx, setConfirmingIdx] = useState(null);   // reply awaiting delete confirmation
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
+
+  // Drop a reply and the question above it. They leave the thread AND the
+  // history posted with the next question, so the model stops seeing them.
+  function deletePair(replyIdx) {
+    setMessages((thread) => thread.filter((message, messageIdx) => {
+      if (messageIdx === replyIdx) return false;
+      return !(messageIdx === replyIdx - 1 && message.role === 'user');
+    }));
+    setConfirmingIdx(null);
+  }
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
@@ -246,7 +303,15 @@ export default function Chat({ active, onCitation }) {
             message.role === 'user' ? (
               <div className="msg user" key={messageIdx}>{message.content}</div>
             ) : message.error ? (
-              <div className="msg assistant error" key={messageIdx}>{message.error}</div>
+              <div className="msg assistant error" key={messageIdx}>
+                {message.error}
+                <DeletePair
+                  confirming={confirmingIdx === messageIdx}
+                  onAsk={() => setConfirmingIdx(messageIdx)}
+                  onConfirm={() => deletePair(messageIdx)}
+                  onCancel={() => setConfirmingIdx(null)}
+                />
+              </div>
             ) : (
               <div className="msg assistant" key={messageIdx}>
                 <div className="msg-body">
@@ -262,6 +327,12 @@ export default function Chat({ active, onCitation }) {
                   reply={message.content}
                   query={message.query}
                   onCitation={onCitation}
+                />
+                <DeletePair
+                  confirming={confirmingIdx === messageIdx}
+                  onAsk={() => setConfirmingIdx(messageIdx)}
+                  onConfirm={() => deletePair(messageIdx)}
+                  onCancel={() => setConfirmingIdx(null)}
                 />
               </div>
             )
