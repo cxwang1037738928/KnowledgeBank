@@ -47,7 +47,9 @@ const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
 const CATEGORIES_OUT = path.join(DATA_DIR, 'categories.json');
 const VECTORS_OUT    = path.join(DATA_DIR, 'doc_vectors.json');
 
-const EMBED_MODEL = 'Xenova/all-MiniLM-L12-v2';
+// Same corpus model embed.js uses — these vectors and the chunk vectors are
+// compared against the same browser-side query vectors.
+const EMBED_MODEL = process.env.SAPPHIRE_EMBEDDING_MODEL || 'Xenova/all-MiniLM-L12-v2';
 const BATCH_SIZE  = 32;
 const KEYWORDS_N  = parseInt(process.env.KEYWORDS_N || '20', 10);
 // Mutual-kNN gate: a pair may merge only if each doc is in the other's top

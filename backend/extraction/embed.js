@@ -1,10 +1,10 @@
 /**
  * embed.js  embed all documents
  *
- * Reads data/doclings.json, chunks each document's text, generates 384-dim
- * embeddings with Xenova/all-MiniLM-L12-v2, and writes the results to
- * data/embeddings.json (overwrites — this is the authoritative embedding
- * store for the whole pipeline).
+ * Reads data/doclings.json, chunks each document's text, embeds every chunk
+ * with SAPPHIRE_EMBEDDING_MODEL (default Xenova/all-MiniLM-L12-v2, 384-dim),
+ * and writes the results to data/embeddings.json (overwrites — this is the
+ * authoritative embedding store for the whole pipeline).
  *
  * Run: node backend/extraction/embed.js
  */
@@ -21,8 +21,10 @@ const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
 const EMBEDDINGS_OUT = path.join(DATA_DIR, 'embeddings.json');
 
-const MODEL      = 'Xenova/all-MiniLM-L12-v2';
-const DIMENSIONS = 384; // all-MiniLM-L12-v2 outputs 384-dim vectors
+// Corpus embedding model for the sapphire crawler. The browser must embed
+// queries with the SAME model (CLIENT_EMBEDDING_MODEL) or retrieval compares
+// vectors from two different spaces.
+const MODEL      = process.env.SAPPHIRE_EMBEDDING_MODEL || 'Xenova/all-MiniLM-L12-v2';
 const CHUNK_SIZE    = parseInt(process.env.CHUNK_SIZE    || '180', 10);
 const CHUNK_OVERLAP = parseInt(process.env.CHUNK_OVERLAP || '30',  10);
 const BATCH_SIZE    = 32;
@@ -149,7 +151,9 @@ export async function embedAll({ force = false } = {}) {
     chunks: allChunks,
     metadata: {
       model:      MODEL,
-      dimensions: DIMENSIONS,
+      // Measured, not assumed: the model is configurable now, and a wrong
+      // hard-coded 384 would make the retriever's dimension check lie.
+      dimensions: allChunks[0]?.embedding.length ?? 0,
       created:    existing.metadata?.created || new Date().toISOString(),
       updated:    new Date().toISOString(),
       totalDocs:  new Set(allChunks.map((chunk) => chunk.docId)).size,

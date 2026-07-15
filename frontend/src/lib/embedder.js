@@ -3,8 +3,13 @@
  *
  * One lazily-created pipeline for the whole app: Chat embeds queries with it,
  * DocumentViewer embeds chunk sentences to pick which ones to highlight.
- * Must stay the same model the corpus was embedded with (backend/extraction/
- * embed.js).
+ *
+ * The model comes from CLIENT_EMBEDDING_MODEL in the root .env, baked in at
+ * build time by vite.config.js. It MUST name the same model the corpus was
+ * embedded with (SAPPHIRE_EMBEDDING_MODEL, backend/extraction/embed.js) —
+ * query and chunk vectors are compared directly, so two different models mean
+ * two different vector spaces. The retriever rejects an outright dimension
+ * mismatch; a same-size mismatch would just retrieve badly.
  *
  * The browser cache is off by design, so the model is re-fetched every
  * session — from our own backend (/models, vendored by npm run fetch:model)
@@ -12,7 +17,7 @@
  * Falls back to the HF hub with a console warning if models/ is absent.
  */
 
-export const EMBED_MODEL = 'Xenova/all-MiniLM-L12-v2';
+export const EMBED_MODEL = __CLIENT_EMBEDDING_MODEL__;
 
 let _embedder = null;
 

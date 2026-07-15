@@ -19,13 +19,16 @@
  * Run: npm run fetch:model     (idempotent; skips files already present)
  */
 
+import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const ROOT       = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MODELS_DIR = path.join(ROOT, 'models');
-const MODEL_ID   = 'Xenova/all-MiniLM-L12-v2';   // must match EMBED_MODEL in Chat.jsx
+// The model the BROWSER loads — same env var vite.config.js bakes into the app,
+// so vendoring and loading can never drift apart.
+const MODEL_ID   = process.env.CLIENT_EMBEDDING_MODEL || 'Xenova/all-MiniLM-L12-v2';
 const BASE       = `https://huggingface.co/${MODEL_ID}/resolve/main`;
 
 // quantized: true (Chat.jsx) → model_quantized.onnx, not model.onnx.
