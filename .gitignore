@@ -12,5 +12,8 @@ __pycache__/
 tests/test_log.txt
 frontend/dist/
 
+# Chat prompt/context/response log (backend/routes/chat.js)
+chat_log.txt
+
 # Vendored browser embedding model (npm run fetch:model)
 models/

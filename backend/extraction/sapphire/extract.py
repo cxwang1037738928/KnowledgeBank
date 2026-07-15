@@ -76,6 +76,28 @@ EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "ministral:3b")
 METADATA_MODEL   = os.environ.get("METADATA_MODEL",   "ministral:3b")
 METADATA_WORDS   = int(os.environ.get("METADATA_WORDS", "800"))
 
+# ---------------------------------------------------------------------------
+# Prompts — every LLM prompt lives in /prompts/prompts.json, one entry per
+# prompt: {prompt, created, function}. Same file backend/prompts.js reads on
+# the Node side.
+# ---------------------------------------------------------------------------
+
+_PROMPTS_PATH = ROOT / "prompts" / "prompts.json"
+_prompt_entries: dict | None = None
+
+
+def _get_prompt(name: str, **substitutions: str) -> str:
+    """The `prompt` template of entry `name` in prompts/prompts.json with each
+    {key} replaced. Plain replace of the named keys only (not str.format) —
+    the prompts contain literal JSON braces .format() would treat as fields."""
+    global _prompt_entries
+    if _prompt_entries is None:
+        _prompt_entries = json.loads(_PROMPTS_PATH.read_text(encoding="utf-8"))
+    text = _prompt_entries[name]["prompt"]
+    for key, value in substitutions.items():
+        text = text.replace("{" + key + "}", value)
+    return text
+
 # GROBID server (CRF models — run the lightweight image):
 #   docker run -d --name grobid --restart unless-stopped -p 8070:8070 \
 #     -e JDK_JAVA_OPTIONS="-XX:-UseContainerSupport" lfoppiano/grobid:0.8.0
@@ -336,13 +358,7 @@ def _llm_extract_metadata(sections: list[dict], need_authors: bool = True) -> di
 
     if candidate_parts:
         header_text = "\n".join(candidate_parts)
-        prompt = (
-            "Extract the author names from this academic paper header text.\n"
-            'Return ONLY a JSON array of strings, each a full author name (e.g. ["John Smith", "Jane Doe"]).\n'
-            "Ignore affiliations, email addresses, degree titles (PhD, Member IEEE, etc.), and institution names.\n"
-            "Return [] if no clear author names are present. No explanation, no extra text.\n\n"
-            f"Text:\n{header_text}"
-        )
+        prompt = _get_prompt("extract_authors", header_text=header_text)
         try:
             response = requests.post(
                 f"{OLLAMA_URL}/api/generate",
@@ -641,13 +657,13 @@ def _valid_created(year: int, month: int | None) -> bool:
 
 
 def _scan_created(text: str) -> dict | None:
-    """Earliest plausible {year, month|null} date mentioned in `text`.
+    """Closest plausible {year, month|null} date to the current date mentioned in `text`.
 
     Callers pass the first-page region only (~3000 chars: arXiv stamp,
     'Received:', journal line) — body text is full of in-text citation years
     ('(Hochreiter & Schmidhuber, 1997)') that would make every paper look as
     old as its oldest reference. Future dates are rejected via
-    _valid_created; among survivors the earliest wins, with a known month
+    _valid_created; among survivors the closest wins, with a known month
     beating an unknown one in the same year.
     """
     candidates: list[tuple[int, int | None]] = []
@@ -671,7 +687,10 @@ def _scan_created(text: str) -> dict | None:
                    if _valid_created(year, month)]
     if not valid_dates:
         return None
-    year, month = min(valid_dates, key=lambda date: (date[0], date[1] or 12))
+    # Latest surviving date wins (= closest to now, since future dates are already
+    # rejected). An unknown month sorts to 0 so a known month still beats it in
+    # the same year — with `or 12` a bare '2017' would outrank 'June 2017'.
+    year, month = max(valid_dates, key=lambda date: (date[0], date[1] or 0))
     return {"year": year, "month": month}
 
 

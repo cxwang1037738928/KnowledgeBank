@@ -18,17 +18,10 @@
  */
 
 import 'dotenv/config';
+import { getPrompt } from '../../prompts.js';
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const CLASSIFIER_MODEL = process.env.QUERY_CLASSIFIER_MODEL || 'llama3.2:1b';
-
-const SYSTEM_PROMPT = `You are a query classifier for a document retrieval system.
-Classify each user query as exactly one of:
-  "retrieval" — the query asks for specific facts, passages, or definitions that can be answered by returning relevant document excerpts.
-  "reason"    — the query requires comparing multiple documents, multi-hop reasoning, or synthesising information that spans many sources.
-
-Respond with ONLY a valid JSON object. No extra text, no markdown:
-{"type": "retrieval" | "reason", "confidence": <float 0.0–1.0>}`;
 
 // ---------------------------------------------------------------------------
 // Core classifier
@@ -45,7 +38,7 @@ export async function classifyQuery(query) {
     throw new Error('"query" must be a non-empty string');
   }
 
-  const prompt = `${SYSTEM_PROMPT}\n\nQuery: ${query.trim()}`;
+  const prompt = getPrompt('query_classifier', { query: query.trim() });
 
   const resp = await fetch(`${OLLAMA_URL}/api/generate`, {
     method: 'POST',
