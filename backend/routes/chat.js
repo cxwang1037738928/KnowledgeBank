@@ -84,7 +84,9 @@ chatRouter.post('/', wrap(async (req, res) => {
   res.json({
     reply,
     model,
-    sources: chunks.map(({ text, ...sourceMeta }, chunkIdx) =>   // full text stays server-side
+    // full text + embedding stay server-side (text is large; embedding is a
+    // grounding artifact the browser has no use for)
+    sources: chunks.map(({ text, embedding, ...sourceMeta }, chunkIdx) =>
       ({ ...sourceMeta, quotes: quotesByChunk[chunkIdx] })),
   });
 }));

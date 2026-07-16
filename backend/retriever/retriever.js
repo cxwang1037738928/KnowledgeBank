@@ -30,6 +30,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { tokenise } from '../extraction/regex_utils.js';
 import { getPrompt } from '../prompts.js';
+import { embedTexts } from './embedder.js';
 
 const ROOT            = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR        = path.resolve(ROOT, process.env.DATA_DIR || 'data');
@@ -198,16 +199,17 @@ export async function retrieve(queryEmbedding, queryText, { topK = DEFAULT_TOP_K
   const kept = scored.slice(0, topK).filter((c, idx) => idx === 0 || c.score >= cutoff);
 
   return kept.map(({ chunk, sim, boost, lex, score }) => ({
-    chunkId:  chunk.id,
-    docId:    chunk.docId,
-    filename: chunk.filename,
-    heading:  chunk.heading,
-    pages:    chunk.pages ?? null,
-    text:     chunk.text,
-    sim:      Math.round(sim * 10000) / 10000,
-    boost:    Math.round(boost * 10000) / 10000,
-    lex:      Math.round(lex * 10000) / 10000,
-    score:    Math.round(score * 10000) / 10000,
+    chunkId:   chunk.id,
+    docId:     chunk.docId,
+    filename:  chunk.filename,
+    heading:   chunk.heading,
+    pages:     chunk.pages ?? null,
+    text:      chunk.text,
+    embedding: chunk.embedding,   // kept for citation grounding; chat.js strips it from sources
+    sim:       Math.round(sim * 10000) / 10000,
+    boost:     Math.round(boost * 10000) / 10000,
+    lex:       Math.round(lex * 10000) / 10000,
+    score:     Math.round(score * 10000) / 10000,
   }));
 }
 
@@ -313,7 +315,7 @@ export async function answer(messages, chunks) {
 
   // Repair before returning: the model's numbering is a guess, not an index.
   const { text: repairedReply, quotesByChunk } =
-    repairCitations(normalizeCitations(reply.trim(), chunks.length), chunks);
+    await repairCitations(normalizeCitations(reply.trim(), chunks.length), chunks);
   return { reply: repairedReply, model, quotesByChunk };
 }
 
@@ -323,9 +325,22 @@ export async function answer(messages, chunks) {
 
 const CITE_MARKER   = /\[\s*\d+(?:\s*,\s*\d+)*\s*\]/g;
 const QUOTED_SPAN   = /["“”']([^"“”']{25,})["“”']/g;
-const VERBATIM_RUN  = 8;     // words of literal overlap that pin a claim to a chunk
-const MIN_OVERLAP   = 0.5;   // else the claim is ungrounded and the marker is dropped
+const VERBATIM_RUN  = 8;     // words of literal overlap that pin a QUOTE to a chunk
 const CLAIM_WINDOW  = 400;   // chars each side of a marker searched for its quote
+// A paraphrase (no quote marks) is grounded when EITHER signal clears its bar:
+//   - MIN_OVERLAP: fraction of the claim's content words present literally in a
+//     chunk. Catches claims that reuse the source's vocabulary.
+//   - GROUNDING_SIM: cosine between the claim and the chunk in embedding space.
+//     Catches claims reworded in the model's own words, which share few literal
+//     words but stay semantically close.
+// Both, not just cosine: a short, generic true paraphrase can score LOWER on
+// cosine than a plausible on-topic fabrication (measured: "…are enumerable"
+// 0.45 vs a fabricated "…tabulated by Babbage on the difference engine" 0.48),
+// but the true one reuses corpus words and clears MIN_OVERLAP. A claim is
+// flagged [!] only when it fails both. GROUNDING_SIM is deliberately high so
+// topical-but-unsupported claims still fall through.
+const MIN_OVERLAP   = 0.5;
+const GROUNDING_SIM = parseFloat(process.env.RETRIEVER_GROUNDING_SIM || '0.6');
 
 // Space-free comparison, same trick as the PDF viewer: immune to how each side
 // hyphenates, spaces, or line-breaks the text.
@@ -388,12 +403,36 @@ function gapTo(span, markerStart, markerEnd) {
   return 0;
 }
 
-/** The sentence a marker sits in — the claim when nothing nearby is quoted. */
+/**
+ * The claim a marker refers to, when nothing nearby is quoted. Small models
+ * routinely park the marker on its OWN line, after the sentence it supports:
+ *
+ *     - a computable number's decimal can be written down by a machine.
+ *     [1]
+ *
+ * so we can't just split on \n and take the fragment touching the marker —
+ * that fragment is the blank indentation, and the claim looks empty (which
+ * flagged every such citation as unsupported). Instead: the claim is the last
+ * NON-BLANK sentence before the marker; if it already ends a sentence (. ! ?)
+ * that is the whole claim. Only a marker sitting mid-sentence glues on the
+ * fragment that follows.
+ */
 function sentenceAround(text, markerStart, markerEnd) {
-  const before = text.slice(Math.max(0, markerStart - CLAIM_WINDOW), markerStart);
-  const after  = text.slice(markerEnd, markerEnd + CLAIM_WINDOW);
-  return (before.split(/(?<=[.!?])\s|\n/).pop() || '')
-    + (after.split(/(?<=[.!?])\s|\n/)[0] || '');
+  const sentences = (segment) => segment
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+
+  const before = sentences(text.slice(Math.max(0, markerStart - CLAIM_WINDOW), markerStart));
+  const lastBefore = before[before.length - 1] || '';
+  if (/[.!?]$/.test(lastBefore)) return lastBefore;
+
+  // Glue on only what continues the SAME line. A marker at end-of-line (or on
+  // its own line) belongs to the sentence before it — reaching into the next
+  // line pulls an unrelated claim in and tanks the grounding of both.
+  const restOfLine = text.slice(markerEnd, markerEnd + CLAIM_WINDOW).split('\n')[0];
+  const after = sentences(restOfLine);
+  return `${lastBefore} ${after[0] || ''}`.trim();
 }
 
 /**
@@ -402,44 +441,87 @@ function sentenceAround(text, markerStart, markerEnd) {
  * [12]-style refs verbatim), so a number in the reply cannot be trusted as an
  * index into `chunks`.
  *
- * A marker no chunk supports becomes UNSUPPORTED_MARKER rather than vanishing:
- * a silently deleted marker is indistinguishable from a claim the model simply
- * never cited, and the reader deserves to know which claims we could not ground.
+ * A marker no chunk supports is flagged rather than trusted or dropped: it keeps
+ * the model's own number but as [n!] (frontend renders a clickable warning), so
+ * the reader can still open what it points at while knowing we couldn't verify
+ * it. A marker with no usable number becomes a bare [!].
  *
  * Returns { text, quotesByChunk } — quotesByChunk[i] lists the verbatim quotes
  * that grounded chunk i, so the PDF viewer can highlight the quoted lines
  * themselves instead of guessing from query similarity.
+ *
+ * `embedClaims(texts) → vectors` (default: the MiniLM backend embedder) supplies
+ * the semantic side of paraphrase grounding. Injected so tests can stub it and
+ * so a caller without a model degrades to lexical-only grounding.
  */
 export const UNSUPPORTED_MARKER = '[!]';
-export function repairCitations(text, chunks) {
+export async function repairCitations(text, chunks, embedClaims = embedTexts) {
   const quotesByChunk = chunks.map(() => []);
   if (!chunks.length) return { text, quotesByChunk };
   const chunkIndex = chunks.map((chunk) => ({
     spaceless: spaceless(chunk.text),
     tokens: new Set(tokenise(chunk.text || '')),
+    embedding: chunk.embedding || null,
   }));
   const spans = quotedSpans(text);
 
-  let repaired = '';
-  let cursor = 0;
-  for (const marker of text.matchAll(CITE_MARKER)) {
+  // Resolve each marker to a quote (verbatim path) or a paraphrase claim.
+  const markers = [...text.matchAll(CITE_MARKER)].map((marker) => {
     const markerStart = marker.index;
     const markerEnd = markerStart + marker[0].length;
-
     // Cite the NEAREST quote, not the best-scoring one in the neighbourhood —
     // otherwise a strong quote two paragraphs away steals its neighbour's marker.
     const quote = spans
       .map((span) => ({ span, gap: gapTo(span, markerStart, markerEnd) }))
       .filter((candidate) => candidate.gap <= CLAIM_WINDOW)
       .sort((a, b) => a.gap - b.gap)[0];
+    const claim = quote ? null : sentenceAround(text, markerStart, markerEnd);
+    // The model's own cited excerpt(s), kept so an ungrounded marker can still
+    // link to what it points at instead of collapsing to a bare warning.
+    const citedNumbers = (marker[0].match(/\d+/g) || [])
+      .map(Number).filter((num) => num >= 1 && num <= chunks.length);
+    return { markerStart, markerEnd, quote, claim, citedNumbers };
+  });
 
+  // Batch-embed the paraphrase claims once (strip stray [n] markers first so
+  // they don't pollute the vector). Only touched when there are paraphrases,
+  // so a quotes-only reply never loads the model.
+  const claimTexts = [...new Set(markers
+    .map((marker) => marker.claim)
+    .filter((claim) => claim && claim.length >= 8)
+    .map((claim) => claim.replace(CITE_MARKER, ' ').replace(/\s+/g, ' ').trim()))];
+  const claimVectors = new Map();
+  if (claimTexts.length) {
+    try {
+      const vectors = await embedClaims(claimTexts);
+      claimTexts.forEach((claim, claimIdx) => claimVectors.set(claim, vectors[claimIdx]));
+    } catch (err) {
+      console.warn('[retriever] claim embedding failed — grounding lexically only:', err.message);
+    }
+  }
+
+  // Best chunk for a paraphrase claim by cosine, and the similarity itself.
+  const bestBySimilarity = (claim) => {
+    const vector = claimVectors.get(claim.replace(CITE_MARKER, ' ').replace(/\s+/g, ' ').trim());
+    if (!vector) return { chunkIdx: -1, sim: 0 };
+    let best = { chunkIdx: -1, sim: 0 };
+    chunkIndex.forEach((indexed, chunkIdx) => {
+      if (!indexed.embedding) return;
+      const sim = dot(vector, indexed.embedding);
+      if (sim > best.sim) best = { chunkIdx, sim };
+    });
+    return best;
+  };
+
+  let repaired = '';
+  let cursor = 0;
+  for (const { markerStart, markerEnd, quote, claim, citedNumbers } of markers) {
     let target = -1;
     if (quote) {
       // A quote claims to be verbatim, so it must literally appear in a chunk —
-      // verbatim run required. Loose word overlap is NOT enough: a quote built
-      // from common words overlaps ~100% with many chunks, and the tie used to
-      // resolve to excerpt [1], pointing readers at an unrelated first-page
-      // passage. If no chunk contains the quote, the model made it up.
+      // verbatim run required. Word overlap and cosine are NOT enough: a quote
+      // built from common words matches many chunks, and a reworded "quote" is
+      // still a fabricated quote. If no chunk contains it, the model made it up.
       const best = bestChunkFor(quote.span.text, chunkIndex);
       if (best.verbatim) {
         target = best.chunkIdx;
@@ -448,15 +530,26 @@ export function repairCitations(text, chunks) {
         }
       }
     } else {
-      // Paraphrase: no literal text to match, so fall back to word overlap.
-      const best = bestChunkFor(sentenceAround(text, markerStart, markerEnd), chunkIndex);
-      if (best.score >= MIN_OVERLAP) target = best.chunkIdx;
+      // Paraphrase: grounded if it reuses the chunk's words (lexical overlap) OR
+      // is semantically close to it (cosine). The model rewords the source, so
+      // literal overlap alone flagged genuine paraphrases as fabricated.
+      const lexical = bestChunkFor(claim, chunkIndex);
+      if (lexical.score >= MIN_OVERLAP) {
+        target = lexical.chunkIdx;
+      } else {
+        const semantic = bestBySimilarity(claim);
+        if (semantic.sim >= GROUNDING_SIM) target = semantic.chunkIdx;
+      }
     }
 
     repaired += text.slice(cursor, markerStart);
-    // Grounded → the real excerpt number; ungrounded → a flag the UI renders as
-    // a warning, so an unsupported claim is visible instead of silently unmarked.
-    repaired += target >= 0 ? `[${target + 1}]` : UNSUPPORTED_MARKER;
+    // Grounded → the verified excerpt. Ungrounded → keep the model's own
+    // citation but flag it ([n!]), so the reader can still open what it points
+    // at while seeing it's unverified; only a marker with no usable number
+    // drops to a bare [!].
+    if (target >= 0) repaired += `[${target + 1}]`;
+    else if (citedNumbers.length) repaired += `[${citedNumbers.join(', ')}!]`;
+    else repaired += UNSUPPORTED_MARKER;
     cursor = markerEnd;
   }
   repaired += text.slice(cursor);
