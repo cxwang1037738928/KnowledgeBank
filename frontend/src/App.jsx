@@ -69,19 +69,24 @@ function ComingSoon({ crawler }) {
 export default function App() {
   const [tab, setTab] = useState('chat');
   const [controlsEl, setControlsEl] = useState(null);
-  const [docTarget, setDocTarget] = useState(null);   // { docId, chunkId, quotes, query, nonce }
+  const [docTarget, setDocTarget] = useState(null);   // { docId, chunkId, quotes, citing, query, nonce }
   const { crawler, setCrawler } = useCrawler();
   const live = crawler === 'sapphire';
 
   // A [n] citation (or source chip) was clicked in Chat: jump to the cited
-  // chunk in the Documents tab. quotes = the reply's verbatim quotes this
-  // source grounds — the viewer highlights exactly those; otherwise it falls
-  // back to the chunk sentences scoring best against query = {text, embedding}.
-  const openCitation = (source, query) => {
+  // chunk in the Documents tab. `citing` = the specific sentence that [n] sat
+  // in, so the viewer highlights the part of the chunk THAT sentence refers to
+  // (a chunk cited by several sentences no longer highlights the same span for
+  // all of them). Priority in the viewer: quotes from the citing sentence →
+  // chunk sentences scoring against the citing sentence → against the query →
+  // whole chunk. Source chips pass no citing sentence and keep the old query
+  // behavior.
+  const openCitation = (source, query, citing) => {
     setDocTarget({
       docId: source.docId,
       chunkId: source.chunkId,
       quotes: source.quotes?.length ? source.quotes : null,
+      citing: citing || null,
       query: query || null,
       nonce: Date.now(),
     });

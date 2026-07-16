@@ -700,6 +700,16 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   cursor: help;
 }
 
+/* [n!] — flagged but clickable: opens the model's cited chunk, still warns. */
+.citation-unsupported-link {
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.citation-unsupported-link:hover {
+  background: rgba(230, 103, 103, 0.26);
+}
+
 /* Hover/focus tooltip explaining the flag. A real element, not title=, so it
    shows instantly and reads at chat-bubble size. */
 .unsupported-tip {

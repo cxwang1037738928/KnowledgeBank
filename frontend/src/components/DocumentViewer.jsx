@@ -4,19 +4,20 @@
  * The sidebar (via portal) lists every indexed document; the main pane renders
  * the selected PDF with pdf.js, pages lazily rendered on scroll.
  *
- * Citation deep-links: App passes `target` = { docId, chunkId, quotes, query,
- * nonce } when a [n] marker (or source chip) is clicked in Chat. The viewer
- * opens that document, locates the chunk's text in the PDF text layer and lays
- * a light yellow highlight over it, scrolled into view. Location strategy:
- * strip the chunk's embedded heading prefix (prefixLen), normalize both
- * sides, search the chunk's recorded page range first (±1), then the whole
+ * Citation deep-links: App passes `target` = { docId, chunkId, quotes, citing,
+ * query, nonce } when a [n] marker (or source chip) is clicked in Chat. The
+ * viewer opens that document, locates the chunk's text in the PDF text layer
+ * and lays a light yellow highlight over it, scrolled into view. Location
+ * strategy: strip the chunk's embedded heading prefix (prefixLen), normalize
+ * both sides, search the chunk's recorded page range first (±1), then the whole
  * document — chunks indexed before page provenance existed still resolve.
  *
- * Highlight priority: `quotes` (the reply's verbatim quotes this citation
- * grounds, per the backend's repair pass) when they locate on the page; else,
- * with `query` ({text, embedding}) present, the chunk sentences scoring above
- * threshold against it (in-browser cosine + keyword bonus); else the whole
- * chunk.
+ * Highlight priority, all scoped to the specific citation clicked (`citing` =
+ * the sentence that [n] sat in, so a chunk cited by several sentences lights a
+ * different span per citation): verbatim `quotes` contained in the citing
+ * sentence → chunk sentences scoring above threshold (in-browser cosine +
+ * keyword bonus) against the citing sentence → against `query` (chip clicks, or
+ * a citation with no claim) → the whole chunk.
  */
 
 import { useEffect, useRef, useState } from 'react';
@@ -140,16 +141,16 @@ const KEEP_RATIO = 0.6;    // keep sentences scoring ≥ 60% of the best one
  * threshold — the best sentence always survives. Empty on any failure, and
  * the caller falls back to whole-chunk highlighting.
  */
-async function pickSentences(body, query, onStatus) {
+async function pickSentences(body, focus, onStatus) {
   try {
     const sentences = splitSentences(body);
     if (sentences.length <= 1) return sentences;
     onStatus('scoring the cited passage…');
     const sentenceVectors = await embedTexts(sentences, onStatus);
-    const queryTokens = kwTokens(query.text);
+    const focusTokens = kwTokens(focus.text);
     const scores = sentences.map((sentence, sentenceIdx) => {
-      const keywordHits = [...kwTokens(sentence)].filter((token) => queryTokens.has(token)).length;
-      return dot(sentenceVectors[sentenceIdx], query.embedding) + KW_BONUS * keywordHits;
+      const keywordHits = [...kwTokens(sentence)].filter((token) => focusTokens.has(token)).length;
+      return dot(sentenceVectors[sentenceIdx], focus.embedding) + KW_BONUS * keywordHits;
     });
     const bestScore = Math.max(...scores);
     return sentences.filter(
@@ -157,6 +158,22 @@ async function pickSentences(body, query, onStatus) {
   } catch (err) {
     console.warn('[viewer] sentence scoring failed, highlighting whole chunk:', err);
     return [];
+  }
+}
+
+/**
+ * Embed the citing sentence into the same {text, embedding} shape pickSentences
+ * scores against — so a citation is highlighted by what ITS sentence says, not
+ * the whole question. Null (→ caller falls back to the query) on empty or error.
+ */
+async function embedFocus(text) {
+  if (!text || text.trim().length < 8) return null;
+  try {
+    const [embedding] = await embedTexts([text]);
+    return { text, embedding };
+  } catch (err) {
+    console.warn('[viewer] could not embed citing sentence:', err);
+    return null;
   }
 }
 
@@ -328,13 +345,26 @@ export default function DocumentViewer({ controlsEl, active, target }) {
           const pageIndex = indexPage(textContent);
           const bodyRange = matchOnPage(pageIndex, bodyWords);
           if (bodyRange) {
-            // Default: the whole chunk. Best: the reply's verbatim quotes this
-            // citation grounds (backend citation repair) — highlight exactly
-            // what was quoted. Fallback: sentences scoring against the query,
-            // which for "quote me some lines" questions picks arbitrary text.
+            // Highlight priority, all scoped to the SPECIFIC citation clicked:
+            //   1. verbatim quotes from this citation's own sentence,
+            //   2. chunk sentences scoring against the citing sentence,
+            //   3. against the query (chip clicks, or a citation with no claim),
+            //   4. the whole chunk.
+            // A chunk cited by several sentences thus highlights a different
+            // span per citation instead of the same one every time.
             let highlightItemIds = itemsInRange(pageIndex, bodyRange.start, bodyRange.end);
+
+            // Only the quotes this citation's sentence actually contains — so
+            // sentence 3's quote doesn't light up when you click sentence 1's [n].
+            const citingJoined = target.citing ? normWords(target.citing).join('') : '';
+            const relevantQuotes = (target.quotes || []).filter((quoteText) => {
+              if (!citingJoined) return true;   // chip click: no sentence to scope by
+              const quoteJoined = normWords(quoteText).join('');
+              return quoteJoined.length >= 12 && citingJoined.includes(quoteJoined);
+            });
+
             const quoteItemIds = [];
-            for (const quoteText of target.quotes || []) {
+            for (const quoteText of relevantQuotes) {
               const quoteJoined = normWords(quoteText).join('');
               if (quoteJoined.length < 12) continue;
               const quoteAt = pageIndex.joined.indexOf(
@@ -344,23 +374,28 @@ export default function DocumentViewer({ controlsEl, active, target }) {
                   ...itemsInRange(pageIndex, quoteAt, quoteAt + quoteJoined.length));
               }
             }
+
             if (quoteItemIds.length) {
               highlightItemIds = [...new Set(quoteItemIds)];
-            } else if (target.query?.embedding) {
-              const pickedSentences = await pickSentences(body, target.query, setStatus);
+            } else {
+              const focus = (await embedFocus(target.citing)) || target.query;
               if (cancelled) return;
-              const sentenceItemIds = [];
-              for (const sentence of pickedSentences) {
-                const sentenceText = normWords(sentence).join('');
-                if (sentenceText.length < 12) continue;
-                const sentenceAt = pageIndex.joined.indexOf(
-                  sentenceText, Math.max(0, bodyRange.start - 300));
-                if (sentenceAt !== -1 && sentenceAt < bodyRange.end + 300) {
-                  sentenceItemIds.push(
-                    ...itemsInRange(pageIndex, sentenceAt, sentenceAt + sentenceText.length));
+              if (focus?.embedding) {
+                const pickedSentences = await pickSentences(body, focus, setStatus);
+                if (cancelled) return;
+                const sentenceItemIds = [];
+                for (const sentence of pickedSentences) {
+                  const sentenceText = normWords(sentence).join('');
+                  if (sentenceText.length < 12) continue;
+                  const sentenceAt = pageIndex.joined.indexOf(
+                    sentenceText, Math.max(0, bodyRange.start - 300));
+                  if (sentenceAt !== -1 && sentenceAt < bodyRange.end + 300) {
+                    sentenceItemIds.push(
+                      ...itemsInRange(pageIndex, sentenceAt, sentenceAt + sentenceText.length));
+                  }
                 }
+                if (sentenceItemIds.length) highlightItemIds = [...new Set(sentenceItemIds)];
               }
-              if (sentenceItemIds.length) highlightItemIds = [...new Set(sentenceItemIds)];
             }
             setHighlights({ [pageNum]: highlightItemIds });
             setStatus(null);

@@ -23,19 +23,45 @@ async function embedQuery(text, onStatus) {
 const CITE_BODY = /\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*\d+(?:\s*,\s*\d+)*\s*\]/;
 const CITE_NUMBERS_RE = /^\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*(\d+(?:\s*,\s*\d+)*)\s*\]$/;
 
-// The backend stamps this where a citation could not be traced to any retrieved
-// excerpt (retriever.js UNSUPPORTED_MARKER) — the claim is ungrounded.
+// Ungrounded citations (retriever.js): [n!] still points at the model's cited
+// excerpt but is flagged; a bare [!] is one with no usable excerpt number.
 const UNSUPPORTED_MARKER = '[!]';
+const UNSUPPORTED_CITE = /\[\s*\d+(?:\s*,\s*\d+)*\s*!\s*\]/;
+const UNSUPPORTED_CITE_RE = /^\[\s*(\d+(?:\s*,\s*\d+)*)\s*!\s*\]$/;
 const UNSUPPORTED_TIP =
-  'This information is hallucinated: no retrieved excerpt contains it — the model fabricated this claim.';
+  'This information is possibly hallucinated. No retrieved excerpt contains this exact sentence.';
 
 // One capture group, so split() hands markers back interleaved with the prose.
-const SEGMENT_RE = new RegExp(`(${CITE_BODY.source}|\\[!\\])`, 'g');
+const SEGMENT_RE = new RegExp(`(${CITE_BODY.source}|${UNSUPPORTED_CITE.source}|\\[!\\])`, 'g');
 
-/** [n] markers → buttons that open the cited chunk; [!] → a fabrication warning. */
-function citeInline(text, sources, query, onCitation, keyBase) {
+/**
+ * The claim each marker sits in, one entry per marker occurrence ([n] and [!]
+ * alike) in document order. Clicking a specific [n] can then highlight the part
+ * of the chunk THAT sentence refers to, instead of every sentence citing the
+ * chunk. Computed per block over markdown-stripped text with markers removed.
+ */
+function markerCitingSentences(blockText) {
+  const plain = (blockText || '').replace(/\*\*|\*|`/g, '');
+  const claims = [];
+  for (const sentence of plain.split(/(?<=[.!?])\s+/)) {
+    const markerCount = (sentence.match(SEGMENT_RE) || []).length;
+    if (!markerCount) continue;
+    const claim = sentence.replace(SEGMENT_RE, ' ').replace(/\s+/g, ' ').trim();
+    for (let occurrence = 0; occurrence < markerCount; occurrence++) claims.push(claim);
+  }
+  return claims;
+}
+
+/**
+ * [n] → a button opening the cited chunk; [n!] → the same but flagged unsupported
+ * (red, with the disclaimer); [!] → a warning with no chunk to open.
+ * `ctx` = { sentences, i }: markerCitingSentences for the block, consumed one
+ * per marker in document order so each marker carries its own citing claim.
+ */
+function citeInline(text, sources, query, onCitation, keyBase, ctx) {
   return text.split(SEGMENT_RE).map((part, partIdx) => {
     if (part === UNSUPPORTED_MARKER) {
+      if (ctx) ctx.i += 1;   // keep alignment: [!] is a marker occurrence too
       // Custom tooltip (not title=): the native one takes a second to appear
       // and is easy to miss; this needs to be readable on a quick hover.
       return (
@@ -48,21 +74,41 @@ function citeInline(text, sources, query, onCitation, keyBase) {
         </span>
       );
     }
+    const unsupportedMatch = part.match(UNSUPPORTED_CITE_RE);
+    const citeMatch = unsupportedMatch || part.match(CITE_NUMBERS_RE);
+    if (!citeMatch) return part;                        // plain prose
+    const citing = ctx ? ctx.sentences[ctx.i++] : undefined;   // consume in order
     if (!sources?.length || !onCitation) return part;
-    const citeMatch = part.match(CITE_NUMBERS_RE);
-    if (!citeMatch) return part;
     const sourceNumbers = citeMatch[1].split(',').map((number) => parseInt(number, 10));
     if (sourceNumbers.some((sourceNumber) => sourceNumber < 1 || sourceNumber > sources.length)) return part;
     return (
       <span className="citation-group" key={`${keyBase}c${partIdx}`}>
         {sourceNumbers.map((sourceNumber) => {
           const source = sources[sourceNumber - 1];
+          const openChunk = () => onCitation(source, query, citing);
+          // Flagged citation: still opens the model's cited chunk, but red and
+          // carrying the disclaimer so the reader knows it's unverified.
+          if (unsupportedMatch) {
+            return (
+              <button
+                key={sourceNumber}
+                className="citation-unsupported citation-unsupported-link"
+                onClick={openChunk}
+                aria-label={`Excerpt ${sourceNumber}: ${UNSUPPORTED_TIP}`}
+              >
+                {sourceNumber}!
+                <span className="unsupported-tip" role="tooltip" aria-hidden="true">
+                  {UNSUPPORTED_TIP}
+                </span>
+              </button>
+            );
+          }
           return (
             <button
               key={sourceNumber}
               className="citation-link"
               title={`${source.filename}${source.heading ? ` — ${source.heading}` : ''}${source.pages ? ` · p.${source.pages[0]}` : ''}`}
-              onClick={() => onCitation(source, query)}
+              onClick={openChunk}
             >
               {sourceNumber}
             </button>
@@ -101,7 +147,12 @@ function inlineMd(text, keyBase, cite) {
  * as garbage. Citation markers stay clickable inside all of it.
  */
 function CitedText({ text, sources, query, onCitation }) {
-  const cite = (segment, key) => citeInline(segment, sources, query, onCitation, key);
+  // A block-scoped cite(): each block owns a fresh marker→claim counter, so a
+  // [n] in one paragraph/list-item is matched to that block's citing sentence.
+  const makeCite = (blockText) => {
+    const ctx = { sentences: markerCitingSentences(blockText), i: 0 };
+    return (segment, key) => citeInline(segment, sources, query, onCitation, key, ctx);
+  };
   const blocks = [];
   const lines = (text || '').split('\n');
 
@@ -113,7 +164,7 @@ function CitedText({ text, sources, query, onCitation }) {
     if (headingMatch) {
       const [, , headingText] = headingMatch;
       blocks.push(
-        <div className="md-h" key={lineIdx}>{inlineMd(headingText, `h${lineIdx}`, cite)}</div>
+        <div className="md-h" key={lineIdx}>{inlineMd(headingText, `h${lineIdx}`, makeCite(headingText))}</div>
       );
       continue;
     }
@@ -125,8 +176,9 @@ function CitedText({ text, sources, query, onCitation }) {
         lineIdx++;
       }
       lineIdx--;
+      const quoteText = quoteLines.join(' ');
       blocks.push(
-        <blockquote key={lineIdx}>{inlineMd(quoteLines.join(' '), `q${lineIdx}`, cite)}</blockquote>
+        <blockquote key={lineIdx}>{inlineMd(quoteText, `q${lineIdx}`, makeCite(quoteText))}</blockquote>
       );
       continue;
     }
@@ -143,7 +195,7 @@ function CitedText({ text, sources, query, onCitation }) {
       blocks.push(
         <List key={lineIdx}>
           {listItems.map((listItem, itemIdx) => (
-            <li key={itemIdx}>{inlineMd(listItem, `l${lineIdx}_${itemIdx}`, cite)}</li>
+            <li key={itemIdx}>{inlineMd(listItem, `l${lineIdx}_${itemIdx}`, makeCite(listItem))}</li>
           ))}
         </List>
       );
@@ -156,7 +208,8 @@ function CitedText({ text, sources, query, onCitation }) {
            !/^\s*(?:[-*+]|\d+[.)])\s+|^\s*>|^#{1,6}\s/.test(lines[lineIdx + 1])) {
       paragraphLines.push(lines[++lineIdx]);
     }
-    blocks.push(<p key={lineIdx}>{inlineMd(paragraphLines.join(' '), `p${lineIdx}`, cite)}</p>);
+    const paragraphText = paragraphLines.join(' ');
+    blocks.push(<p key={lineIdx}>{inlineMd(paragraphText, `p${lineIdx}`, makeCite(paragraphText))}</p>);
   }
 
   return blocks;
