@@ -125,21 +125,21 @@ const dot = (vecA, vecB) => {
 };
 
 // Plural-insensitive content tokens for the keyword bonus.
-const kwTokens = (text) => new Set(
+const keywordTokens = (text) => new Set(
   (text || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, ' ')
     .split(' ')
     .filter((word) => word.length >= 3)
     .map((word) => (word.endsWith('s') ? word.slice(0, -1) : word)),
 );
 
-const KW_BONUS   = 0.1;    // per distinct query token found in the sentence
+const KW_BONUS   = 0.1;    // per distinct focus token found in the sentence
 const KEEP_RATIO = 0.6;    // keep sentences scoring ≥ 60% of the best one
 
 /**
- * Score each sentence of the chunk body against the query (cosine of
- * in-browser embeddings + keyword-match bonus) and return the ones above
- * threshold — the best sentence always survives. Empty on any failure, and
- * the caller falls back to whole-chunk highlighting.
+ * Score each sentence of the chunk body against `focus` (the citing sentence,
+ * or the query on chip clicks) — in-browser cosine + keyword bonus — and return
+ * the ones above threshold; the best sentence always survives. Empty on any
+ * failure, and the caller falls back to whole-chunk highlighting.
  */
 async function pickSentences(body, focus, onStatus) {
   try {
@@ -147,9 +147,9 @@ async function pickSentences(body, focus, onStatus) {
     if (sentences.length <= 1) return sentences;
     onStatus('scoring the cited passage…');
     const sentenceVectors = await embedTexts(sentences, onStatus);
-    const focusTokens = kwTokens(focus.text);
+    const focusTokens = keywordTokens(focus.text);
     const scores = sentences.map((sentence, sentenceIdx) => {
-      const keywordHits = [...kwTokens(sentence)].filter((token) => focusTokens.has(token)).length;
+      const keywordHits = [...keywordTokens(sentence)].filter((token) => focusTokens.has(token)).length;
       return dot(sentenceVectors[sentenceIdx], focus.embedding) + KW_BONUS * keywordHits;
     });
     const bestScore = Math.max(...scores);
@@ -181,7 +181,7 @@ async function embedFocus(text) {
 // Single page: lazy canvas render + highlight overlay
 // ---------------------------------------------------------------------------
 
-function PdfPage({ pdf, pageNum, size, highlightIds, pageRef }) {
+function PdfPage({ pdf, pageNum, size, highlightIds, onPageEl }) {
   const holderRef = useRef(null);
   const [rendered, setRendered] = useState(null);   // { canvasUrl?, rects }
 
@@ -229,7 +229,7 @@ function PdfPage({ pdf, pageNum, size, highlightIds, pageRef }) {
   return (
     <div
       className="pdf-page"
-      ref={(holderEl) => { holderRef.current = holderEl; if (pageRef) pageRef(pageNum, holderEl); }}
+      ref={(holderEl) => { holderRef.current = holderEl; if (onPageEl) onPageEl(pageNum, holderEl); }}
       style={{ width: size.width, height: size.height }}
     >
       {rendered ? (
@@ -257,14 +257,14 @@ function PdfPage({ pdf, pageNum, size, highlightIds, pageRef }) {
 export default function DocumentViewer({ controlsEl, active, target }) {
   const [docs, setDocs] = useState(null);
   const [error, setError] = useState(null);
-  const [selected, setSelected] = useState(null);       // docId
+  const [selectedDocId, setSelectedDocId] = useState(null);
   const [pdf, setPdf] = useState(null);
   const [pageSizes, setPageSizes] = useState([]);
   const [highlights, setHighlights] = useState({});     // pageNum -> itemIds
   const [status, setStatus] = useState(null);
   const [search, setSearch] = useState('');             // sidebar filter text
   const pageEls = useRef(new Map());
-  const scrollTo = useRef(null);                        // pageNum pending scroll
+  const pendingScrollPage = useRef(null);               // pageNum to scroll to once its element mounts
 
   useEffect(() => {
     getDocuments()
@@ -274,7 +274,7 @@ export default function DocumentViewer({ controlsEl, active, target }) {
 
   // Load the selected PDF and measure every page for stable lazy-scroll.
   useEffect(() => {
-    if (!selected) return;
+    if (!selectedDocId) return;
     let cancelled = false;
     setPdf(null);
     setPageSizes([]);
@@ -285,7 +285,7 @@ export default function DocumentViewer({ controlsEl, active, target }) {
         // wasmUrl: JBIG2/JPX scans decode in wasm; without it scanned pages
         // render blank white. Vendored by npm run fetch:model.
         const doc = await pdfjsLib.getDocument({
-          url: documentPdfUrl(selected),
+          url: documentPdfUrl(selectedDocId),
           wasmUrl: '/models/pdfjs/wasm/',
           standardFontDataUrl: '/models/pdfjs/standard_fonts/',
         }).promise;
@@ -303,18 +303,18 @@ export default function DocumentViewer({ controlsEl, active, target }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [selected]);
+  }, [selectedDocId]);
 
   // Citation deep-link: open the doc, locate the chunk, highlight + scroll.
   useEffect(() => {
     if (!target) return;
     setHighlights({});
-    setSelected(target.docId);
+    setSelectedDocId(target.docId);
     setStatus('locating cited passage…');
   }, [target?.nonce]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (!target || !pdf || selected !== target.docId) return;
+    if (!target || !pdf || selectedDocId !== target.docId) return;
     let cancelled = false;
     (async () => {
       try {
@@ -399,11 +399,11 @@ export default function DocumentViewer({ controlsEl, active, target }) {
             }
             setHighlights({ [pageNum]: highlightItemIds });
             setStatus(null);
-            scrollTo.current = pageNum;
+            pendingScrollPage.current = pageNum;
             const pageEl = pageEls.current.get(pageNum);
             if (pageEl) {
               pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              scrollTo.current = null;
+              pendingScrollPage.current = null;
             }
             return;
           }
@@ -411,7 +411,7 @@ export default function DocumentViewer({ controlsEl, active, target }) {
         // Text not locatable (scanned page, heavy equations): land on the page.
         const fallbackPage = chunk.pages?.[0] ?? 1;
         setStatus('passage could not be pinpointed — showing its page');
-        scrollTo.current = fallbackPage;
+        pendingScrollPage.current = fallbackPage;
         pageEls.current.get(fallbackPage)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       } catch (err) {
         if (!cancelled) setStatus(`citation lookup failed: ${err.message}`);
@@ -423,8 +423,8 @@ export default function DocumentViewer({ controlsEl, active, target }) {
   const registerPage = (pageNum, pageEl) => {
     if (pageEl) pageEls.current.set(pageNum, pageEl);
     else pageEls.current.delete(pageNum);
-    if (pageEl && scrollTo.current === pageNum) {
-      scrollTo.current = null;
+    if (pageEl && pendingScrollPage.current === pageNum) {
+      pendingScrollPage.current = null;
       pageEl.scrollIntoView({ block: 'start' });
     }
   };
@@ -453,8 +453,8 @@ export default function DocumentViewer({ controlsEl, active, target }) {
       {shownDocs.map((doc) => (
         <button
           key={doc.docId}
-          className={`doc-item ${selected === doc.docId ? 'active' : ''}`}
-          onClick={() => { setHighlights({}); setStatus(null); setSelected(doc.docId); }}
+          className={`doc-item ${selectedDocId === doc.docId ? 'active' : ''}`}
+          onClick={() => { setHighlights({}); setStatus(null); setSelectedDocId(doc.docId); }}
           title={doc.filename}
         >
           <span className="doc-item-title">{doc.title}</span>
@@ -474,7 +474,7 @@ export default function DocumentViewer({ controlsEl, active, target }) {
     <div className="pdf-wrap">
       {active && controlsEl && createPortal(controls, controlsEl)}
       {status && <div className="pdf-status">{status}</div>}
-      {!selected ? (
+      {!selectedDocId ? (
         <div className="viz-empty">
           <h2>Documents</h2>
           <p>Pick a document from the sidebar, or click a citation in Chat to jump straight to the cited passage.</p>
@@ -485,12 +485,12 @@ export default function DocumentViewer({ controlsEl, active, target }) {
         <div className="pdf-scroll">
           {pageSizes.map((size, pageIdx) => (
             <PdfPage
-              key={`${selected}_${pageIdx + 1}`}
+              key={`${selectedDocId}_${pageIdx + 1}`}
               pdf={pdf}
               pageNum={pageIdx + 1}
               size={size}
               highlightIds={highlights[pageIdx + 1] || null}
-              pageRef={registerPage}
+              onPageEl={registerPage}
             />
           ))}
         </div>

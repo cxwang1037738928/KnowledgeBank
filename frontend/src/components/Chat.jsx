@@ -18,27 +18,28 @@ async function embedQuery(text, onStatus) {
   return queryVector;
 }
 
-// Small models drift off the [n] format even when told not to; the backend
-// normalizes what it can, and this accepts the leftovers ([n1], [#1], [ref 1]).
-const CITE_BODY = /\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*\d+(?:\s*,\s*\d+)*\s*\]/;
+// Verified citations. CITE_MARKER_RE matches a whole [n] marker (plus the
+// [n1]/[#1]/[ref 1] variants small models drift into); CITE_NUMBERS_RE anchors
+// it and captures the numbers.
+const CITE_MARKER_RE = /\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*\d+(?:\s*,\s*\d+)*\s*\]/;
 const CITE_NUMBERS_RE = /^\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*(\d+(?:\s*,\s*\d+)*)\s*\]$/;
 
 // Ungrounded citations (retriever.js): [n!] still points at the model's cited
 // excerpt but is flagged; a bare [!] is one with no usable excerpt number.
 const UNSUPPORTED_MARKER = '[!]';
-const UNSUPPORTED_CITE = /\[\s*\d+(?:\s*,\s*\d+)*\s*!\s*\]/;
-const UNSUPPORTED_CITE_RE = /^\[\s*(\d+(?:\s*,\s*\d+)*)\s*!\s*\]$/;
+const FLAGGED_CITE_RE = /\[\s*\d+(?:\s*,\s*\d+)*\s*!\s*\]/;
+const FLAGGED_NUMBERS_RE = /^\[\s*(\d+(?:\s*,\s*\d+)*)\s*!\s*\]$/;
 const UNSUPPORTED_TIP =
   'This information is possibly hallucinated. No retrieved excerpt contains this exact sentence.';
 
 // One capture group, so split() hands markers back interleaved with the prose.
-const SEGMENT_RE = new RegExp(`(${CITE_BODY.source}|${UNSUPPORTED_CITE.source}|\\[!\\])`, 'g');
+const SEGMENT_RE = new RegExp(`(${CITE_MARKER_RE.source}|${FLAGGED_CITE_RE.source}|\\[!\\])`, 'g');
 
 /**
- * The claim each marker sits in, one entry per marker occurrence ([n] and [!]
- * alike) in document order. Clicking a specific [n] can then highlight the part
- * of the chunk THAT sentence refers to, instead of every sentence citing the
- * chunk. Computed per block over markdown-stripped text with markers removed.
+ * The claim sentence each marker sits in — one entry per marker occurrence, in
+ * document order, so clicking a specific marker can highlight what ITS sentence
+ * refers to rather than every sentence citing the chunk. Works on the block's
+ * markdown-stripped text with the markers themselves removed.
  */
 function markerCitingSentences(blockText) {
   const plain = (blockText || '').replace(/\*\*|\*|`/g, '');
@@ -55,13 +56,13 @@ function markerCitingSentences(blockText) {
 /**
  * [n] → a button opening the cited chunk; [n!] → the same but flagged unsupported
  * (red, with the disclaimer); [!] → a warning with no chunk to open.
- * `ctx` = { sentences, i }: markerCitingSentences for the block, consumed one
- * per marker in document order so each marker carries its own citing claim.
+ * `claimCursor` = { claims, next }: the block's citing sentences, consumed one
+ * per marker in document order so each marker carries its own claim.
  */
-function citeInline(text, sources, query, onCitation, keyBase, ctx) {
+function citeInline(text, sources, query, onCitation, keyBase, claimCursor) {
   return text.split(SEGMENT_RE).map((part, partIdx) => {
     if (part === UNSUPPORTED_MARKER) {
-      if (ctx) ctx.i += 1;   // keep alignment: [!] is a marker occurrence too
+      if (claimCursor) claimCursor.next += 1;   // [!] is a marker occurrence too
       // Custom tooltip (not title=): the native one takes a second to appear
       // and is easy to miss; this needs to be readable on a quick hover.
       return (
@@ -74,10 +75,10 @@ function citeInline(text, sources, query, onCitation, keyBase, ctx) {
         </span>
       );
     }
-    const unsupportedMatch = part.match(UNSUPPORTED_CITE_RE);
-    const citeMatch = unsupportedMatch || part.match(CITE_NUMBERS_RE);
+    const flaggedMatch = part.match(FLAGGED_NUMBERS_RE);
+    const citeMatch = flaggedMatch || part.match(CITE_NUMBERS_RE);
     if (!citeMatch) return part;                        // plain prose
-    const citing = ctx ? ctx.sentences[ctx.i++] : undefined;   // consume in order
+    const citing = claimCursor ? claimCursor.claims[claimCursor.next++] : undefined;
     if (!sources?.length || !onCitation) return part;
     const sourceNumbers = citeMatch[1].split(',').map((number) => parseInt(number, 10));
     if (sourceNumbers.some((sourceNumber) => sourceNumber < 1 || sourceNumber > sources.length)) return part;
@@ -88,7 +89,7 @@ function citeInline(text, sources, query, onCitation, keyBase, ctx) {
           const openChunk = () => onCitation(source, query, citing);
           // Flagged citation: still opens the model's cited chunk, but red and
           // carrying the disclaimer so the reader knows it's unverified.
-          if (unsupportedMatch) {
+          if (flaggedMatch) {
             return (
               <button
                 key={sourceNumber}
@@ -147,11 +148,11 @@ function inlineMd(text, keyBase, cite) {
  * as garbage. Citation markers stay clickable inside all of it.
  */
 function CitedText({ text, sources, query, onCitation }) {
-  // A block-scoped cite(): each block owns a fresh marker→claim counter, so a
-  // [n] in one paragraph/list-item is matched to that block's citing sentence.
+  // Each block gets its own marker→claim cursor, so a [n] in one paragraph or
+  // list item is matched to that block's citing sentence, not a neighbour's.
   const makeCite = (blockText) => {
-    const ctx = { sentences: markerCitingSentences(blockText), i: 0 };
-    return (segment, key) => citeInline(segment, sources, query, onCitation, key, ctx);
+    const claimCursor = { claims: markerCitingSentences(blockText), next: 0 };
+    return (segment, key) => citeInline(segment, sources, query, onCitation, key, claimCursor);
   };
   const blocks = [];
   const lines = (text || '').split('\n');
@@ -215,10 +216,11 @@ function CitedText({ text, sources, query, onCitation }) {
   return blocks;
 }
 
-/** Excerpt numbers the reply actually cites (post-repair, so they're verified). */
+/** Excerpt numbers the reply cites with VERIFIED markers — flagged [n!] ones
+ * are deliberately excluded, so an unverified claim never earns a source chip. */
 function citedNumbers(text) {
   const numbers = new Set();
-  for (const marker of (text || '').matchAll(new RegExp(CITE_BODY.source, 'g'))) {
+  for (const marker of (text || '').matchAll(new RegExp(CITE_MARKER_RE.source, 'g'))) {
     for (const number of marker[0].replace(/[^\d,]/g, '').split(',')) {
       if (number) numbers.add(parseInt(number, 10));
     }

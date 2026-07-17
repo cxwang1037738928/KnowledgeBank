@@ -102,47 +102,44 @@ const shell2D = (point, segments = 12) =>
     return [point[0] + Math.cos(angle) * PAD, point[1] + Math.sin(angle) * PAD];
   });
 
-function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
-  const pointCount = data.points.length;
+function Scene({ embeddingMap, mode, clusterOfPoint, showHulls, onHover, hoveredIndex }) {
+  const pointCount = embeddingMap.points.length;
 
   const dotTex  = useMemo(() => makeSprite('dot'), []);
   const ringTex = useMemo(() => makeSprite('ring'), []);
 
   const positions = useMemo(() => {
     const positionArray = new Float32Array(pointCount * 3);
-    data.points.forEach((docPoint, pointIdx) => {
+    embeddingMap.points.forEach((docPoint, pointIdx) => {
       const coords = mode === '3d' ? docPoint.p3 : [...docPoint.p2, 0];
       positionArray[pointIdx * 3]     = coords[0] * SCALE;
       positionArray[pointIdx * 3 + 1] = coords[1] * SCALE;
       positionArray[pointIdx * 3 + 2] = (coords[2] || 0) * SCALE;
     });
     return positionArray;
-  }, [data, mode, pointCount]);
+  }, [embeddingMap, mode, pointCount]);
 
   const colors = useMemo(() => {
     const colorArray = new Float32Array(pointCount * 3);
     const slotColor = new THREE.Color();
     for (let pointIdx = 0; pointIdx < pointCount; pointIdx++) {
-      slotColor.set(seriesColor(assign[pointIdx]));
+      slotColor.set(seriesColor(clusterOfPoint[pointIdx]));
       colorArray[pointIdx * 3] = slotColor.r;
       colorArray[pointIdx * 3 + 1] = slotColor.g;
       colorArray[pointIdx * 3 + 2] = slotColor.b;
     }
     return colorArray;
-  }, [assign, pointCount]);
+  }, [clusterOfPoint, pointCount]);
 
-  // Clusters are drawn two ways. A cluster of MIN_BLOB+ members gets a padded
-  // convex-hull blob (hulling each member's padding shell, so the blob hugs its
-  // members and never degenerates). A cluster below that is drawn as a
-  // constellation: its members linked by MST lines in the cluster's own colour —
-  // a 2- or 3-doc category reads as a star pattern rather than a bloated
-  // capsule, which is both truer to the data and the look we want.
+  // Two treatments per cluster: MIN_BLOB+ members get a padded convex-hull blob
+  // (see shell3D/shell2D); smaller ones get MST constellation lines, so a 2-doc
+  // category reads as a star pattern instead of a bloated capsule.
   const { hulls, constellations } = useMemo(() => {
     if (!showHulls) return { hulls: [], constellations: [] };
 
     const membersBySlot = new Map();
     for (let pointIdx = 0; pointIdx < pointCount; pointIdx++) {
-      const slot = assign[pointIdx];
+      const slot = clusterOfPoint[pointIdx];
       if (slot >= SLOTS) continue;                   // "other" bucket gets neither
       if (!membersBySlot.has(slot)) membersBySlot.set(slot, []);
       membersBySlot.get(slot).push(pointIdx);
@@ -156,12 +153,12 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
 
       if (members.length < MIN_BLOB) {
         if (members.length < 2) continue;            // a lone star needs no line
-        const verts = new Float32Array(
+        const lineVertices = new Float32Array(
           mstEdges(members, positions).flatMap(([fromMember, toMember]) => [
             positions[fromMember * 3], positions[fromMember * 3 + 1], positions[fromMember * 3 + 2],
             positions[toMember * 3], positions[toMember * 3 + 1], positions[toMember * 3 + 2],
           ]));
-        constellations.push({ slot, color, verts });
+        constellations.push({ slot, color, lineVertices });
         continue;
       }
 
@@ -194,7 +191,7 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
       }
     }
     return { hulls, constellations };
-  }, [assign, positions, mode, showHulls, pointCount]);
+  }, [clusterOfPoint, positions, mode, showHulls, pointCount]);
 
   // Dispose the previous frame's geometries — the slider rebuilds these on
   // every step, and orphaned BufferGeometry leaks GPU memory.
@@ -250,7 +247,7 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
       {constellations.map((constellation) => (
         <lineSegments key={`c-${mode}-${constellation.slot}`} renderOrder={1}>
           <bufferGeometry key={`cg-${mode}-${constellation.slot}`}>
-            <bufferAttribute attach="attributes-position" args={[constellation.verts, 3]} />
+            <bufferAttribute attach="attributes-position" args={[constellation.lineVertices, 3]} />
           </bufferGeometry>
           <lineBasicMaterial
             color={constellation.color}
@@ -285,7 +282,7 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
         renderOrder={3}
         onPointerMove={(event) => {
           event.stopPropagation();
-          if (event.index !== undefined && event.index !== hoverIndex) {
+          if (event.index !== undefined && event.index !== hoveredIndex) {
             onHover(event.index, event.nativeEvent.offsetX, event.nativeEvent.offsetY);
           }
         }}
@@ -306,21 +303,21 @@ function Scene({ data, mode, assign, showHulls, onHover, hoverIndex }) {
         />
       </points>
 
-      <HoverRing positions={positions} ringTex={ringTex} mode={mode} hoveredIdx={hoverIndex} />
+      <HoverRing positions={positions} ringTex={ringTex} mode={mode} hoveredIndex={hoveredIndex} />
     </>
   );
 }
 
 // Camera-facing ring on the hovered doc — the "surface ring on overlapping
 // marks" treatment, adapted to a point cloud.
-function HoverRing({ positions, ringTex, mode, hoveredIdx }) {
-  if (hoveredIdx < 0 || hoveredIdx * 3 >= positions.length) return null;
+function HoverRing({ positions, ringTex, mode, hoveredIndex }) {
+  if (hoveredIndex < 0 || hoveredIndex * 3 >= positions.length) return null;
   const hoveredPosition = new Float32Array([
-    positions[hoveredIdx * 3], positions[hoveredIdx * 3 + 1], positions[hoveredIdx * 3 + 2],
+    positions[hoveredIndex * 3], positions[hoveredIndex * 3 + 1], positions[hoveredIndex * 3 + 2],
   ]);
   return (
     <points renderOrder={4}>
-      <bufferGeometry key={hoveredIdx}>
+      <bufferGeometry key={hoveredIndex}>
         <bufferAttribute attach="attributes-position" args={[hoveredPosition, 3]} />
       </bufferGeometry>
       <pointsMaterial
@@ -337,7 +334,7 @@ function HoverRing({ positions, ringTex, mode, hoveredIdx }) {
 }
 
 export default function EmbeddingSpace({ controlsEl, active }) {
-  const [data, setData] = useState(null);
+  const [embeddingMap, setEmbeddingMap] = useState(null);
   const [error, setError] = useState(null);
   const [threshold, setThreshold] = useState(0.5);
   const [mode, setMode] = useState('3d');
@@ -346,17 +343,17 @@ export default function EmbeddingSpace({ controlsEl, active }) {
 
   useEffect(() => {
     getEmbeddingMap()
-      .then((embeddingMap) => {
-        setData(embeddingMap);
-        setThreshold(embeddingMap.defaultThreshold ?? 0.5);
+      .then((loadedMap) => {
+        setEmbeddingMap(loadedMap);
+        setThreshold(loadedMap.defaultThreshold ?? 0.5);
       })
       .catch((err) => setError(err.message));
   }, []);
 
-  const { assign, clusters } = useMemo(() => {
-    if (!data) return { assign: new Int32Array(0), clusters: [] };
-    return clusterize(data.points.length, data.edges, threshold);
-  }, [data, threshold]);
+  const { clusterOfPoint, clusters } = useMemo(() => {
+    if (!embeddingMap) return { clusterOfPoint: new Int32Array(0), clusters: [] };
+    return clusterize(embeddingMap.points.length, embeddingMap.edges, threshold);
+  }, [embeddingMap, threshold]);
 
   const onHover = (index, x, y) =>
     setTooltip(index >= 0 ? { index, x, y } : null);
@@ -370,7 +367,7 @@ export default function EmbeddingSpace({ controlsEl, active }) {
       </div>
     );
   }
-  if (!data) return <div className="viz-empty"><p>Loading embedding space…</p></div>;
+  if (!embeddingMap) return <div className="viz-empty"><p>Loading embedding space…</p></div>;
 
   const controls = (
     <>
@@ -412,7 +409,7 @@ export default function EmbeddingSpace({ controlsEl, active }) {
       </label>
 
       <div>
-        <span className="control-label">Categories · {data.points.length} docs</span>
+        <span className="control-label">Categories · {embeddingMap.points.length} docs</span>
         <div className="legend">
           {clusters.slice(0, SLOTS).map((cluster) => (
             <div className="legend-row" key={cluster.index}>
@@ -420,8 +417,8 @@ export default function EmbeddingSpace({ controlsEl, active }) {
                 className="legend-swatch"
                 style={{ background: seriesColor(cluster.index), color: seriesColor(cluster.index) }}
               />
-              <span className="legend-title" title={data.points[cluster.members[0]].title}>
-                {data.points[cluster.members[0]].title}
+              <span className="legend-title" title={embeddingMap.points[cluster.members[0]].title}>
+                {embeddingMap.points[cluster.members[0]].title}
               </span>
               <span className="legend-count">{cluster.members.length}</span>
             </div>
@@ -452,19 +449,19 @@ export default function EmbeddingSpace({ controlsEl, active }) {
         dpr={[1, 2]}
       >
         <Scene
-          data={data}
+          embeddingMap={embeddingMap}
           mode={mode}
-          assign={assign}
+          clusterOfPoint={clusterOfPoint}
           showHulls={showHulls}
           onHover={onHover}
-          hoverIndex={tooltip ? tooltip.index : -1}
+          hoveredIndex={tooltip ? tooltip.index : -1}
         />
       </Canvas>
 
       {tooltip && (
         <div className="viz-tooltip" style={{ left: tooltip.x, top: tooltip.y }}>
-          <div>{data.points[tooltip.index].title}</div>
-          <div className="sub">{data.points[tooltip.index].filename}</div>
+          <div>{embeddingMap.points[tooltip.index].title}</div>
+          <div className="sub">{embeddingMap.points[tooltip.index].filename}</div>
         </div>
       )}
 

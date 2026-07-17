@@ -27,10 +27,10 @@ class UnionFind {
 }
 
 /**
- * Cluster `n` points with edges filtered at `threshold`.
- * Returns { assign, clusters }: `assign[i]` is a dense cluster index ordered
- * by cluster size (0 = largest — stable palette slots for the biggest
- * clusters), `clusters` is [{ index, members }] in that same order.
+ * Cluster `pointCount` points with edges filtered at `threshold`.
+ * Returns { clusterOfPoint, clusters }: `clusterOfPoint[i]` is a dense cluster
+ * index ordered by cluster size (0 = largest — stable palette slots for the
+ * biggest clusters), `clusters` is [{ index, members }] in that same order.
  */
 export function clusterize(pointCount, edges, threshold) {
   const unionFind = new UnionFind(pointCount);
@@ -51,10 +51,10 @@ export function clusterize(pointCount, edges, threshold) {
     (groupA, groupB) => groupB.length - groupA.length || groupA[0] - groupB[0]
   );
 
-  const assign = new Int32Array(pointCount);
+  const clusterOfPoint = new Int32Array(pointCount);
   groups.forEach((members, clusterIdx) => {
-    for (const memberIdx of members) assign[memberIdx] = clusterIdx;
+    for (const memberIdx of members) clusterOfPoint[memberIdx] = clusterIdx;
   });
 
-  return { assign, clusters: groups.map((members, index) => ({ index, members })) };
+  return { clusterOfPoint, clusters: groups.map((members, index) => ({ index, members })) };
 }

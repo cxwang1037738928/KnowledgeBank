@@ -11,23 +11,23 @@ const ROLE_LABELS = {
 
 function RoleCard({ role, description, value, installed, onSaved }) {
   const [draft, setDraft] = useState(value || '');
-  const [state, setState] = useState('idle'); // idle | saving | ok | err
-  const [message, setMessage] = useState('');
+  const [saveState, setSaveState] = useState('idle'); // idle | saving | ok | err
+  const [saveMessage, setSaveMessage] = useState('');
 
   useEffect(() => { setDraft(value || ''); }, [value]);
 
   const dirty = draft.trim() !== (value || '');
 
   const apply = async () => {
-    setState('saving');
+    setSaveState('saving');
     try {
       const saved = await saveSettings({ [role]: draft.trim() });
       onSaved(saved.roles);
-      setState('ok');
-      setMessage('Saved to .env');
+      setSaveState('ok');
+      setSaveMessage('Saved to .env');
     } catch (err) {
-      setState('err');
-      setMessage(err.message);
+      setSaveState('err');
+      setSaveMessage(err.message);
     }
   };
 
@@ -41,15 +41,15 @@ function RoleCard({ role, description, value, installed, onSaved }) {
           list="installed-models"
           value={draft}
           placeholder="model name, e.g. phi4"
-          onChange={(event) => { setDraft(event.target.value); setState('idle'); }}
+          onChange={(event) => { setDraft(event.target.value); setSaveState('idle'); }}
           aria-label={`${ROLE_LABELS[role] || role} model`}
         />
-        <button className="btn" onClick={apply} disabled={!dirty || !draft.trim() || state === 'saving'}>
-          {state === 'saving' ? 'Saving…' : 'Apply'}
+        <button className="btn" onClick={apply} disabled={!dirty || !draft.trim() || saveState === 'saving'}>
+          {saveState === 'saving' ? 'Saving…' : 'Apply'}
         </button>
       </div>
-      {state === 'ok' && !dirty && <p className="save-note ok">✓ {message}</p>}
-      {state === 'err' && <p className="save-note err">{message}</p>}
+      {saveState === 'ok' && !dirty && <p className="save-note ok">✓ {saveMessage}</p>}
+      {saveState === 'err' && <p className="save-note err">{saveMessage}</p>}
       {installed.length > 0 && value && !installed.includes(value) && (
         <p className="save-note" style={{ color: 'var(--ink-muted)' }}>
           Current model isn’t in Ollama’s installed list.
@@ -60,15 +60,15 @@ function RoleCard({ role, description, value, installed, onSaved }) {
 }
 
 export default function ModelsPanel() {
-  const [info, setInfo] = useState(null);
+  const [modelsInfo, setModelsInfo] = useState(null);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    getModels().then(setInfo).catch((err) => setError(err.message));
+    getModels().then(setModelsInfo).catch((err) => setError(err.message));
   }, []);
 
   if (error) return <div className="viz-empty"><p>{error}</p></div>;
-  if (!info) return <div className="viz-empty"><p>Loading models…</p></div>;
+  if (!modelsInfo) return <div className="viz-empty"><p>Loading models…</p></div>;
 
   return (
     <div className="models-wrap">
@@ -79,25 +79,25 @@ export default function ModelsPanel() {
           apply to the next pipeline run.
         </p>
 
-        {!info.ollamaUp && (
+        {!modelsInfo.ollamaUp && (
           <div className="banner">
-            Ollama is unreachable at {info.ollamaUrl} — the installed-model list is
+            Ollama is unreachable at {modelsInfo.ollamaUrl} — the installed-model list is
             unavailable, but you can still type a model name and apply it.
           </div>
         )}
 
         <datalist id="installed-models">
-          {info.installed.map((modelName) => <option key={modelName} value={modelName} />)}
+          {modelsInfo.installed.map((modelName) => <option key={modelName} value={modelName} />)}
         </datalist>
 
-        {Object.entries(info.descriptions).map(([role, description]) => (
+        {Object.entries(modelsInfo.descriptions).map(([role, description]) => (
           <RoleCard
             key={role}
             role={role}
             description={description}
-            value={info.roles[role]}
-            installed={info.installed}
-            onSaved={(roles) => setInfo((prev) => ({ ...prev, roles }))}
+            value={modelsInfo.roles[role]}
+            installed={modelsInfo.installed}
+            onSaved={(roles) => setModelsInfo((prev) => ({ ...prev, roles }))}
           />
         ))}
       </div>

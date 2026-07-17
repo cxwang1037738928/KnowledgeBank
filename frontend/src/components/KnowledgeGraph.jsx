@@ -53,8 +53,8 @@ export default function KnowledgeGraph({ controlsEl, active }) {
   // graph.json → force-graph shape, defensively: edges referencing nodes that
   // were never materialized (known build_graph.js stub gap, pending the
   // LightRAG migration) would crash the layout, so they're dropped + counted.
-  const { data, stats } = useMemo(() => {
-    if (!graphJson) return { data: null, stats: null };
+  const { graphData, stats } = useMemo(() => {
+    if (!graphJson) return { graphData: null, stats: null };
     const keepNode = (graphNode) => showSections || graphNode.type !== 'section';
     const nodes = graphJson.nodes.filter(keepNode).map((graphNode) => ({
       id: graphNode.id,
@@ -80,7 +80,7 @@ export default function KnowledgeGraph({ controlsEl, active }) {
         type: graphEdge.type,
       }));
     return {
-      data: { nodes, links },
+      graphData: { nodes, links },
       stats: {
         docs: graphJson.nodes.filter((graphNode) => graphNode.type === 'document').length,
         sections: graphJson.nodes.filter((graphNode) => graphNode.type === 'section').length,
@@ -104,7 +104,7 @@ export default function KnowledgeGraph({ controlsEl, active }) {
       </div>
     );
   }
-  if (!data) return <div className="viz-empty"><p>Loading knowledge graph…</p></div>;
+  if (!graphData) return <div className="viz-empty"><p>Loading knowledge graph…</p></div>;
 
   const controls = (
     <>
@@ -159,7 +159,7 @@ export default function KnowledgeGraph({ controlsEl, active }) {
         <ForceGraph2D
           width={width}
           height={height}
-          graphData={data}
+          graphData={graphData}
           backgroundColor="rgba(0,0,0,0)"
           nodeVal={(node) => (node.type === 'document' ? 7 : 1.6)}
           nodeColor={(node) => (node.type === 'document' ? palette.doc : palette.section)}
