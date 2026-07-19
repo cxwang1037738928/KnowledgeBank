@@ -48,7 +48,6 @@ export function stripJats(jatsMarkup) {
 
 const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const DATA_DIR      = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const DOCLINGS_PATH = path.join(DATA_DIR, 'doclings.json');
 const CACHE_DIR     = path.join(ROOT, 'cache');
 const META_PATH     = path.join(CACHE_DIR, 'meta.json');
 
@@ -165,12 +164,13 @@ async function saveCache(metaByDoi) {
  * parsedReferences stay intact — Crossref references often lack article
  * titles, which the citation matcher needs.
  */
-export async function enrichDoclings() {
+export async function enrichDoclings(dataDir = DATA_DIR) {
+  const doclingsPath = path.join(dataDir, 'doclings.json');
   let doclings;
   try {
-    doclings = JSON.parse(await fs.readFile(DOCLINGS_PATH, 'utf-8'));
+    doclings = JSON.parse(await fs.readFile(doclingsPath, 'utf-8'));
   } catch {
-    throw new Error('data/doclings.json not found — run extract.py first');
+    throw new Error(`${doclingsPath} not found — run extract.py first`);
   }
 
   const metaByDoi = await loadCache();
@@ -210,8 +210,8 @@ export async function enrichDoclings() {
     if (crossrefMeta.reference && crossrefMeta.reference.length) doclingEntry.crossrefReferences = crossrefMeta.reference;
   }
 
-  await fs.writeFile(DOCLINGS_PATH, JSON.stringify(doclings, null, 2), 'utf-8');
-  console.log(`[search_doi] Crossref: ${matchedCount} matched, ${unmatchedCount} unmatched of ${doiDocCount} DOI'd doc(s) → ${DOCLINGS_PATH}`);
+  await fs.writeFile(doclingsPath, JSON.stringify(doclings, null, 2), 'utf-8');
+  console.log(`[search_doi] Crossref: ${matchedCount} matched, ${unmatchedCount} unmatched of ${doiDocCount} DOI'd doc(s) → ${doclingsPath}`);
   return doclings;
 }
 

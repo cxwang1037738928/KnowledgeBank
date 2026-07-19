@@ -1,26 +1,20 @@
 /**
- * corpus.js — read-only corpus data + model settings for the frontend
+ * corpus.js — corpus data for the frontend, read from Postgres.
  *
- * Mounted at /api/corpus (server.js).
+ * collectionCorpusRouter — mounted at /api/collections/:collectionId/corpus
+ * (req.collection set by the collections router):
+ *   GET /embedding-map   — the collection's document points projected to 3D
+ *         and 2D (UMAP over Collection.docVectors) plus mutual-kNN edges with
+ *         cosine similarities. The frontend re-runs union-find over these
+ *         edges as the threshold slider moves, reproducing the backend
+ *         clustering exactly with no server round-trip.
+ *   GET /graph           — Collection.knowledgeGraph passthrough.
+ *   GET /chunks/:chunkId — one indexed chunk (text, pages, prefixLen) so the
+ *         viewer can locate and highlight it in the PDF.
  *
- *   GET  /embedding-map — document points projected to 3D and 2D (UMAP over
- *          the title+abstract vectors persisted by generate_categories.js),
- *          plus the mutual-kNN edge list with cosine similarities. The
- *          frontend re-runs union-find over these edges as the threshold
- *          slider moves, reproducing the backend clustering exactly
- *          (same vectors, same mutual-kNN gate, same threshold semantics)
- *          with no server round-trip.
- *   GET  /graph         — data/graph.json passthrough (knowledge graph).
- *   GET  /documents     — corpus document list (id, filename, title, authors).
- *   GET  /documents/:docId/pdf — streams the original source PDF.
- *   GET  /chunks/:chunkId — one indexed chunk (text, pages, prefixLen) so the
- *          viewer can locate and highlight it in the PDF.
- *   GET  /models        — installed Ollama models + current per-role choices.
- *   POST /settings      — persist per-role model choices to .env and
- *          process.env, so pipeline spawns pick them up immediately.
- *
- * Reads DATA_DIR (default: data) like every other pipeline module — point it
- * at tests/test-output to browse test data.
+ * modelsRouter — mounted at /api/corpus (global, not chat-scoped):
+ *   GET  /models   — installed Ollama models + current per-role choices.
+ *   POST /settings — persist per-role model choices to .env and process.env.
  */
 
 import 'dotenv/config';
@@ -29,12 +23,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import { UMAP } from 'umap-js';
+import { prisma } from '../db.js';
 
-const ROOT         = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const DATA_DIR     = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const VECTORS_PATH = path.join(DATA_DIR, 'doc_vectors.json');
-const GRAPH_PATH   = path.join(DATA_DIR, 'graph.json');
-const ENV_PATH     = path.join(ROOT, '.env');
+const ROOT     = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+const ENV_PATH = path.join(ROOT, '.env');
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MUTUAL_K   = parseInt(process.env.CLUSTER_MUTUAL_K || '10', 10);
@@ -49,8 +41,6 @@ export const MODEL_ROLES = {
   KG_MODEL:               'Knowledge-graph construction (LightRAG, upcoming)',
   REASONING_MODEL:        'Answer synthesis over retrieved chunks (/api/chat)',
 };
-
-export const corpusRouter = express.Router();
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -103,6 +93,11 @@ function normalizeCoords(coords) {
 function project(vectors, nComponents, seed) {
   const docCount = vectors.length;
   if (docCount === 1) return [nComponents === 3 ? [0, 0, 0] : [0, 0]];
+  // umap-js requires nNeighbors < docCount — impossible with 2 points, so
+  // place them apart directly instead of crashing the embedding map.
+  if (docCount === 2) {
+    return nComponents === 3 ? [[-1, 0, 0], [1, 0, 0]] : [[-1, 0], [1, 0]];
+  }
   const umap = new UMAP({
     nComponents,
     // UMAP requires nNeighbors < docCount; 15 is the library default sweet spot.
@@ -138,24 +133,24 @@ function mutualKnnEdges(vectors, k) {
   return edges;
 }
 
-// Projection is the expensive part — memoize on the vectors file's
+export const collectionCorpusRouter = express.Router();
+
+// Projection is the expensive part — memoize per collection on the vectors'
 // generatedAt stamp so repeat requests are free until the corpus changes.
-let mapCache = null;
+const mapCacheByCollection = new Map();
 
-corpusRouter.get('/embedding-map', wrap(async (req, res) => {
-  let docVectors;
-  try {
-    docVectors = JSON.parse(await fs.readFile(VECTORS_PATH, 'utf-8'));
-  } catch {
-    throw httpError(404, 'doc_vectors.json not found — run the categorize stage first');
+collectionCorpusRouter.get('/embedding-map', wrap(async (req, res) => {
+  const docVectors = req.collection.docVectors;
+  if (!docVectors?.docs?.length) {
+    throw httpError(404, 'No document vectors — run the categorize stage first');
   }
-  if (!docVectors.docs?.length) throw httpError(404, 'doc_vectors.json is empty');
 
-  if (mapCache?.generatedAt !== docVectors.generatedAt) {
+  const cached = mapCacheByCollection.get(req.collection.id);
+  if (cached?.generatedAt !== docVectors.generatedAt) {
     const vectors = docVectors.docs.map((doc) => doc.vector);
     const p3 = project(vectors, 3, 1337);
     const p2 = project(vectors, 2, 1337);
-    mapCache = {
+    mapCacheByCollection.set(req.collection.id, {
       generatedAt: docVectors.generatedAt,
       mutualK: MUTUAL_K,
       defaultThreshold: parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
@@ -167,84 +162,42 @@ corpusRouter.get('/embedding-map', wrap(async (req, res) => {
         p2:       p2[docIdx].map((coord) => Math.round(coord * 1000) / 1000),
       })),
       edges: mutualKnnEdges(vectors, MUTUAL_K),
-    };
+    });
   }
-  res.json(mapCache);
+  res.json(mapCacheByCollection.get(req.collection.id));
 }));
 
-// ---------------------------------------------------------------------------
-// Knowledge graph
-// ---------------------------------------------------------------------------
-
-corpusRouter.get('/graph', wrap(async (req, res) => {
-  try {
-    res.json(JSON.parse(await fs.readFile(GRAPH_PATH, 'utf-8')));
-  } catch {
-    throw httpError(404, 'graph.json not found — run the build-graph stage first');
+collectionCorpusRouter.get('/graph', wrap(async (req, res) => {
+  if (!req.collection.knowledgeGraph) {
+    throw httpError(404, 'No knowledge graph — run the build-graph stage first');
   }
+  res.json(req.collection.knowledgeGraph);
 }));
 
-// ---------------------------------------------------------------------------
-// Documents + chunks (citation deep-links)
-// ---------------------------------------------------------------------------
-
-const DOCLINGS_PATH   = path.join(DATA_DIR, 'doclings.json');
-const EMBEDDINGS_PATH = path.join(DATA_DIR, 'embeddings.json');
-
-// Both files are MBs; memoize each parse on its mtime.
-const fileCache = new Map();
-async function readJsonCached(filePath, missing) {
-  const mtime = await fs.stat(filePath).then((stats) => stats.mtimeMs).catch(() => null);
-  if (mtime === null) throw httpError(404, missing);
-  const cached = fileCache.get(filePath);
-  if (cached?.mtime === mtime) return cached.data;
-  const data = JSON.parse(await fs.readFile(filePath, 'utf-8'));
-  fileCache.set(filePath, { mtime, data });
-  return data;
-}
-
-const loadDoclings = () =>
-  readJsonCached(DOCLINGS_PATH, 'doclings.json not found — run the extract stage first');
-
-corpusRouter.get('/documents', wrap(async (req, res) => {
-  const doclings = await loadDoclings();
-  const docs = Object.values(doclings).map((doclingEntry) => ({
-    docId:    doclingEntry.docId,
-    filename: doclingEntry.filename,
-    title:    doclingEntry.metadata?.title || doclingEntry.filename,
-    authors:  doclingEntry.metadata?.authors || [],
-    created:  doclingEntry.metadata?.created || null,
-  }));
-  docs.sort((docA, docB) => docA.title.localeCompare(docB.title));
-  res.json({ documents: docs });
-}));
-
-corpusRouter.get('/documents/:docId/pdf', wrap(async (req, res) => {
-  const doclings = await loadDoclings();
-  const entry = doclings[req.params.docId];
-  if (!entry) throw httpError(404, `Unknown document "${req.params.docId}"`);
-  try {
-    await fs.access(entry.filePath);
-  } catch {
-    throw httpError(404, `Source PDF missing on disk: ${entry.filename}`);
-  }
-  res.type('application/pdf');
-  res.sendFile(path.resolve(entry.filePath));
-}));
-
-corpusRouter.get('/chunks/:chunkId', wrap(async (req, res) => {
-  const embeddingStore = await readJsonCached(
-    EMBEDDINGS_PATH, 'embeddings.json not found — run the embed stage first');
-  const chunk = (embeddingStore.chunks || []).find(
-    (storedChunk) => storedChunk.id === req.params.chunkId);
+collectionCorpusRouter.get('/chunks/:chunkId', wrap(async (req, res) => {
+  const chunk = await prisma.chunk.findFirst({
+    where: { collectionId: req.collection.id, chunkId: req.params.chunkId },
+  });
   if (!chunk) throw httpError(404, `Unknown chunk "${req.params.chunkId}"`);
-  const { embedding, ...chunkWithoutEmbedding } = chunk;
-  res.json(chunkWithoutEmbedding);
+  res.json({
+    id:           chunk.chunkId,
+    docId:        chunk.docId,
+    filename:     chunk.filename,
+    pages:        chunk.pages,
+    prefixLen:    chunk.prefixLen,
+    chunkIndex:   chunk.chunkIndex,
+    heading:      chunk.heading,
+    sectionIndex: chunk.sectionIndex,
+    chunkType:    chunk.chunkType,
+    text:         chunk.text,
+  });
 }));
 
 // ---------------------------------------------------------------------------
-// Models
+// Models (global — not chat-scoped)
 // ---------------------------------------------------------------------------
+
+export const modelsRouter = express.Router();
 
 async function ollamaModels() {
   try {
@@ -260,7 +213,7 @@ async function ollamaModels() {
   }
 }
 
-corpusRouter.get('/models', wrap(async (req, res) => {
+modelsRouter.get('/models', wrap(async (req, res) => {
   const installed = await ollamaModels();
   const roles = {};
   for (const key of Object.keys(MODEL_ROLES)) roles[key] = process.env[key] || null;
@@ -280,7 +233,7 @@ corpusRouter.get('/models', wrap(async (req, res) => {
  * new values without a server restart. Temp-file + rename so a crash mid-write
  * can't truncate .env.
  */
-corpusRouter.post('/settings', wrap(async (req, res) => {
+modelsRouter.post('/settings', wrap(async (req, res) => {
   const updates = req.body || {};
   const roleKeys = Object.keys(updates);
   if (roleKeys.length === 0) throw httpError(400, 'Empty settings payload');

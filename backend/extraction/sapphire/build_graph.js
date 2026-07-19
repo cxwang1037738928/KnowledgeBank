@@ -19,9 +19,6 @@ import { REF_HEADINGS, normHeading } from '../regex_utils.js';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
-const HEURISTIC_PATH = path.join(DATA_DIR, 'heuristic_output.json');
-const GRAPH_PATH     = path.join(DATA_DIR, 'graph.json');
 
 // ---------------------------------------------------------------------------
 // Node / edge builders
@@ -73,19 +70,22 @@ async function readJSON(filePath) {
   return JSON.parse(fileContents);
 }
 
-export async function buildGraph() {
+export async function buildGraph(dataDir = DATA_DIR) {
+  const doclingsPath  = path.join(dataDir, 'doclings.json');
+  const heuristicPath = path.join(dataDir, 'heuristic_output.json');
+  const graphPath     = path.join(dataDir, 'graph.json');
   let doclings, heuristicOutput;
 
   try {
-    doclings = await readJSON(DOCLINGS_PATH);
+    doclings = await readJSON(doclingsPath);
   } catch {
-    throw new Error(`data/doclings.json not found — run extract.py first`);
+    throw new Error(`${doclingsPath} not found — run extract.py first`);
   }
 
   try {
-    heuristicOutput = await readJSON(HEURISTIC_PATH);
+    heuristicOutput = await readJSON(heuristicPath);
   } catch {
-    throw new Error(`data/heuristic_output.json not found — run heuristic.py first`);
+    throw new Error(`${heuristicPath} not found — run heuristic.py first`);
   }
 
   const topKIds = new Set(heuristicOutput.topK.map((topDoc) => topDoc.docId));
@@ -133,10 +133,10 @@ export async function buildGraph() {
     edges,
   };
 
-  await fs.mkdir(path.dirname(GRAPH_PATH), { recursive: true });
-  await fs.writeFile(GRAPH_PATH, JSON.stringify(graph, null, 2), 'utf-8');
+  await fs.mkdir(path.dirname(graphPath), { recursive: true });
+  await fs.writeFile(graphPath, JSON.stringify(graph, null, 2), 'utf-8');
 
-  console.log(`[build_graph] ${nodes.length} nodes, ${edges.length} edges → ${GRAPH_PATH}`);
+  console.log(`[build_graph] ${nodes.length} nodes, ${edges.length} edges → ${graphPath}`);
   return graph;
 }
 

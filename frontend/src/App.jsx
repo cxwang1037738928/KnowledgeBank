@@ -1,10 +1,15 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import AuthPage from './components/AuthPage.jsx';
 import Chat from './components/Chat.jsx';
 import DocumentViewer from './components/DocumentViewer.jsx';
 import EmbeddingSpace from './components/EmbeddingSpace.jsx';
 import KnowledgeGraph from './components/KnowledgeGraph.jsx';
 import ModelsPanel from './components/ModelsPanel.jsx';
 import { useCrawler, CRAWLERS } from './lib/theme.js';
+import {
+  getToken, getMe, clearToken, getCollections, createCollection,
+  deleteCollection, getChats, createChat, deleteChat,
+} from './api.js';
 
 const GEM = (color, size = 12) => (
   <svg width={size} height={size} viewBox="0 0 16 16" aria-hidden="true">
@@ -66,21 +71,165 @@ function ComingSoon({ crawler }) {
   );
 }
 
+/** Sidebar chat history: each chat carries its collection's colored orb. */
+function ChatList({ chats, selectedChatId, onSelect, onNew, onDelete }) {
+  return (
+    <div className="chat-list">
+      <div className="control-label chat-list-head">
+        Chats
+        <button className="chat-new" onClick={onNew} title="New chat on the selected collection">+</button>
+      </div>
+      {chats.map((chat) => (
+        <div
+          key={chat.id}
+          className={`chat-item ${chat.id === selectedChatId ? 'active' : ''}`}
+          onClick={() => onSelect(chat)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => { if (event.key === 'Enter') onSelect(chat); }}
+        >
+          <span
+            className="orb"
+            style={{ background: chat.collection?.color || '#5b6a84' }}
+            title={chat.collection?.name}
+          />
+          <span className="chat-item-title" title={chat.title}>{chat.title}</span>
+          <button
+            className="chat-delete"
+            title="Delete chat"
+            onClick={(event) => { event.stopPropagation(); onDelete(chat); }}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+      {chats.length === 0 && (
+        <div className="chat-list-empty">No chats yet — pick a collection in Documents, then hit +.</div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
+  const [user, setUser] = useState(null);            // null = not logged in
+  const [authChecked, setAuthChecked] = useState(false);
+  const [collections, setCollections] = useState([]);
+  const [selectedCollectionId, setSelectedCollectionId] = useState(null);
+  const [chats, setChats] = useState([]);
+  const [selectedChatId, setSelectedChatId] = useState(null);
   const [tab, setTab] = useState('chat');
   const [controlsEl, setControlsEl] = useState(null);
   const [docTarget, setDocTarget] = useState(null);   // { docId, chunkId, quotes, citing, query, nonce }
+  // Bumped when a pipeline run finishes so the embedding-space and
+  // knowledge-graph tabs refetch without a remount.
+  const [corpusVersion, setCorpusVersion] = useState(0);
+  // Counter, not Date.now(): two clicks in the same millisecond must still
+  // produce distinct nonces or the second deep-link is silently ignored.
+  const citationClickCount = useRef(0);
   const { crawler, setCrawler } = useCrawler();
   const live = crawler === 'sapphire';
 
+  // Boot: validate any stored token; without a valid session the app shows
+  // the login page. Data loads once a user is confirmed.
+  useEffect(() => {
+    if (!getToken()) { setAuthChecked(true); return; }
+    getMe()
+      .then((response) => {
+        setUser(response.user);
+        if (response.user) loadOwnerData();
+      })
+      .catch(() => clearToken())
+      .finally(() => setAuthChecked(true));
+  }, []);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  async function loadOwnerData() {
+    try {
+      const [{ collections: loadedCollections }, { chats: loadedChats }] =
+        await Promise.all([getCollections(), getChats()]);
+      setCollections(loadedCollections);
+      setChats(loadedChats);
+      if (loadedChats.length) selectChat(loadedChats[0]);
+      else if (loadedCollections.length) setSelectedCollectionId(loadedCollections[0].id);
+    } catch (err) {
+      console.error('[app] could not load collections/chats:', err);
+    }
+  }
+
+  const selectChat = (chat) => {
+    setSelectedChatId(chat.id);
+    setDocTarget(null);              // targets point into the previous corpus
+    if (chat.collection) {
+      setSelectedCollectionId(chat.collection.id);
+      if (CRAWLERS[chat.collection.crawler]) setCrawler(chat.collection.crawler);
+    }
+  };
+
+  const newChat = async () => {
+    if (!selectedCollectionId) {
+      window.alert('Select (or create) a collection in the Documents tab first — every chat runs on one.');
+      setTab('docs');
+      return;
+    }
+    const { chat } = await createChat(selectedCollectionId);
+    setChats((previous) => [chat, ...previous]);
+    selectChat(chat);
+    setTab('chat');
+  };
+
+  const removeChat = async (chat) => {
+    if (!window.confirm(`Delete "${chat.title}"?`)) return;
+    await deleteChat(chat.id);
+    const remaining = chats.filter((other) => other.id !== chat.id);
+    setChats(remaining);
+    if (chat.id === selectedChatId) {
+      setSelectedChatId(null);
+      if (remaining.length) selectChat(remaining[0]);
+    }
+  };
+
+  const selectCollection = (collection) => {
+    setSelectedCollectionId(collection.id);
+    if (CRAWLERS[collection.crawler]) setCrawler(collection.crawler);
+  };
+
+  // New collection: name is required; then the user lands in the upload UI.
+  const newCollection = async () => {
+    const name = window.prompt('Collection name:');
+    if (name === null) return;
+    if (!name.trim()) { window.alert('A collection needs a name.'); return; }
+    const { collection } = await createCollection(name.trim(), crawler);
+    setCollections((previous) => [...previous, collection]);
+    selectCollection(collection);
+    setTab('docs');
+  };
+
+  const removeCollection = async (collection) => {
+    const warning = `Delete collection "${collection.name}"?\n\nThis permanently removes ` +
+      'its documents, embeddings, knowledge graph, and every chat (with history) that uses it.';
+    if (!window.confirm(warning)) return;
+    await deleteCollection(collection.id);
+    setCollections((previous) => previous.filter((other) => other.id !== collection.id));
+    // Its chats are gone server-side (cascade); drop them here too.
+    const remainingChats = chats.filter((chat) => chat.collection?.id !== collection.id);
+    setChats(remainingChats);
+    if (selectedCollectionId === collection.id) setSelectedCollectionId(null);
+    if (!remainingChats.some((chat) => chat.id === selectedChatId)) setSelectedChatId(null);
+  };
+
+  /** A chat's first message retitles it server-side; mirror that in the list. */
+  const retitleChat = (chatId, title) => {
+    setChats((previous) => previous.map((chat) =>
+      (chat.id === chatId && chat.title === 'New chat' ? { ...chat, title } : chat)));
+  };
+
+  const logout = () => {
+    clearToken();
+    window.location.reload();
+  };
+
   // A [n] citation (or source chip) was clicked in Chat: jump to the cited
   // chunk in the Documents tab. `citing` = the specific sentence that [n] sat
-  // in, so the viewer highlights the part of the chunk THAT sentence refers to
-  // (a chunk cited by several sentences no longer highlights the same span for
-  // all of them). Priority in the viewer: quotes from the citing sentence →
-  // chunk sentences scoring against the citing sentence → against the query →
-  // whole chunk. Source chips pass no citing sentence and keep the old query
-  // behavior.
+  // in, so the viewer highlights the part of the chunk THAT sentence refers to.
   const openCitation = (source, query, citing) => {
     setDocTarget({
       docId: source.docId,
@@ -88,10 +237,15 @@ export default function App() {
       quotes: source.quotes?.length ? source.quotes : null,
       citing: citing || null,
       query: query || null,
-      nonce: Date.now(),
+      nonce: ++citationClickCount.current,
     });
     setTab('docs');
   };
+
+  if (!authChecked) return null;
+  if (!user) {
+    return <AuthPage onAuth={(loggedInUser) => { setUser(loggedInUser); loadOwnerData(); }} />;
+  }
 
   return (
     <div className="app">
@@ -116,16 +270,27 @@ export default function App() {
 
         <hr className="sidebar-divider" />
 
+        <ChatList
+          chats={chats}
+          selectedChatId={selectedChatId}
+          onSelect={(chat) => { selectChat(chat); setTab('chat'); }}
+          onNew={newChat}
+          onDelete={removeChat}
+        />
+
+        <hr className="sidebar-divider" />
+
         {/* Active tab portals its contextual controls here. */}
         <div className="sidebar-controls" ref={setControlsEl} />
 
         <div className="sidebar-footer">
-          <span>local corpus</span>
+          <span className="footer-user" title={user.email}>{user.email}</span>
+          <button className="footer-logout" onClick={logout}>log out</button>
         </div>
       </aside>
 
       <main className="main">
-        {/* Crawler switcher — the top-right jewel box. */}
+        {/* Crawler switcher — sets the crawler for NEW collections + the theme. */}
         <div className="crawler-switch" role="group" aria-label="Crawler">
           {Object.entries(CRAWLERS).map(([crawlerId, crawlerInfo]) => (
             <button
@@ -147,16 +312,58 @@ export default function App() {
             {/* Tabs stay mounted so camera position / graph layout / chat
                 history survive tab switches; hidden ones are display:none. */}
             <div className="viz-fill" style={{ display: tab === 'chat' ? 'block' : 'none' }}>
-              <Chat active={tab === 'chat'} onCitation={openCitation} />
+              {selectedChatId ? (
+                <Chat
+                  key={selectedChatId}
+                  chatId={selectedChatId}
+                  active={tab === 'chat'}
+                  onCitation={openCitation}
+                  onFirstMessage={retitleChat}
+                />
+              ) : (
+                <div className="viz-empty">
+                  <h2>No chat open</h2>
+                  <p>Select a collection in the Documents tab, then hit + in Chats to start one.</p>
+                </div>
+              )}
             </div>
             <div className="viz-fill" style={{ display: tab === 'docs' ? 'block' : 'none' }}>
-              {controlsEl && <DocumentViewer controlsEl={controlsEl} active={tab === 'docs'} target={docTarget} />}
+              {controlsEl && (
+                <DocumentViewer
+                  key={selectedCollectionId ?? 'none'}
+                  collectionId={selectedCollectionId}
+                  collections={collections}
+                  onSelectCollection={selectCollection}
+                  onCreateCollection={newCollection}
+                  onDeleteCollection={removeCollection}
+                  onPipelineDone={() => setCorpusVersion((version) => version + 1)}
+                  controlsEl={controlsEl}
+                  active={tab === 'docs'}
+                  target={docTarget}
+                />
+              )}
             </div>
             <div className="viz-fill" style={{ display: tab === 'space' ? 'block' : 'none' }}>
-              {controlsEl && <EmbeddingSpace controlsEl={controlsEl} active={tab === 'space'} />}
+              {controlsEl && (
+                <EmbeddingSpace
+                  key={selectedCollectionId ?? 'none'}
+                  collectionId={selectedCollectionId}
+                  corpusVersion={corpusVersion}
+                  controlsEl={controlsEl}
+                  active={tab === 'space'}
+                />
+              )}
             </div>
             <div className="viz-fill" style={{ display: tab === 'graph' ? 'block' : 'none' }}>
-              {controlsEl && <KnowledgeGraph controlsEl={controlsEl} active={tab === 'graph'} />}
+              {controlsEl && (
+                <KnowledgeGraph
+                  key={selectedCollectionId ?? 'none'}
+                  collectionId={selectedCollectionId}
+                  corpusVersion={corpusVersion}
+                  controlsEl={controlsEl}
+                  active={tab === 'graph'}
+                />
+              )}
             </div>
             <div className="viz-fill" style={{ display: tab === 'models' ? 'block' : 'none' }}>
               <ModelsPanel active={tab === 'models'} />

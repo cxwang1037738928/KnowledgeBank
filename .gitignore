@@ -17,3 +17,6 @@ chat_log.txt
 
 # Vendored browser embedding model (npm run fetch:model)
 models/
+
+# Per-chat pipeline scratch (Postgres is canonical; these are stage exchange files)
+data/collections/

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import * as THREE from 'three';
 import { Canvas } from '@react-three/fiber';
@@ -8,99 +8,14 @@ import { getEmbeddingMap } from '../api.js';
 import { clusterize } from '../lib/cluster.js';
 import { convexHull2D } from '../lib/hull.js';
 import { seriesColor } from '../lib/theme.js';
+import {
+  PAD, makeSprite, mstEdges, centroidOf, shell3D, shell2D,
+} from '../utils/EmbeddingSpace_utils.jsx';
 
 const SCALE     = 2.4;   // UMAP coords arrive in [-1,1]; scene half-extent
 const SLOTS     = 8;     // categorical palette slots; larger clusters win them
-const PAD       = 0.16;  // blob padding around each member point (scene units)
 const MIN_BLOB  = 4;     // clusters smaller than this are drawn as constellations
 const OUTLINE   = 1.4;   // outline disc size relative to the coloured fill
-
-// Round-point sprites: PointsMaterial draws squares, so tint a circular alpha
-// texture per point instead. `disc` is the star body (used for both the grey
-// outline layer and the coloured fill on top of it); `ring` marks the hover.
-function makeSprite(kind) {
-  const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = 64;
-  const ctx = canvas.getContext('2d');
-  if (kind === 'ring') {
-    ctx.beginPath();
-    ctx.arc(32, 32, 24, 0, Math.PI * 2);
-    ctx.lineWidth = 6;
-    ctx.strokeStyle = '#fff';
-    ctx.stroke();
-  } else {
-    // Soft edge only (not a glow) so the grey outline layer beneath stays a
-    // crisp rim rather than a smear.
-    const edgeGradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 30);
-    edgeGradient.addColorStop(0, 'rgba(255,255,255,1)');
-    edgeGradient.addColorStop(0.82, 'rgba(255,255,255,1)');
-    edgeGradient.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = edgeGradient;
-    ctx.fillRect(0, 0, 64, 64);
-  }
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.needsUpdate = true;
-  return texture;
-}
-
-/**
- * Minimum spanning tree over a cluster's member points (Prim's). Small clusters
- * are drawn as constellations — each member linked to its nearest already-drawn
- * neighbour — rather than as a blob. An MST is what makes it read as a
- * constellation instead of a mesh: every member is connected, with the fewest,
- * shortest lines and no closed loops.
- */
-function mstEdges(members, positions) {
-  const distance = (fromMember, toMember) => Math.hypot(
-    positions[fromMember * 3] - positions[toMember * 3],
-    positions[fromMember * 3 + 1] - positions[toMember * 3 + 1],
-    positions[fromMember * 3 + 2] - positions[toMember * 3 + 2],
-  );
-  const inTree = [members[0]];
-  const remaining = members.slice(1);
-  const edges = [];
-  while (remaining.length) {
-    let nearest = null;
-    for (const treeMember of inTree) {
-      remaining.forEach((candidate, remainingIdx) => {
-        const candidateDistance = distance(treeMember, candidate);
-        if (!nearest || candidateDistance < nearest.distance) {
-          nearest = { treeMember, candidate, remainingIdx, distance: candidateDistance };
-        }
-      });
-    }
-    edges.push([nearest.treeMember, nearest.candidate]);
-    inTree.push(nearest.candidate);
-    remaining.splice(nearest.remainingIdx, 1);
-  }
-  return edges;
-}
-
-const centroidOf = (points) => {
-  const sum = [0, 0, 0];
-  for (const point of points) { sum[0] += point[0]; sum[1] += point[1]; sum[2] += point[2]; }
-  return sum.map((axisSum) => axisSum / points.length);
-};
-
-/**
- * Padding shells. Instead of hulling the member points directly — which is
- * degenerate below 4 points (3D) or 3 points (2D), and forced an ugly
- * bounding-sphere fallback that ballooned to the cluster's full radius — we
- * hull a small shell of points around EACH member. The result is well-defined
- * at every cluster size and hugs the members: 1 doc gives a small ball, 2 docs
- * a capsule, N docs a padded hull. No special cases, no giant spheres.
- */
-const shell3D = (point) => [
-  [point[0] + PAD, point[1], point[2]], [point[0] - PAD, point[1], point[2]],
-  [point[0], point[1] + PAD, point[2]], [point[0], point[1] - PAD, point[2]],
-  [point[0], point[1], point[2] + PAD], [point[0], point[1], point[2] - PAD],
-];
-
-const shell2D = (point, segments = 12) =>
-  Array.from({ length: segments }, (_, segmentIdx) => {
-    const angle = (segmentIdx / segments) * Math.PI * 2;
-    return [point[0] + Math.cos(angle) * PAD, point[1] + Math.sin(angle) * PAD];
-  });
 
 function Scene({ embeddingMap, mode, clusterOfPoint, showHulls, onHover, hoveredIndex }) {
   const pointCount = embeddingMap.points.length;
@@ -193,16 +108,13 @@ function Scene({ embeddingMap, mode, clusterOfPoint, showHulls, onHover, hovered
     return { hulls, constellations };
   }, [clusterOfPoint, positions, mode, showHulls, pointCount]);
 
-  // Dispose the previous frame's geometries — the slider rebuilds these on
-  // every step, and orphaned BufferGeometry leaks GPU memory.
-  const previousHulls = useRef([]);
+  // Dispose replaced geometries — the slider rebuilds hulls on every step, and
+  // orphaned BufferGeometry leaks GPU memory. Each rebuild creates all-new
+  // geometries, so the outgoing set can be freed whole; the same cleanup also
+  // frees the final set on unmount (the old version skipped that).
   useEffect(() => {
-    const staleHulls = previousHulls.current;
-    previousHulls.current = hulls;
     return () => {
-      for (const staleHull of staleHulls) {
-        if (!hulls.includes(staleHull)) staleHull.geometry.dispose();
-      }
+      for (const hull of hulls) hull.geometry.dispose();
     };
   }, [hulls]);
 
@@ -333,7 +245,7 @@ function HoverRing({ positions, ringTex, mode, hoveredIndex }) {
   );
 }
 
-export default function EmbeddingSpace({ controlsEl, active }) {
+export default function EmbeddingSpace({ collectionId, corpusVersion, controlsEl, active }) {
   const [embeddingMap, setEmbeddingMap] = useState(null);
   const [error, setError] = useState(null);
   const [threshold, setThreshold] = useState(0.5);
@@ -341,14 +253,27 @@ export default function EmbeddingSpace({ controlsEl, active }) {
   const [showHulls, setShowHulls] = useState(true);
   const [tooltip, setTooltip] = useState(null);
 
+  // Refetches when the collection changes AND when a pipeline run finishes
+  // (corpusVersion bump) — previously the map only loaded once per mount.
   useEffect(() => {
-    getEmbeddingMap()
+    if (!collectionId) return;
+    setError(null);
+    getEmbeddingMap(collectionId)
       .then((loadedMap) => {
         setEmbeddingMap(loadedMap);
         setThreshold(loadedMap.defaultThreshold ?? 0.5);
       })
       .catch((err) => setError(err.message));
-  }, []);
+  }, [collectionId, corpusVersion]);
+
+  if (!collectionId) {
+    return (
+      <div className="viz-empty">
+        <h2>No collection selected</h2>
+        <p>Select a collection in the Documents tab to see its embedding space.</p>
+      </div>
+    );
+  }
 
   const { clusterOfPoint, clusters } = useMemo(() => {
     if (!embeddingMap) return { clusterOfPoint: new Int32Array(0), clusters: [] };
@@ -363,7 +288,7 @@ export default function EmbeddingSpace({ controlsEl, active }) {
       <div className="viz-empty">
         <h2>No embedding map yet</h2>
         <p>{error}</p>
-        <p>Run the pipeline through the categorize stage, then reload.</p>
+        <p>Run the pipeline through the categorize stage.</p>
       </div>
     );
   }

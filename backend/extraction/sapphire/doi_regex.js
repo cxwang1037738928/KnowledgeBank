@@ -39,7 +39,6 @@ export function findDoi(text) {
 
 const ROOT          = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 const DATA_DIR      = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const DOCLINGS_PATH = path.join(DATA_DIR, 'doclings.json');
 
 // How much of the document head to search. The paper's own DOI appears on
 // the first page (header, footer, or copyright block); anything deeper is
@@ -51,12 +50,13 @@ const HEAD_CHARS = 5000;
  * found in the document head). Existing non-null DOIs are left untouched so
  * re-runs are idempotent.
  */
-export async function annotateDois() {
+export async function annotateDois(dataDir = DATA_DIR) {
+  const doclingsPath = path.join(dataDir, 'doclings.json');
   let doclings;
   try {
-    doclings = JSON.parse(await fs.readFile(DOCLINGS_PATH, 'utf-8'));
+    doclings = JSON.parse(await fs.readFile(doclingsPath, 'utf-8'));
   } catch {
-    throw new Error('data/doclings.json not found — run extract.py first');
+    throw new Error(`${doclingsPath} not found — run extract.py first`);
   }
 
   const doiByDocId = {};
@@ -68,10 +68,10 @@ export async function annotateDois() {
     doiByDocId[docId] = doclingEntry.metadata.doi;
   }
 
-  await fs.writeFile(DOCLINGS_PATH, JSON.stringify(doclings, null, 2), 'utf-8');
+  await fs.writeFile(doclingsPath, JSON.stringify(doclings, null, 2), 'utf-8');
 
   const docsWithDoi = Object.values(doiByDocId).filter(Boolean).length;
-  console.log(`[doi_regex] ${docsWithDoi}/${Object.keys(doiByDocId).length} documents have a DOI → ${DOCLINGS_PATH}`);
+  console.log(`[doi_regex] ${docsWithDoi}/${Object.keys(doiByDocId).length} documents have a DOI → ${doclingsPath}`);
   return doiByDocId;
 }
 

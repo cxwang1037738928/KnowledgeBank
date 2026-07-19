@@ -1,20 +1,24 @@
 /**
- * routes/chat.js — /api/chat
+ * routes/chat.js — /api/chats/:chatId/chat  (req.chat with its collection
+ * included, and req.user, set upstream)
  *
- * RAG chat over the corpus. The frontend embeds the user's question in the
- * browser (same MiniLM model as the corpus, browser cache disabled) and sends
- * the vector along; retrieval + Ollama answering happen here (retriever/).
+ * RAG chat over the chat's collection. The frontend embeds the user's
+ * question in the browser (same MiniLM model as the corpus) and sends the
+ * vector along; retrieval + Ollama answering happen here (retriever/).
  *
- * POST /api/chat
- *   Request:  { messages: [{role:'user'|'assistant', content}], queryEmbedding: number[] }
+ * POST /
+ *   Request:  { content: string, queryEmbedding: number[] }
  *   Response: { reply, model, sources: [{chunkId, docId, filename, heading, pages, sim, boost, score, quotes}] }
  *             sources[n-1] is what a [n] citation marker in reply refers to;
  *             quotes = verbatim spans in reply that this source grounds (the
  *             PDF viewer highlights exactly these when the citation is clicked)
  *   Errors:   400 bad payload · 502 Ollama failure · 503 missing corpus/model
  *
- * Every prompt → retrieved-context → response trio is appended to
- * chat_log.txt at the repo root.
+ * The conversation persists on the Chat row: both the user message and the
+ * assistant reply (with sources) are appended to Chat.conversation.
+ *
+ * chat_log.txt (prompt → retrieved-context → response trios at the repo root)
+ * is written for the ADMIN USER ONLY.
  */
 
 import { Router } from 'express';
@@ -22,6 +26,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { retrieve, answer } from '../retriever/retriever.js';
+import { prisma } from '../db.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 // Repo root, NOT backend/: the dev watcher watches backend/ (--watch-path),
@@ -61,32 +66,47 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 export const chatRouter = Router();
 
 chatRouter.post('/', wrap(async (req, res) => {
-  const { messages, queryEmbedding } = req.body ?? {};
+  const { content, queryEmbedding } = req.body ?? {};
 
-  if (!Array.isArray(messages) || messages.length === 0) {
-    return res.status(400).json({ error: '"messages" must be a non-empty array' });
-  }
-  const lastMessage = messages[messages.length - 1];
-  if (lastMessage?.role !== 'user' || typeof lastMessage?.content !== 'string'
-      || !lastMessage.content.trim()) {
-    return res.status(400).json({ error: 'last message must be a user message with string "content"' });
+  if (typeof content !== 'string' || !content.trim()) {
+    return res.status(400).json({ error: '"content" must be a non-empty string' });
   }
   if (!Array.isArray(queryEmbedding)
       || queryEmbedding.some((component) => typeof component !== 'number')) {
     return res.status(400).json({ error: '"queryEmbedding" must be a number array (computed in the browser)' });
   }
 
-  const chunks = await retrieve(queryEmbedding, lastMessage.content);
+  // LLM history = stored conversation (roles + text only) + the new question.
+  const conversation = Array.isArray(req.chat.conversation) ? req.chat.conversation : [];
+  const messages = [
+    ...conversation.map(({ role, content: text }) => ({ role, content: text })),
+    { role: 'user', content },
+  ];
+
+  const chunks = await retrieve(req.chat.collection, queryEmbedding, content);
   const { reply, model, quotesByChunk } = await answer(messages, chunks);
 
-  logChatTrio({ question: lastMessage.content, chunks, reply, model });
+  if (req.user.isAdmin) logChatTrio({ question: content, chunks, reply, model });
 
-  res.json({
-    reply,
-    model,
-    // full text + embedding stay server-side (text is large; embedding is a
-    // grounding artifact the browser has no use for)
-    sources: chunks.map(({ text, embedding, ...sourceMeta }, chunkIdx) =>
-      ({ ...sourceMeta, quotes: quotesByChunk[chunkIdx] })),
+  // Full text + embedding stay server-side (text is large; embedding is a
+  // grounding artifact the browser has no use for).
+  const sources = chunks.map(({ text, embedding, ...sourceMeta }, chunkIdx) =>
+    ({ ...sourceMeta, quotes: quotesByChunk[chunkIdx] }));
+
+  await prisma.chat.update({
+    where: { id: req.chat.id },
+    data: {
+      conversation: [
+        ...conversation,
+        { role: 'user', content },
+        { role: 'assistant', content: reply, sources },
+      ],
+      // First exchange titles the chat after the question.
+      ...(conversation.length === 0 && req.chat.title === 'New chat'
+        ? { title: content.trim().slice(0, 60) }
+        : {}),
+    },
   });
+
+  res.json({ reply, model, sources });
 }));

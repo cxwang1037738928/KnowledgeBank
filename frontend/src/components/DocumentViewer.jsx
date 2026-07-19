@@ -1,8 +1,11 @@
 /**
- * DocumentViewer.jsx — Documents tab: corpus PDF browser + citation targets.
+ * DocumentViewer.jsx — Documents tab: collections + their PDFs + citation
+ * targets.
  *
- * The sidebar (via portal) lists every indexed document; the main pane renders
- * the selected PDF with pdf.js, pages lazily rendered on scroll.
+ * The sidebar (via portal) lists the owner's collections (colored orb each;
+ * + adds one, hover × deletes with a warning). Clicking a collection opens
+ * its document list with upload / delete / run-pipeline controls; the main
+ * pane renders the selected PDF with pdf.js, pages lazily rendered on scroll.
  *
  * Citation deep-links: App passes `target` = { docId, chunkId, quotes, citing,
  * query, nonce } when a [n] marker (or source chip) is clicked in Chat. The
@@ -15,167 +18,28 @@
  * Highlight priority, all scoped to the specific citation clicked (`citing` =
  * the sentence that [n] sat in, so a chunk cited by several sentences lights a
  * different span per citation): verbatim `quotes` contained in the citing
- * sentence → chunk sentences scoring above threshold (in-browser cosine +
- * keyword bonus) against the citing sentence → against `query` (chip clicks, or
- * a citation with no claim) → the whole chunk.
+ * sentence → the chunk sentence scoring best against the citing sentence
+ * (in-browser cosine + keyword bonus, near-ties included) → sentences above the
+ * loose threshold against `query` (chip clicks, or a citation with no claim) →
+ * the whole chunk.
  */
 
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import * as pdfjsLib from 'pdfjs-dist';
-import { getDocuments, getChunk, documentPdfUrl } from '../api.js';
-import { embedTexts } from '../lib/embedder.js';
+import {
+  getDocuments, getChunk, documentPdfUrl,
+  uploadDocuments, deleteDocument, runPipeline, authHeaders,
+} from '../api.js';
+import {
+  normWords, indexPage, itemsInRange, matchOnPage, pickSentences, embedFocus,
+} from '../utils/DocumentViewer_utils.jsx';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
 const SCALE = 1.4;
 const HIGHLIGHT_COLOR = 'rgba(255, 235, 59, 0.42)';   // light yellow
-
-// ---------------------------------------------------------------------------
-// Text matching
-// ---------------------------------------------------------------------------
-
-// Matching is done over SPACE-FREE normalized text: PDF text layers break
-// words at line-end hyphens ("informa- tion") and tokenize differently from
-// docling, so comparing with spaces removed sidesteps both.
-const normWords = (text) =>
-  (text || '')
-    .toLowerCase()
-    .normalize('NFKD')
-    .replace(/[̀-ͯ]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim()
-    .split(' ')
-    .filter(Boolean);
-
-/** Space-free page text + char-range per text item, for offset→item mapping. */
-function indexPage(textContent) {
-  const itemSpans = [];
-  let joinedText = '';
-  textContent.items.forEach((textItem, itemIdx) => {
-    const normalized = normWords(textItem.str).join('');
-    if (!normalized) return;
-    itemSpans.push({ item: itemIdx, start: joinedText.length, end: joinedText.length + normalized.length });
-    joinedText += normalized;
-  });
-  return { joined: joinedText, spans: itemSpans };
-}
-
-/** Item indices whose normalized range overlaps [rangeStart, rangeEnd). */
-const itemsInRange = (pageIndex, rangeStart, rangeEnd) =>
-  pageIndex.spans
-    .filter((span) => span.end > rangeStart && span.start < rangeEnd)
-    .map((span) => span.item);
-
-/**
- * Find the chunk body on one page. Tries the full body, then word-window
- * anchors at a few offsets (front matter and equations often diverge from
- * the text layer even when the rest of the chunk is present verbatim).
- * Returns the matched char range in index.joined, or null.
- */
-function matchOnPage(pageIndex, bodyWords) {
-  if (!pageIndex.joined) return null;
-  const bodyWordCount = bodyWords.length;
-  const anchors = [[0, bodyWordCount]];
-  for (const wordOffset of [0, 8, 20]) {
-    for (const anchorLength of [30, 15, 8]) {
-      if (wordOffset + anchorLength <= bodyWordCount) anchors.push([wordOffset, anchorLength]);
-    }
-  }
-
-  for (const [wordOffset, anchorLength] of anchors) {
-    const anchorText = bodyWords.slice(wordOffset, wordOffset + anchorLength).join('');
-    if (anchorText.length < 16) continue;   // too short to trust (e.g. "By C. E. SHANNON.")
-    const anchorAt = pageIndex.joined.indexOf(anchorText);
-    if (anchorAt === -1) continue;
-
-    // Extend the match to the chunk's tail if it appears later on the page.
-    let start = anchorAt;
-    let end = anchorAt + anchorText.length;
-    if (wordOffset > 0 || anchorLength < bodyWordCount) {
-      const tailText = bodyWords.slice(-10).join('');
-      const tailAt = pageIndex.joined.indexOf(tailText, end);
-      if (tailAt !== -1) end = tailAt + tailText.length;
-    }
-    // If the anchor skipped the head, pull the start back to it when nearby.
-    if (wordOffset > 0) {
-      const headText = bodyWords.slice(0, 6).join('');
-      const headAt = pageIndex.joined.lastIndexOf(headText, anchorAt);
-      if (headAt !== -1 && anchorAt - headAt < 600) start = headAt;
-    }
-    return { start, end };
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Sentence selection — highlight only what answers the query
-// ---------------------------------------------------------------------------
-
-const splitSentences = (text) =>
-  text.split(/(?<=[.!?])\s+(?=[A-Z0-9("'[])/)
-    .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence.length >= 25);
-
-const dot = (vecA, vecB) => {
-  let sum = 0;
-  for (let dim = 0; dim < vecA.length; dim++) sum += vecA[dim] * vecB[dim];
-  return sum;
-};
-
-// Plural-insensitive content tokens for the keyword bonus.
-const keywordTokens = (text) => new Set(
-  (text || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, ' ')
-    .split(' ')
-    .filter((word) => word.length >= 3)
-    .map((word) => (word.endsWith('s') ? word.slice(0, -1) : word)),
-);
-
-const KW_BONUS   = 0.1;    // per distinct focus token found in the sentence
-const KEEP_RATIO = 0.6;    // keep sentences scoring ≥ 60% of the best one
-
-/**
- * Score each sentence of the chunk body against `focus` (the citing sentence,
- * or the query on chip clicks) — in-browser cosine + keyword bonus — and return
- * the ones above threshold; the best sentence always survives. Empty on any
- * failure, and the caller falls back to whole-chunk highlighting.
- */
-async function pickSentences(body, focus, onStatus) {
-  try {
-    const sentences = splitSentences(body);
-    if (sentences.length <= 1) return sentences;
-    onStatus('scoring the cited passage…');
-    const sentenceVectors = await embedTexts(sentences, onStatus);
-    const focusTokens = keywordTokens(focus.text);
-    const scores = sentences.map((sentence, sentenceIdx) => {
-      const keywordHits = [...keywordTokens(sentence)].filter((token) => focusTokens.has(token)).length;
-      return dot(sentenceVectors[sentenceIdx], focus.embedding) + KW_BONUS * keywordHits;
-    });
-    const bestScore = Math.max(...scores);
-    return sentences.filter(
-      (_, sentenceIdx) => scores[sentenceIdx] >= bestScore * KEEP_RATIO && scores[sentenceIdx] > 0);
-  } catch (err) {
-    console.warn('[viewer] sentence scoring failed, highlighting whole chunk:', err);
-    return [];
-  }
-}
-
-/**
- * Embed the citing sentence into the same {text, embedding} shape pickSentences
- * scores against — so a citation is highlighted by what ITS sentence says, not
- * the whole question. Null (→ caller falls back to the query) on empty or error.
- */
-async function embedFocus(text) {
-  if (!text || text.trim().length < 8) return null;
-  try {
-    const [embedding] = await embedTexts([text]);
-    return { text, embedding };
-  } catch (err) {
-    console.warn('[viewer] could not embed citing sentence:', err);
-    return null;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Single page: lazy canvas render + highlight overlay
@@ -254,7 +118,10 @@ function PdfPage({ pdf, pageNum, size, highlightIds, onPageEl }) {
 // Viewer
 // ---------------------------------------------------------------------------
 
-export default function DocumentViewer({ controlsEl, active, target }) {
+export default function DocumentViewer({
+  collectionId, collections, onSelectCollection, onCreateCollection,
+  onDeleteCollection, onPipelineDone, controlsEl, active, target,
+}) {
   const [docs, setDocs] = useState(null);
   const [error, setError] = useState(null);
   const [selectedDocId, setSelectedDocId] = useState(null);
@@ -263,14 +130,67 @@ export default function DocumentViewer({ controlsEl, active, target }) {
   const [highlights, setHighlights] = useState({});     // pageNum -> itemIds
   const [status, setStatus] = useState(null);
   const [search, setSearch] = useState('');             // sidebar filter text
+  const [jobStatus, setJobStatus] = useState(null);     // upload/pipeline progress line
   const pageEls = useRef(new Map());
   const pendingScrollPage = useRef(null);               // pageNum to scroll to once its element mounts
+  const fileInputRef = useRef(null);
+
+  const refreshDocs = () =>
+    getDocuments(collectionId)
+      .then((response) => { setError(null); setDocs(response.documents); })
+      .catch((err) => setError(err.message));
 
   useEffect(() => {
-    getDocuments()
-      .then((response) => setDocs(response.documents))
-      .catch((err) => setError(err.message));
-  }, []);
+    if (collectionId) refreshDocs();
+  }, [collectionId]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Upload the picked PDFs into this collection, then refresh the list. The
+  // corpus only sees them after the pipeline runs.
+  async function onFilesPicked(event) {
+    const files = [...event.target.files];
+    event.target.value = '';                       // same files re-pickable later
+    if (!files.length) return;
+    setJobStatus(`uploading ${files.length} file(s)…`);
+    try {
+      const { results } = await uploadDocuments(collectionId, files);
+      const failed = results.filter((result) => !result.ok);
+      setJobStatus(failed.length
+        ? `${failed.length} rejected — ${failed[0].filename}: ${failed[0].error}`
+        : `${results.length} uploaded — run the pipeline to index them`);
+      refreshDocs();
+    } catch (err) {
+      setJobStatus(`upload failed: ${err.message}`);
+    }
+  }
+
+  // Full pipeline (extract → embed → categorize → heuristic → graph) for this
+  // collection. Extraction is the slow stage — minutes for large PDFs.
+  async function runFullPipeline() {
+    setJobStatus('running pipeline… (extraction can take minutes)');
+    try {
+      const { stages } = await runPipeline(collectionId);
+      const failedStage = Object.entries(stages).find(([, stage]) => !stage.ok);
+      setJobStatus(failedStage
+        ? `${failedStage[0]} failed: ${failedStage[1].error}`
+        : 'pipeline complete — corpus indexed');
+      refreshDocs();
+      // Tell the app so the embedding-space / knowledge-graph tabs refetch.
+      if (!failedStage) onPipelineDone?.();
+    } catch (err) {
+      setJobStatus(`pipeline failed: ${err.message}`);
+    }
+  }
+
+  async function removeDoc(doc) {
+    if (!window.confirm(`Remove "${doc.filename}" from this collection?`)) return;
+    try {
+      await deleteDocument(collectionId, doc.docId);
+      if (selectedDocId === doc.docId) { setSelectedDocId(null); setPdf(null); }
+      refreshDocs();
+    } catch (err) {
+      setJobStatus(`delete failed: ${err.message}`);
+    }
+  }
 
   // Load the selected PDF and measure every page for stable lazy-scroll.
   useEffect(() => {
@@ -285,7 +205,8 @@ export default function DocumentViewer({ controlsEl, active, target }) {
         // wasmUrl: JBIG2/JPX scans decode in wasm; without it scanned pages
         // render blank white. Vendored by npm run fetch:model.
         const doc = await pdfjsLib.getDocument({
-          url: documentPdfUrl(selectedDocId),
+          url: documentPdfUrl(collectionId, selectedDocId),
+          httpHeaders: authHeaders(),   // the PDF route requires the JWT
           wasmUrl: '/models/pdfjs/wasm/',
           standardFontDataUrl: '/models/pdfjs/standard_fonts/',
         }).promise;
@@ -318,7 +239,7 @@ export default function DocumentViewer({ controlsEl, active, target }) {
     let cancelled = false;
     (async () => {
       try {
-        const chunk = await getChunk(target.chunkId);
+        const chunk = await getChunk(collectionId, target.chunkId);
         // Strip the embedded "title — heading\n" prefix; legacy chunks lack
         // prefixLen, but the prefix convention always ends at the first \n.
         const text = chunk.text || '';
@@ -328,91 +249,137 @@ export default function DocumentViewer({ controlsEl, active, target }) {
         const bodyWords = normWords(body);
 
         // Recorded page range (±1) first, then everything else.
-        const candidatePages = [];
+        const recordedPages = [];
         if (chunk.pages) {
           for (let pageNum = Math.max(1, chunk.pages[0] - 1);
                pageNum <= Math.min(pdf.numPages, chunk.pages[1] + 1); pageNum++) {
-            candidatePages.push(pageNum);
+            recordedPages.push(pageNum);
           }
         }
+        const candidatePages = [...recordedPages];
         for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
           if (!candidatePages.includes(pageNum)) candidatePages.push(pageNum);
         }
 
+        // One text-layer index per page per click, shared by every lookup below.
+        const pageIndexes = new Map();
+        const indexFor = async (pageNum) => {
+          if (!pageIndexes.has(pageNum)) {
+            const textContent = await (await pdf.getPage(pageNum)).getTextContent();
+            pageIndexes.set(pageNum, indexPage(textContent));
+          }
+          return pageIndexes.get(pageNum);
+        };
+
+        // Anchor: the first candidate page where the chunk's body matches. A
+        // chunk that crosses a page break only matches its HEAD here — its tail
+        // sentences live on the next page, which locate() handles below.
+        let anchorPage = null;
+        let bodyRange = null;
         for (const pageNum of candidatePages) {
-          const textContent = await (await pdf.getPage(pageNum)).getTextContent();
+          const pageIndex = await indexFor(pageNum);
           if (cancelled) return;
-          const pageIndex = indexPage(textContent);
-          const bodyRange = matchOnPage(pageIndex, bodyWords);
-          if (bodyRange) {
-            // Highlight priority, all scoped to the SPECIFIC citation clicked:
-            //   1. verbatim quotes from this citation's own sentence,
-            //   2. chunk sentences scoring against the citing sentence,
-            //   3. against the query (chip clicks, or a citation with no claim),
-            //   4. the whole chunk.
-            // A chunk cited by several sentences thus highlights a different
-            // span per citation instead of the same one every time.
-            let highlightItemIds = itemsInRange(pageIndex, bodyRange.start, bodyRange.end);
+          bodyRange = matchOnPage(pageIndex, bodyWords);
+          if (bodyRange) { anchorPage = pageNum; break; }
+        }
 
-            // Only the quotes this citation's sentence actually contains — so
-            // sentence 3's quote doesn't light up when you click sentence 1's [n].
-            const citingJoined = target.citing ? normWords(target.citing).join('') : '';
-            const relevantQuotes = (target.quotes || []).filter((quoteText) => {
-              if (!citingJoined) return true;   // chip click: no sentence to scope by
-              const quoteJoined = normWords(quoteText).join('');
-              return quoteJoined.length >= 12 && citingJoined.includes(quoteJoined);
-            });
+        if (anchorPage === null) {
+          // Text not locatable (scanned page, heavy equations): land on the page.
+          const fallbackPage = chunk.pages?.[0] ?? 1;
+          setStatus('passage could not be pinpointed — showing its page');
+          pendingScrollPage.current = fallbackPage;
+          pageEls.current.get(fallbackPage)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          return;
+        }
+        const anchorIndex = pageIndexes.get(anchorPage);
 
-            const quoteItemIds = [];
-            for (const quoteText of relevantQuotes) {
-              const quoteJoined = normWords(quoteText).join('');
-              if (quoteJoined.length < 12) continue;
-              const quoteAt = pageIndex.joined.indexOf(
-                quoteJoined, Math.max(0, bodyRange.start - 300));
-              if (quoteAt !== -1 && quoteAt < bodyRange.end + 300) {
-                quoteItemIds.push(
-                  ...itemsInRange(pageIndex, quoteAt, quoteAt + quoteJoined.length));
-              }
-            }
+        // Locate a space-free needle: near the anchor range first (the same
+        // words elsewhere shouldn't steal it), then anywhere on the anchor
+        // page, then on the chunk's other recorded pages — a page-spanning
+        // chunk keeps its tail sentences on the NEXT page, and pinning the
+        // search to the anchor range used to highlight the wrong head text.
+        const locate = async (needleJoined) => {
+          if (needleJoined.length < 12) return null;
+          const nearAt = anchorIndex.joined.indexOf(
+            needleJoined, Math.max(0, bodyRange.start - 300));
+          if (nearAt !== -1 && nearAt < bodyRange.end + 300) {
+            return { pageNum: anchorPage, at: nearAt };
+          }
+          const anchorAt = anchorIndex.joined.indexOf(needleJoined);
+          if (anchorAt !== -1) return { pageNum: anchorPage, at: anchorAt };
+          for (const pageNum of recordedPages) {
+            if (pageNum === anchorPage) continue;
+            const pageIndex = await indexFor(pageNum);
+            const at = pageIndex.joined.indexOf(needleJoined);
+            if (at !== -1) return { pageNum, at };
+          }
+          return null;
+        };
 
-            if (quoteItemIds.length) {
-              highlightItemIds = [...new Set(quoteItemIds)];
-            } else {
-              const focus = (await embedFocus(target.citing)) || target.query;
+        // Highlight priority, all scoped to the SPECIFIC citation clicked:
+        //   1. verbatim quotes from this citation's own sentence,
+        //   2. the chunk sentence(s) scoring best against the citing sentence,
+        //   3. against the query (chip clicks, or a citation with no claim),
+        //   4. the whole matched chunk region.
+        const highlightsByPage = {};   // pageNum -> text item ids
+        const addHighlight = ({ pageNum, at }, needleLength) => {
+          const itemIds = itemsInRange(pageIndexes.get(pageNum), at, at + needleLength);
+          if (!highlightsByPage[pageNum]) highlightsByPage[pageNum] = [];
+          highlightsByPage[pageNum].push(...itemIds);
+        };
+
+        // Only the quotes this citation's sentence actually contains — so
+        // sentence 3's quote doesn't light up when you click sentence 1's [n].
+        const citingJoined = target.citing ? normWords(target.citing).join('') : '';
+        const relevantQuotes = (target.quotes || []).filter((quoteText) => {
+          if (!citingJoined) return true;   // chip click: no sentence to scope by
+          const quoteJoined = normWords(quoteText).join('');
+          return quoteJoined.length >= 12 && citingJoined.includes(quoteJoined);
+        });
+        for (const quoteText of relevantQuotes) {
+          const quoteJoined = normWords(quoteText).join('');
+          const found = await locate(quoteJoined);
+          if (cancelled) return;
+          if (found) addHighlight(found, quoteJoined.length);
+        }
+
+        if (!Object.keys(highlightsByPage).length) {
+          const citingFocus = await embedFocus(target.citing);
+          if (cancelled) return;
+          let focus = citingFocus || target.query;
+          // A restored conversation stores only the query TEXT — embed it now.
+          if (focus && !focus.embedding) focus = await embedFocus(focus.text);
+          if (cancelled) return;
+          if (focus?.embedding) {
+            // precise only with a citing sentence — a question is too vague
+            // to pin one sentence, so chip clicks keep the loose band.
+            const pickedSentences = await pickSentences(body, focus, setStatus, !!citingFocus);
+            if (cancelled) return;
+            for (const sentence of pickedSentences) {
+              const found = await locate(normWords(sentence).join(''));
               if (cancelled) return;
-              if (focus?.embedding) {
-                const pickedSentences = await pickSentences(body, focus, setStatus);
-                if (cancelled) return;
-                const sentenceItemIds = [];
-                for (const sentence of pickedSentences) {
-                  const sentenceText = normWords(sentence).join('');
-                  if (sentenceText.length < 12) continue;
-                  const sentenceAt = pageIndex.joined.indexOf(
-                    sentenceText, Math.max(0, bodyRange.start - 300));
-                  if (sentenceAt !== -1 && sentenceAt < bodyRange.end + 300) {
-                    sentenceItemIds.push(
-                      ...itemsInRange(pageIndex, sentenceAt, sentenceAt + sentenceText.length));
-                  }
-                }
-                if (sentenceItemIds.length) highlightItemIds = [...new Set(sentenceItemIds)];
-              }
+              if (found) addHighlight(found, normWords(sentence).join('').length);
             }
-            setHighlights({ [pageNum]: highlightItemIds });
-            setStatus(null);
-            pendingScrollPage.current = pageNum;
-            const pageEl = pageEls.current.get(pageNum);
-            if (pageEl) {
-              pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              pendingScrollPage.current = null;
-            }
-            return;
           }
         }
-        // Text not locatable (scanned page, heavy equations): land on the page.
-        const fallbackPage = chunk.pages?.[0] ?? 1;
-        setStatus('passage could not be pinpointed — showing its page');
-        pendingScrollPage.current = fallbackPage;
-        pageEls.current.get(fallbackPage)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+        // Nothing located → the whole matched body region on the anchor page.
+        if (!Object.keys(highlightsByPage).length) {
+          highlightsByPage[anchorPage] =
+            itemsInRange(anchorIndex, bodyRange.start, bodyRange.end);
+        }
+
+        setHighlights(Object.fromEntries(Object.entries(highlightsByPage)
+          .map(([pageNum, itemIds]) => [pageNum, [...new Set(itemIds)]])));
+        setStatus(null);
+        // Scroll to the first highlighted page in reading order.
+        const scrollPage = Math.min(...Object.keys(highlightsByPage).map(Number));
+        pendingScrollPage.current = scrollPage;
+        const pageEl = pageEls.current.get(scrollPage);
+        if (pageEl) {
+          pageEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          pendingScrollPage.current = null;
+        }
       } catch (err) {
         if (!cancelled) setStatus(`citation lookup failed: ${err.message}`);
       }
@@ -429,52 +396,140 @@ export default function DocumentViewer({ controlsEl, active, target }) {
     }
   };
 
-  // Plain lexical filter: the search text must appear literally in the title or
-  // in one of the authors (case-insensitive). No stemming, no fuzziness.
+  // Plain lexical filter: the search text must appear literally in the title,
+  // an author, or the filename (case-insensitive). Filename matters: title and
+  // authors only exist after the extract stage, and un-indexed docs are listed
+  // by filename.
   const needle = search.trim().toLowerCase();
   const shownDocs = (docs || []).filter((doc) => {
     if (!needle) return true;
-    const titleAndAuthors = [doc.title || '', ...(doc.authors || [])].join(' ').toLowerCase();
-    return titleAndAuthors.includes(needle);
+    const searchableText = [doc.title || '', doc.filename || '', ...(doc.authors || [])]
+      .join(' ')
+      .toLowerCase();
+    return searchableText.includes(needle);
   });
 
-  const controls = (
+  // Collections list: orb + name; + creates one (name prompt), hover × deletes
+  // (with a warning). Clicking a collection opens its document list below.
+  const collectionControls = (
+    <div className="collection-list">
+      <div className="control-label chat-list-head">
+        Collections
+        <button className="chat-new" onClick={onCreateCollection} title="New collection">+</button>
+      </div>
+      {(collections || []).map((collection) => (
+        <div
+          key={collection.id}
+          className={`chat-item ${collection.id === collectionId ? 'active' : ''}`}
+          onClick={() => onSelectCollection(collection)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => { if (event.key === 'Enter') onSelectCollection(collection); }}
+        >
+          <span className="orb" style={{ background: collection.color }} />
+          <span className="chat-item-title" title={collection.name}>{collection.name}</span>
+          <button
+            className="chat-delete"
+            title="Delete collection (and everything in it)"
+            onClick={(event) => { event.stopPropagation(); onDeleteCollection(collection); }}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+      {(!collections || collections.length === 0) && (
+        <div className="doc-list-error">No collections yet — hit + to create one.</div>
+      )}
+    </div>
+  );
+
+  const documentControls = collectionId && (
     <div className="doc-list">
       <div className="control-label">Documents</div>
+      <div className="doc-actions">
+        <button className="btn btn-small" onClick={() => fileInputRef.current?.click()}>
+          Upload PDFs
+        </button>
+        <button
+          className="btn btn-small"
+          onClick={runFullPipeline}
+          disabled={/^(uploading|running)/.test(jobStatus || '') || !docs?.length}
+          title="Extract, embed, categorize, rank and graph this chat's PDFs"
+        >
+          Run pipeline
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          multiple
+          hidden
+          onChange={onFilesPicked}
+        />
+      </div>
+      {jobStatus && <div className="doc-job-status">{jobStatus}</div>}
       {error && <div className="doc-list-error">{error}</div>}
       <input
         className="doc-search"
         type="search"
         value={search}
-        placeholder="Search title or author…"
-        aria-label="Search documents by title or author"
+        placeholder="Search title, author, or filename…"
+        aria-label="Search documents by title, author, or filename"
         onChange={(event) => setSearch(event.target.value)}
       />
       {shownDocs.map((doc) => (
-        <button
+        <div
           key={doc.docId}
           className={`doc-item ${selectedDocId === doc.docId ? 'active' : ''}`}
           onClick={() => { setHighlights({}); setStatus(null); setSelectedDocId(doc.docId); }}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') { setHighlights({}); setStatus(null); setSelectedDocId(doc.docId); }
+          }}
           title={doc.filename}
         >
-          <span className="doc-item-title">{doc.title}</span>
+          <span className="doc-item-title">
+            {doc.title || doc.filename}
+            {doc.status !== 'completed' && <span className="doc-item-pending"> · not indexed</span>}
+          </span>
           {doc.authors?.length > 0 && (
             <span className="doc-item-authors">{doc.authors.slice(0, 3).join(', ')}</span>
           )}
-        </button>
+          <button
+            className="doc-delete"
+            title="Remove from this chat"
+            onClick={(event) => { event.stopPropagation(); removeDoc(doc); }}
+          >
+            ×
+          </button>
+        </div>
       ))}
       {docs?.length > 0 && shownDocs.length === 0 && (
         <div className="doc-list-error">No document matches “{search.trim()}”.</div>
       )}
-      {docs && docs.length === 0 && <div className="doc-list-error">No documents indexed yet.</div>}
+      {docs && docs.length === 0 && (
+        <div className="doc-list-error">No documents yet — upload PDFs, then run the pipeline.</div>
+      )}
     </div>
   );
 
   return (
     <div className="pdf-wrap">
-      {active && controlsEl && createPortal(controls, controlsEl)}
+      {active && controlsEl && createPortal(
+        <>
+          {collectionControls}
+          {documentControls}
+        </>,
+        controlsEl,
+      )}
       {status && <div className="pdf-status">{status}</div>}
-      {!selectedDocId ? (
+      {!collectionId ? (
+        <div className="viz-empty">
+          <h2>Collections</h2>
+          <p>Select a collection in the sidebar — or hit + to create one — then upload PDFs and run the pipeline.</p>
+        </div>
+      ) : !selectedDocId ? (
         <div className="viz-empty">
           <h2>Documents</h2>
           <p>Pick a document from the sidebar, or click a citation in Chat to jump straight to the cited passage.</p>

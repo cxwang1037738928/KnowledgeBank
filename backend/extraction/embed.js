@@ -18,8 +18,6 @@ import { chunkDocument } from './chunker.js';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
-const EMBEDDINGS_OUT = path.join(DATA_DIR, 'embeddings.json');
 
 // Corpus embedding model for the sapphire crawler. The browser must embed
 // queries with the SAME model (CLIENT_EMBEDDING_MODEL) or retrieval compares
@@ -58,13 +56,15 @@ async function embedBatch(texts) {
 // Main
 // ---------------------------------------------------------------------------
 
-export async function embedAll({ force = false } = {}) {
+export async function embedAll({ force = false, dataDir = DATA_DIR } = {}) {
+  const doclingsPath  = path.join(dataDir, 'doclings.json');
+  const embeddingsOut = path.join(dataDir, 'embeddings.json');
   let doclings;
   try {
-    const doclingsJson = await fs.readFile(DOCLINGS_PATH, 'utf-8');
+    const doclingsJson = await fs.readFile(doclingsPath, 'utf-8');
     doclings = JSON.parse(doclingsJson);
   } catch {
-    throw new Error('data/doclings.json not found — run extract.py first');
+    throw new Error(`${doclingsPath} not found — run extract.py first`);
   }
 
   const docIds = Object.keys(doclings);
@@ -76,7 +76,7 @@ export async function embedAll({ force = false } = {}) {
   let existing = { chunks: [], metadata: {} };
   if (!force) {
     try {
-      existing = JSON.parse(await fs.readFile(EMBEDDINGS_OUT, 'utf-8'));
+      existing = JSON.parse(await fs.readFile(embeddingsOut, 'utf-8'));
     } catch { /* first run */ }
   }
 
@@ -160,9 +160,9 @@ export async function embedAll({ force = false } = {}) {
     },
   };
 
-  await fs.mkdir(path.dirname(EMBEDDINGS_OUT), { recursive: true });
-  await fs.writeFile(EMBEDDINGS_OUT, JSON.stringify(store, null, 2), 'utf-8');
-  console.log(`[embed] Wrote ${allChunks.length} chunks (${store.metadata.totalDocs} docs) → ${EMBEDDINGS_OUT}`);
+  await fs.mkdir(path.dirname(embeddingsOut), { recursive: true });
+  await fs.writeFile(embeddingsOut, JSON.stringify(store, null, 2), 'utf-8');
+  console.log(`[embed] Wrote ${allChunks.length} chunks (${store.metadata.totalDocs} docs) → ${embeddingsOut}`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

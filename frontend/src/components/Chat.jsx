@@ -1,145 +1,23 @@
 /**
- * Chat.jsx — RAG chat over the corpus.
+ * Chat.jsx — RAG chat over the selected chat's corpus.
  *
  * The question is embedded HERE, in the browser, with the same MiniLM model
  * the corpus was embedded with (transformers.js; browser cache deliberately
- * off, so the model re-downloads each session). The vector goes to /api/chat,
- * which retrieves chunks (cosine × category keyword boost) and answers with
- * the Ollama reasoning model.
+ * off, so the model re-downloads each session). The vector goes to
+ * /api/chats/:chatId/chat, which retrieves chunks (cosine × category keyword
+ * boost) and answers with the Ollama reasoning model.
+ *
+ * The conversation lives on the Chat row in Postgres: it is loaded on mount
+ * (App remounts this component per chat) and the server appends each
+ * question/answer pair; deleting a pair PATCHes the pruned conversation back.
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { postChat } from '../api.js';
-import { embedTexts } from '../lib/embedder.js';
-
-async function embedQuery(text, onStatus) {
-  onStatus('embedding your question…');
-  const [queryVector] = await embedTexts([text], onStatus);
-  return queryVector;
-}
-
-// Verified citations. CITE_MARKER_RE matches a whole [n] marker (plus the
-// [n1]/[#1]/[ref 1] variants small models drift into); CITE_NUMBERS_RE anchors
-// it and captures the numbers.
-const CITE_MARKER_RE = /\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*\d+(?:\s*,\s*\d+)*\s*\]/;
-const CITE_NUMBERS_RE = /^\[\s*(?:n|N|#|source|excerpt|ref)?\s*[.:]?\s*(\d+(?:\s*,\s*\d+)*)\s*\]$/;
-
-// Ungrounded citations (retriever.js): [n!] still points at the model's cited
-// excerpt but is flagged; a bare [!] is one with no usable excerpt number.
-const UNSUPPORTED_MARKER = '[!]';
-const FLAGGED_CITE_RE = /\[\s*\d+(?:\s*,\s*\d+)*\s*!\s*\]/;
-const FLAGGED_NUMBERS_RE = /^\[\s*(\d+(?:\s*,\s*\d+)*)\s*!\s*\]$/;
-const UNSUPPORTED_TIP =
-  'This information is possibly hallucinated. No retrieved excerpt contains this exact sentence.';
-
-// One capture group, so split() hands markers back interleaved with the prose.
-const SEGMENT_RE = new RegExp(`(${CITE_MARKER_RE.source}|${FLAGGED_CITE_RE.source}|\\[!\\])`, 'g');
-
-/**
- * The claim sentence each marker sits in — one entry per marker occurrence, in
- * document order, so clicking a specific marker can highlight what ITS sentence
- * refers to rather than every sentence citing the chunk. Works on the block's
- * markdown-stripped text with the markers themselves removed.
- */
-function markerCitingSentences(blockText) {
-  const plain = (blockText || '').replace(/\*\*|\*|`/g, '');
-  const claims = [];
-  for (const sentence of plain.split(/(?<=[.!?])\s+/)) {
-    const markerCount = (sentence.match(SEGMENT_RE) || []).length;
-    if (!markerCount) continue;
-    const claim = sentence.replace(SEGMENT_RE, ' ').replace(/\s+/g, ' ').trim();
-    for (let occurrence = 0; occurrence < markerCount; occurrence++) claims.push(claim);
-  }
-  return claims;
-}
-
-/**
- * [n] → a button opening the cited chunk; [n!] → the same but flagged unsupported
- * (red, with the disclaimer); [!] → a warning with no chunk to open.
- * `claimCursor` = { claims, next }: the block's citing sentences, consumed one
- * per marker in document order so each marker carries its own claim.
- */
-function citeInline(text, sources, query, onCitation, keyBase, claimCursor) {
-  return text.split(SEGMENT_RE).map((part, partIdx) => {
-    if (part === UNSUPPORTED_MARKER) {
-      if (claimCursor) claimCursor.next += 1;   // [!] is a marker occurrence too
-      // Custom tooltip (not title=): the native one takes a second to appear
-      // and is easy to miss; this needs to be readable on a quick hover.
-      return (
-        <span className="citation-unsupported" key={`${keyBase}u${partIdx}`}
-              tabIndex={0} role="img" aria-label={UNSUPPORTED_TIP}>
-          !
-          <span className="unsupported-tip" role="tooltip" aria-hidden="true">
-            {UNSUPPORTED_TIP}
-          </span>
-        </span>
-      );
-    }
-    const flaggedMatch = part.match(FLAGGED_NUMBERS_RE);
-    const citeMatch = flaggedMatch || part.match(CITE_NUMBERS_RE);
-    if (!citeMatch) return part;                        // plain prose
-    const citing = claimCursor ? claimCursor.claims[claimCursor.next++] : undefined;
-    if (!sources?.length || !onCitation) return part;
-    const sourceNumbers = citeMatch[1].split(',').map((number) => parseInt(number, 10));
-    if (sourceNumbers.some((sourceNumber) => sourceNumber < 1 || sourceNumber > sources.length)) return part;
-    return (
-      <span className="citation-group" key={`${keyBase}c${partIdx}`}>
-        {sourceNumbers.map((sourceNumber) => {
-          const source = sources[sourceNumber - 1];
-          const openChunk = () => onCitation(source, query, citing);
-          // Flagged citation: still opens the model's cited chunk, but red and
-          // carrying the disclaimer so the reader knows it's unverified.
-          if (flaggedMatch) {
-            return (
-              <button
-                key={sourceNumber}
-                className="citation-unsupported citation-unsupported-link"
-                onClick={openChunk}
-                aria-label={`Excerpt ${sourceNumber}: ${UNSUPPORTED_TIP}`}
-              >
-                {sourceNumber}!
-                <span className="unsupported-tip" role="tooltip" aria-hidden="true">
-                  {UNSUPPORTED_TIP}
-                </span>
-              </button>
-            );
-          }
-          return (
-            <button
-              key={sourceNumber}
-              className="citation-link"
-              title={`${source.filename}${source.heading ? ` — ${source.heading}` : ''}${source.pages ? ` · p.${source.pages[0]}` : ''}`}
-              onClick={openChunk}
-            >
-              {sourceNumber}
-            </button>
-          );
-        })}
-      </span>
-    );
-  });
-}
-
-/** Inline markdown the models actually emit: **bold**, *italic*, `code`. */
-function inlineMd(text, keyBase, cite) {
-  const nodes = [];
-  const emphasisPattern = /\*\*(.+?)\*\*|(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)|`([^`]+)`/g;
-  let plainStart = 0;
-  let emphasisMatch;
-  while ((emphasisMatch = emphasisPattern.exec(text)) !== null) {
-    if (emphasisMatch.index > plainStart) {
-      nodes.push(cite(text.slice(plainStart, emphasisMatch.index), `${keyBase}t${plainStart}`));
-    }
-    const key = `${keyBase}m${emphasisMatch.index}`;
-    const [whole, boldText, italicText, codeText] = emphasisMatch;
-    if (boldText !== undefined)        nodes.push(<strong key={key}>{cite(boldText, key)}</strong>);
-    else if (italicText !== undefined) nodes.push(<em key={key}>{cite(italicText, key)}</em>);
-    else                               nodes.push(<code key={key}>{codeText}</code>);
-    plainStart = emphasisMatch.index + whole.length;
-  }
-  if (plainStart < text.length) nodes.push(cite(text.slice(plainStart), `${keyBase}t${plainStart}`));
-  return nodes;
-}
+import { postChat, getChat, updateChat } from '../api.js';
+import {
+  embedQuery, SEGMENT_RE, markerCitingSentences, citeInline, inlineMd,
+  citedMarkerNumbers, toConversation,
+} from '../utils/Chat_utils.jsx';
 
 /**
  * Minimal markdown renderer for assistant replies — headings, bullet and
@@ -155,7 +33,23 @@ function CitedText({ text, sources, query, onCitation }) {
     return (segment, key) => citeInline(segment, sources, query, onCitation, key, claimCursor);
   };
   const blocks = [];
-  const lines = (text || '').split('\n');
+
+  // A marker on its own line cites the line above it (a favourite small-model
+  // format, especially after list items). Merge such lines upward so the
+  // marker lands in its claim's block — as its own block it would carry no
+  // claim, and after a list it WOULD become its own block.
+  const lines = [];
+  let lastContentIdx = -1;
+  for (const rawLine of (text || '').split('\n')) {
+    const markerOnly = (rawLine.match(SEGMENT_RE) || []).length > 0
+      && rawLine.replace(SEGMENT_RE, '').trim() === '';
+    if (markerOnly && lastContentIdx >= 0) {
+      lines[lastContentIdx] += ` ${rawLine.trim()}`;
+    } else {
+      lines.push(rawLine);
+      if (rawLine.trim()) lastContentIdx = lines.length - 1;
+    }
+  }
 
   for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
     const line = lines[lineIdx];
@@ -216,41 +110,40 @@ function CitedText({ text, sources, query, onCitation }) {
   return blocks;
 }
 
-/** Excerpt numbers the reply cites with VERIFIED markers — flagged [n!] ones
- * are deliberately excluded, so an unverified claim never earns a source chip. */
-function citedNumbers(text) {
-  const numbers = new Set();
-  for (const marker of (text || '').matchAll(new RegExp(CITE_MARKER_RE.source, 'g'))) {
-    for (const number of marker[0].replace(/[^\d,]/g, '').split(',')) {
-      if (number) numbers.add(parseInt(number, 10));
-    }
-  }
-  return numbers;
-}
-
 function Sources({ sources, reply, query, onCitation }) {
   if (!sources?.length) return null;
-  // Chips are the sources the answer cites — a retrieved but uncited chunk is
-  // not a source, and linking it sent people to passages nothing referenced.
-  const cited = citedNumbers(reply);
-  const citedSources = sources.filter((_, sourceIdx) => cited.has(sourceIdx + 1));
-  if (!citedSources.length) return null;
+  // Chips are the documents the answer cites — a retrieved but uncited chunk
+  // is not a source. A document cited ONLY by flagged [n!] markers still gets
+  // a chip (the reader can open it), but it carries the warning mark since
+  // nothing verified pointed at it.
+  const { verified, flagged } = citedMarkerNumbers(reply);
 
-  // One chip per document, best-scoring chunk first.
-  const bestSourcePerDoc = [];
-  for (const source of citedSources) {
-    if (!bestSourcePerDoc.some((kept) => kept.docId === source.docId)) bestSourcePerDoc.push(source);
-  }
+  // One chip per document, best-scoring cited chunk first (sources arrive in
+  // score order). One verified citation anywhere clears the doc's flag.
+  const chipByDoc = new Map();   // docId -> { source, hasVerifiedCite }
+  sources.forEach((source, sourceIdx) => {
+    const excerptNumber = sourceIdx + 1;
+    if (!verified.has(excerptNumber) && !flagged.has(excerptNumber)) return;
+    const chip = chipByDoc.get(source.docId);
+    if (!chip) chipByDoc.set(source.docId, { source, hasVerifiedCite: verified.has(excerptNumber) });
+    else if (verified.has(excerptNumber)) chip.hasVerifiedCite = true;
+  });
+  if (!chipByDoc.size) return null;
+
   return (
     <div className="msg-sources">
-      {bestSourcePerDoc.map((source) => (
+      {[...chipByDoc.values()].map(({ source, hasVerifiedCite }) => (
         <button
-          className="source-chip"
+          className={`source-chip${hasVerifiedCite ? '' : ' source-chip-flagged'}`}
           key={source.docId}
-          title={`${source.heading || 'document'} · score ${source.score} — open in Documents`}
+          title={`${source.heading || 'document'} · score ${source.score} — open in Documents${
+            hasVerifiedCite ? '' : ' · cited only by unverified citations'}`}
           onClick={() => onCitation?.(source, query)}
         >
           {source.filename.replace(/\.pdf$/i, '')}
+          {!hasVerifiedCite && (
+            <span className="chip-flag" aria-label="cited only by unverified citations">!</span>
+          )}
         </button>
       ))}
     </div>
@@ -280,21 +173,46 @@ function DeletePair({ confirming, onAsk, onConfirm, onCancel }) {
   );
 }
 
-export default function Chat({ active, onCitation }) {
+export default function Chat({ chatId, active, onCitation, onFirstMessage }) {
   const [messages, setMessages] = useState([]);
+  const [loaded, setLoaded] = useState(false);
   const [input, setInput] = useState('');
   const [status, setStatus] = useState(null);   // busy string | null
   const [confirmingIdx, setConfirmingIdx] = useState(null);   // reply awaiting delete confirmation
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
 
-  // Drop a reply and the question above it. They leave the thread AND the
-  // history posted with the next question, so the model stops seeing them.
+  // Restore the persisted conversation. Replies regain `query` as {text} from
+  // the question above them (its embedding was never stored — the viewer
+  // re-embeds the text if a citation needs it).
+  useEffect(() => {
+    let cancelled = false;
+    getChat(chatId)
+      .then(({ chat }) => {
+        if (cancelled) return;
+        let lastQuestion = null;
+        setMessages((chat.conversation || []).map((message) => {
+          if (message.role === 'user') { lastQuestion = message.content; return message; }
+          return { ...message, query: lastQuestion ? { text: lastQuestion } : null };
+        }));
+      })
+      .catch((err) => console.warn('[chat] could not load conversation:', err.message))
+      .finally(() => { if (!cancelled) setLoaded(true); });
+    return () => { cancelled = true; };
+  }, [chatId]);
+
+  // Drop a reply and the question above it — from the thread, from the
+  // history the model sees, and from the conversation persisted server-side.
   function deletePair(replyIdx) {
-    setMessages((thread) => thread.filter((message, messageIdx) => {
-      if (messageIdx === replyIdx) return false;
-      return !(messageIdx === replyIdx - 1 && message.role === 'user');
-    }));
+    setMessages((thread) => {
+      const pruned = thread.filter((message, messageIdx) => {
+        if (messageIdx === replyIdx) return false;
+        return !(messageIdx === replyIdx - 1 && message.role === 'user');
+      });
+      updateChat(chatId, { conversation: toConversation(pruned) })
+        .catch((err) => console.warn('[chat] could not persist deletion:', err.message));
+      return pruned;
+    });
     setConfirmingIdx(null);
   }
 
@@ -310,17 +228,20 @@ export default function Chat({ active, onCitation }) {
     const question = input.trim();
     if (!question || status) return;
 
-    const history = [...messages, { role: 'user', content: question }];
-    setMessages(history);
+    const isFirstMessage = messages.length === 0;
+    setMessages((thread) => [...thread, { role: 'user', content: question }]);
     setInput('');
 
     try {
       const queryEmbedding = await embedQuery(question, setStatus);
       setStatus('retrieving + reasoning…');
-      const { reply, sources, model } = await postChat({
-        messages: history.map(({ role, content }) => ({ role, content })),
+      // The server holds the history — only the new question travels.
+      const { reply, sources, model } = await postChat(chatId, {
+        content: question,
         queryEmbedding,
       });
+      // The first exchange retitles the chat server-side; mirror it in the list.
+      if (isFirstMessage) onFirstMessage?.(chatId, question.slice(0, 60));
       // Keep the query with the reply: citation clicks pass it to the PDF
       // viewer, which scores the chunk's sentences against it to decide
       // what to highlight.
@@ -343,12 +264,12 @@ export default function Chat({ active, onCitation }) {
   return (
     <div className="chat-wrap">
       <div className="chat-scroll" ref={scrollRef}>
-        {messages.length === 0 && !status && (
+        {loaded && messages.length === 0 && !status && (
           <div className="chat-hero">
             <h2>Ask your corpus</h2>
             <p>
-              Answers are retrieved from your indexed documents and grounded with
-              citations. The question is embedded locally in your browser.
+              Answers are retrieved from this chat's indexed documents and grounded
+              with citations. The question is embedded locally in your browser.
             </p>
           </div>
         )}

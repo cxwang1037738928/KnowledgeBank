@@ -596,6 +596,18 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   color: var(--accent-hover);
 }
 
+/* Document cited only by unverified [n!] markers — chip stays clickable but
+   carries the warning mark. */
+.source-chip-flagged {
+  border-color: var(--danger);
+}
+
+.chip-flag {
+  color: var(--danger);
+  font-weight: 700;
+  margin-left: 5px;
+}
+
 /* Delete a Q/A pair — bottom-right of the reply, quiet until hovered. */
 .msg-actions { display: flex; justify-content: flex-end; margin-top: 8px; min-height: 20px; }
 
@@ -701,28 +713,24 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
 }
 
 /* [n!] — flagged but clickable: opens the model's cited chunk, still warns. */
-.citation-unsupported-link {
-  font-family: inherit;
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-}
-.citation-unsupported-link:hover {
-  background: rgba(230, 103, 103, 0.26);
-}
-
 /* Hover/focus tooltip explaining the flag. A real element, not title=, so it
-   shows instantly and reads at chat-bubble size. */
+   shows instantly and reads at chat-bubble size. position:fixed + JS-set
+   left/top (positionTip in Chat.jsx): the chat scroller clips overflow, so a
+   marker near the right edge needs the tooltip clamped to the viewport rather
+   than centered on the marker. --arrow-left keeps the arrow on the marker. */
 .unsupported-tip {
-  position: absolute;
-  bottom: calc(100% + 7px);
-  left: 50%;
-  transform: translateX(-50%) translateY(2px);
+  position: fixed;
+  top: 0;
+  left: 0;
   width: 235px;
   padding: 7px 10px;
   font-size: 11.5px;
   font-weight: 500;
   line-height: 1.45;
   text-align: left;
+  /* the flag can sit inside .citation-group (white-space: nowrap); force
+     normal so the disclaimer wraps inside its box instead of spilling out */
+  white-space: normal;
   color: var(--ink);
   background: var(--elevated);
   border: 1px solid var(--danger);
@@ -731,17 +739,19 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.12s ease, transform 0.12s ease;
+  transition: opacity 0.12s ease;
   z-index: 40;
 }
 
-/* Arrow: border-colored wedge with the surface-colored wedge inset 1.5px. */
+/* Arrow: border-colored wedge with the surface-colored wedge inset 1.5px.
+   Sits under the tooltip by default; .tip-below flips it above when the
+   tooltip is placed below the marker (no room above). */
 .unsupported-tip::before,
 .unsupported-tip::after {
   content: '';
   position: absolute;
   top: 100%;
-  left: 50%;
+  left: var(--arrow-left, 50%);
   margin-left: -5px;
   border: 5px solid transparent;
   border-top-color: var(--danger);
@@ -750,12 +760,23 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   margin-top: -1.5px;
   border-top-color: var(--elevated);
 }
+.unsupported-tip.tip-below::before,
+.unsupported-tip.tip-below::after {
+  top: auto;
+  bottom: 100%;
+  border-top-color: transparent;
+  border-bottom-color: var(--danger);
+}
+.unsupported-tip.tip-below::after {
+  margin-top: 0;
+  margin-bottom: -1.5px;
+  border-bottom-color: var(--elevated);
+}
 
 .citation-unsupported:hover .unsupported-tip,
 .citation-unsupported:focus-visible .unsupported-tip {
   opacity: 1;
   visibility: visible;
-  transform: translateX(-50%) translateY(0);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -924,6 +945,225 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
 }
 
 .doc-list-error { font-size: 12px; color: var(--ink-muted); padding: 4px 10px; }
+
+/* ── Document management (upload / pipeline / delete) ────────────────────── */
+
+.doc-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+
+.btn-small { padding: 5px 10px; font-size: 12px; }
+
+.doc-job-status {
+  font-size: 12px;
+  color: var(--ink-secondary);
+  padding: 2px 2px 8px;
+  line-height: 1.4;
+}
+
+.doc-item { position: relative; padding-right: 26px; }
+
+.doc-item-pending { color: var(--ink-muted); font-size: 11px; }
+
+.doc-delete {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  border: none;
+  background: none;
+  color: var(--ink-muted);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.doc-item:hover .doc-delete, .doc-delete:focus-visible { opacity: 1; }
+.doc-delete:hover { color: var(--danger, #e66767); background: var(--elevated); }
+
+/* ── Sidebar chat + collection lists ─────────────────────────────────────── */
+
+/* Colored orb marking which collection a chat/collection row belongs to. */
+.orb {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.collection-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.chat-list-empty {
+  font-size: 12px;
+  color: var(--ink-muted);
+  padding: 4px 10px;
+  line-height: 1.4;
+}
+
+.chat-list {
+  padding: 8px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 32vh;
+  overflow-y: auto;
+  flex-shrink: 0;
+}
+
+.chat-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px;
+}
+
+.chat-new {
+  border: 1px solid var(--border);
+  background: none;
+  color: var(--ink-secondary);
+  border-radius: 6px;
+  width: 20px;
+  height: 20px;
+  line-height: 1;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.chat-new:hover { color: var(--accent); border-color: var(--accent); }
+
+.chat-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--ink-secondary);
+  font-size: 13px;
+}
+
+.chat-item:hover { background: var(--elevated); }
+.chat-item.active { background: var(--accent-soft); color: var(--accent); }
+
+.chat-item-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-delete {
+  border: none;
+  background: none;
+  color: var(--ink-muted);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.chat-item:hover .chat-delete, .chat-delete:focus-visible { opacity: 1; }
+.chat-delete:hover { color: var(--danger, #e66767); background: var(--elevated); }
+
+/* ── Sidebar footer (user + logout) ──────────────────────────────────────── */
+
+.footer-user {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.footer-logout {
+  border: none;
+  background: none;
+  color: var(--ink-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.footer-logout:hover { color: var(--accent); background: var(--elevated); }
+
+/* ── Auth page (login / register) ────────────────────────────────────────── */
+
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 28px 26px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.auth-sub { color: var(--ink-muted); font-size: 13px; margin: -6px 0 4px; }
+
+.auth-field { display: flex; flex-direction: column; gap: 5px; }
+
+.auth-field span {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-muted);
+}
+
+.auth-field input {
+  font: inherit;
+  color: var(--ink);
+  background: var(--elevated);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.auth-field input:focus-visible { outline: none; border-color: var(--accent); }
+
+.auth-error { color: var(--danger, #e66767); font-size: 12.5px; }
+
+.auth-actions { display: flex; gap: 10px; margin-top: 4px; }
+.auth-actions .btn { flex: 1; }
+
+.btn-secondary {
+  background: var(--elevated);
+  color: var(--ink);
+  border: 1px solid var(--border);
+}
+
+.btn-secondary:hover { background: var(--accent-soft); }
+
+.auth-demo-hint {
+  font-size: 12.5px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: -4px 0 2px;
+  line-height: 1.45;
+}
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }

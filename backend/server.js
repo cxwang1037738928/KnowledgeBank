@@ -1,18 +1,14 @@
 /**
  * server.js — OpenCrawl Express entry point
  *
- * Mounts:
- *   /api/pipeline  — pipeline control (enhance, extract, embed, categorize,
- *                    heuristic, build-graph, run, status)
- *   /api/corpus    — read-only data access for the frontend (embedding map,
- *                    knowledge graph) + model settings
- *   /api/chat      — RAG chat (retriever/ + Ollama REASONING_MODEL)
+ * Mounts (login required for everything but /api/auth):
+ *   /api/auth        — register / login / me
+ *   /api/corpus      — global model settings
+ *   /api/collections — document collections + nested documents/pipeline/corpus
+ *   /api/chats       — chats (each bound to a collection) + RAG chat
  *
  * Serves frontend/dist statically when it exists (npm run build:web);
  * during development run the Vite dev server instead (npm run dev:web).
- *
- * Routers to add later:
- *   /api/documents — upload, list, status, delete  (clean_pdf.js)
  */
 
 import 'dotenv/config';
@@ -21,9 +17,11 @@ import cors from 'cors';
 import path from 'path';
 import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { pipelineRouter } from './routes/pipeline.js';
-import { corpusRouter } from './routes/corpus.js';
-import { chatRouter } from './routes/chat.js';
+import { requireAuth } from './middleware/auth.js';
+import { authRouter } from './routes/auth.js';
+import { chatsRouter } from './routes/chats.js';
+import { collectionsRouter } from './routes/collections.js';
+import { modelsRouter } from './routes/corpus.js';
 
 const app  = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -38,9 +36,10 @@ app.use(express.json());
 
 // ── Routers ───────────────────────────────────────────────────────────────────
 
-app.use('/api/pipeline', pipelineRouter);
-app.use('/api/corpus', corpusRouter);
-app.use('/api/chat', chatRouter);
+app.use('/api/auth', authRouter);
+app.use('/api/corpus', requireAuth, modelsRouter);
+app.use('/api/collections', requireAuth, collectionsRouter);
+app.use('/api/chats', requireAuth, chatsRouter);
 
 // ── Browser embedding model (npm run fetch:model) ────────────────────────────
 // Chat.jsx embeds queries in-browser with the cache off, so it re-fetches the

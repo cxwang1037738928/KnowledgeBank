@@ -1,9 +1,9 @@
 /**
- * retriever.js — RAG retrieval + answer synthesis for /api/chat
+ * retriever.js — RAG retrieval + answer synthesis for /api/chats/:chatId/chat
  *
  * The query embedding arrives from the BROWSER (the frontend embeds the
  * user's question with the same MiniLM model the corpus was embedded with),
- * so retrieval here is pure math over embeddings.json — no model loads.
+ * so retrieval here is pure math over the collection's Chunk rows — no model loads.
  *
  * Scoring: (cosine × category boost) + lexical BM25 blend.
  *   - category boost: if a query token matches a keyword of a category
@@ -20,22 +20,15 @@
  * CPU needs ~110s for a long answer, which is slow but not hung.
  *
  * Exports:
- *   retrieve(queryEmbedding, queryText, {topK}) — ranked chunks
- *   answer(messages, chunks)                    — Ollama completion string
+ *   retrieve(collection, queryEmbedding, queryText, {topK}) — ranked chunks
+ *   answer(messages, chunks)                          — Ollama completion string
  */
 
 import 'dotenv/config';
-import fs from 'fs/promises';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { tokenise } from '../extraction/regex_utils.js';
 import { getPrompt } from '../prompts.js';
 import { embedTexts } from './embedder.js';
-
-const ROOT            = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-const DATA_DIR        = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const EMBEDDINGS_PATH = path.join(DATA_DIR, 'embeddings.json');
-const CATEGORIES_PATH = path.join(DATA_DIR, 'categories.json');
+import { prisma } from '../db.js';
 
 const OLLAMA_URL     = process.env.OLLAMA_URL || 'http://localhost:11434';
 const KEYWORD_BOOST  = 1.05;   // per matched category keyword, multiplicative
@@ -53,32 +46,38 @@ const SCORE_FLOOR = parseFloat(process.env.RETRIEVER_SCORE_FLOOR || '0.5');
 const OLLAMA_IDLE_TIMEOUT = parseInt(process.env.OLLAMA_IDLE_TIMEOUT_MS || '60000', 10);
 
 // ---------------------------------------------------------------------------
-// Corpus cache (reloaded when the underlying file timestamps change)
+// Corpus cache (per collection, invalidated when corpusUpdatedAt changes)
 // ---------------------------------------------------------------------------
 
-let _cache = null;
+const _cacheByCollection = new Map();
 
-async function loadCorpus() {
-  let embeddingStore;
-  try {
-    embeddingStore = JSON.parse(await fs.readFile(EMBEDDINGS_PATH, 'utf-8'));
-  } catch {
-    const err = new Error('embeddings.json not found — run the embed stage first');
+async function loadCorpus(collection) {
+  const rows = await prisma.chunk.findMany({
+    where: { collectionId: collection.id },
+    orderBy: [{ docId: 'asc' }, { chunkIndex: 'asc' }],
+  });
+  if (rows.length === 0) {
+    const err = new Error('This collection has no indexed chunks — upload PDFs and run the pipeline first');
     err.status = 503;
     throw err;
   }
 
-  let categories = [];
-  try {
-    categories = JSON.parse(await fs.readFile(CATEGORIES_PATH, 'utf-8')).categories || [];
-  } catch { /* no categories → no keyword boost */ }
+  const chunks = rows.map((row) => ({
+    id:        row.chunkId,
+    docId:     row.docId,
+    filename:  row.filename,
+    pages:     row.pages,
+    prefixLen: row.prefixLen,
+    heading:   row.heading,
+    text:      row.text,
+    embedding: row.embedding,
+  }));
 
   return {
-    updated: embeddingStore.metadata?.updated,
-    dims: embeddingStore.metadata?.dimensions,
-    chunks: embeddingStore.chunks,
-    categories,
-    lexical: buildLexicalIndex(embeddingStore.chunks),
+    dims: collection.embeddingsMeta?.dimensions,
+    chunks,
+    categories: collection.categories?.categories || [],   // absent → no keyword boost
+    lexical: buildLexicalIndex(chunks),
   };
 }
 
@@ -128,12 +127,13 @@ function bm25Scores(queryTokens, { docFreq, chunkTermFreqs, avgChunkLength, chun
   return scores;
 }
 
-async function getCorpus() {
-  const updated = await fs.stat(EMBEDDINGS_PATH).then((s) => s.mtimeMs).catch(() => 0);
-  if (!_cache || _cache.stamp !== updated) {
-    _cache = { stamp: updated, data: await loadCorpus() };
-  }
-  return _cache.data;
+async function getCorpus(collection) {
+  const stamp = collection.corpusUpdatedAt?.getTime() ?? 0;
+  const cached = _cacheByCollection.get(collection.id);
+  if (cached?.stamp === stamp) return cached.data;
+  const data = await loadCorpus(collection);
+  _cacheByCollection.set(collection.id, { stamp, data });
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,13 +167,14 @@ function keywordBoosts(queryText, categories) {
 }
 
 /**
- * Rank corpus chunks against a query.
+ * Rank one collection's chunks against a query.
+ * @param {object}   collection     — Collection row (id, corpusUpdatedAt, categories, embeddingsMeta)
  * @param {number[]} queryEmbedding — L2-normalized, same model/dims as the corpus
  * @param {string}   queryText      — raw question, for keyword matching
  * @returns top-K [{docId, filename, heading, text, sim, boost, score}]
  */
-export async function retrieve(queryEmbedding, queryText, { topK = DEFAULT_TOP_K } = {}) {
-  const corpus = await getCorpus();
+export async function retrieve(collection, queryEmbedding, queryText, { topK = DEFAULT_TOP_K } = {}) {
+  const corpus = await getCorpus(collection);
   if (corpus.dims && queryEmbedding.length !== corpus.dims) {
     const err = new Error(`query embedding has ${queryEmbedding.length} dims; corpus uses ${corpus.dims}`);
     err.status = 400;

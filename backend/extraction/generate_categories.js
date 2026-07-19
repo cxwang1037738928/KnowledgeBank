@@ -43,9 +43,6 @@ import { tokenise, REF_HEADINGS, normHeading } from './regex_utils.js';
 
 const ROOT           = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
-const DOCLINGS_PATH  = path.join(DATA_DIR, 'doclings.json');
-const CATEGORIES_OUT = path.join(DATA_DIR, 'categories.json');
-const VECTORS_OUT    = path.join(DATA_DIR, 'doc_vectors.json');
 
 // Same corpus model embed.js uses — these vectors and the chunk vectors are
 // compared against the same browser-side query vectors.
@@ -192,16 +189,19 @@ function clusterMedoid(memberIds, vectors) {
 // Main export
 // ---------------------------------------------------------------------------
 
-export async function generateCategories(threshold) {
+export async function generateCategories(threshold, dataDir = DATA_DIR) {
   if (typeof threshold !== 'number' || isNaN(threshold) || threshold <= 0 || threshold > 1) {
     throw new RangeError(`threshold must be a number in (0, 1], got: ${threshold}`);
   }
+  const doclingsPath  = path.join(dataDir, 'doclings.json');
+  const categoriesOut = path.join(dataDir, 'categories.json');
+  const vectorsOut    = path.join(dataDir, 'doc_vectors.json');
 
   let doclings;
   try {
-    doclings = JSON.parse(await fs.readFile(DOCLINGS_PATH, 'utf-8'));
+    doclings = JSON.parse(await fs.readFile(doclingsPath, 'utf-8'));
   } catch {
-    throw new Error('data/doclings.json not found — run extract.py first');
+    throw new Error(`${doclingsPath} not found — run extract.py first`);
   }
 
   const docIds = Object.keys(doclings);
@@ -209,8 +209,8 @@ export async function generateCategories(threshold) {
   if (docIds.length === 0) {
     console.log('[generate_categories] No documents to cluster.');
     const empty = { generatedAt: new Date().toISOString(), threshold, categories: [] };
-    await fs.mkdir(path.dirname(CATEGORIES_OUT), { recursive: true });
-    await fs.writeFile(CATEGORIES_OUT, JSON.stringify(empty, null, 2), 'utf-8');
+    await fs.mkdir(path.dirname(categoriesOut), { recursive: true });
+    await fs.writeFile(categoriesOut, JSON.stringify(empty, null, 2), 'utf-8');
     return empty;
   }
 
@@ -281,8 +281,8 @@ export async function generateCategories(threshold) {
     categories,
   };
 
-  await fs.mkdir(path.dirname(CATEGORIES_OUT), { recursive: true });
-  await fs.writeFile(CATEGORIES_OUT, JSON.stringify(output, null, 2), 'utf-8');
+  await fs.mkdir(path.dirname(categoriesOut), { recursive: true });
+  await fs.writeFile(categoriesOut, JSON.stringify(output, null, 2), 'utf-8');
 
   // Persisted so the frontend embedding view can re-cluster at any threshold
   // without re-embedding.
@@ -297,11 +297,11 @@ export async function generateCategories(threshold) {
       vector:   vectors[docId],
     })),
   };
-  await fs.writeFile(VECTORS_OUT, JSON.stringify(docVectors), 'utf-8');
+  await fs.writeFile(vectorsOut, JSON.stringify(docVectors), 'utf-8');
 
   console.log(
     `[generate_categories] ${categories.length} cluster(s) at threshold=${threshold}`,
-    `(${docIds.length} docs) → ${CATEGORIES_OUT}`
+    `(${docIds.length} docs) → ${categoriesOut}`
   );
   return output;
 }

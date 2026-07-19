@@ -38,7 +38,7 @@ function useSize(ref, active) {
   return size;
 }
 
-export default function KnowledgeGraph({ controlsEl, active }) {
+export default function KnowledgeGraph({ collectionId, corpusVersion, controlsEl, active }) {
   const [graphJson, setGraphJson] = useState(null);
   const [error, setError] = useState(null);
   const [showSections, setShowSections] = useState(true);
@@ -46,9 +46,13 @@ export default function KnowledgeGraph({ controlsEl, active }) {
   const wrapRef = useRef(null);
   const { w: width, h: height } = useSize(wrapRef, active);
 
+  // Refetches when the collection changes AND when a pipeline run finishes
+  // (corpusVersion bump) — previously the graph only loaded once per mount.
   useEffect(() => {
-    getGraph().then(setGraphJson).catch((err) => setError(err.message));
-  }, []);
+    if (!collectionId) return;
+    setError(null);
+    getGraph(collectionId).then(setGraphJson).catch((err) => setError(err.message));
+  }, [collectionId, corpusVersion]);
 
   // graph.json → force-graph shape, defensively: edges referencing nodes that
   // were never materialized (known build_graph.js stub gap, pending the
@@ -95,12 +99,20 @@ export default function KnowledgeGraph({ controlsEl, active }) {
   // edges are the bright channel, membership edges the faint one.
   const palette = { doc: '#58b0e8', section: '#4a5a75', cite: '#93a4c0', member: '#1f2940' };
 
+  if (!collectionId) {
+    return (
+      <div className="viz-empty">
+        <h2>No collection selected</h2>
+        <p>Select a collection in the Documents tab to see its knowledge graph.</p>
+      </div>
+    );
+  }
   if (error) {
     return (
       <div className="viz-empty">
         <h2>No knowledge graph yet</h2>
         <p>{error}</p>
-        <p>Run the pipeline through the build-graph stage, then reload.</p>
+        <p>Run the pipeline through the build-graph stage.</p>
       </div>
     );
   }
