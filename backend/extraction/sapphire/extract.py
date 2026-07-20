@@ -92,7 +92,8 @@ def _get_prompt(name: str, **substitutions: str) -> str:
     the prompts contain literal JSON braces .format() would treat as fields."""
     global _prompt_entries
     if _prompt_entries is None:
-        _prompt_entries = json.loads(_PROMPTS_PATH.read_text(encoding="utf-8"))
+        loaded: dict = json.loads(_PROMPTS_PATH.read_text(encoding="utf-8"))
+        _prompt_entries = loaded
     text = _prompt_entries[name]["prompt"]
     for key, value in substitutions.items():
         text = text.replace("{" + key + "}", value)
