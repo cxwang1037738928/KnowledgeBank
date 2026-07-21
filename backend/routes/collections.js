@@ -86,6 +86,9 @@ const loadOwnedCollection = wrap(async (req, res, next) => {
   if (!Number.isInteger(collectionId)) throw httpError(400, 'collectionId must be an integer');
   const collection = await prisma.collection.findFirst({
     where: { id: collectionId, userId: req.user.id },
+    // The rendered graph page is ~60KB and only one route wants it; that route
+    // reads it directly rather than making every sub-resource carry it.
+    omit: { knowledgeGraphHtml: true },
   });
   if (!collection) throw httpError(404, `No collection ${collectionId}`);
   req.collection = collection;

@@ -28,6 +28,23 @@ async function request(url, options = {}) {
   return body;
 }
 
+/** Same auth/401 handling as request(), for routes that return HTML. */
+async function requestText(url) {
+  const response = await fetch(url, { headers: authHeaders() });
+  if (response.status === 401 && getToken()) {
+    clearToken();
+    window.location.reload();
+  }
+  const body = await response.text();
+  if (!response.ok) {
+    // Errors come back as JSON even though success is HTML.
+    let message = `HTTP ${response.status}`;
+    try { message = JSON.parse(body).error ?? message; } catch { /* not JSON */ }
+    throw new Error(message);
+  }
+  return body;
+}
+
 const postJson = (url, payload) =>
   request(url, {
     method: 'POST',
@@ -86,6 +103,7 @@ export const getPipelineStatus = (collectionId) =>
 
 export const getEmbeddingMap = (collectionId) => request(`/api/collections/${collectionId}/corpus/embedding-map`);
 export const getGraph        = (collectionId) => request(`/api/collections/${collectionId}/corpus/graph`);
+export const getGraphHtml    = (collectionId) => requestText(`/api/collections/${collectionId}/corpus/graph/view`);
 export const getChunk        = (collectionId, chunkId) =>
   request(`/api/collections/${collectionId}/corpus/chunks/${encodeURIComponent(chunkId)}`);
 

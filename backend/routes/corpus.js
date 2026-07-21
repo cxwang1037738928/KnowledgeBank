@@ -8,7 +8,9 @@
  *         cosine similarities. The frontend re-runs union-find over these
  *         edges as the threshold slider moves, reproducing the backend
  *         clustering exactly with no server round-trip.
- *   GET /graph           — Collection.knowledgeGraph passthrough.
+ *   GET /graph           — Collection.knowledgeGraph passthrough (kg-gen
+ *         entities/edges/relations).
+ *   GET /graph/view      — kg-gen's standalone interactive page, as HTML.
  *   GET /chunks/:chunkId — one indexed chunk (text, pages, prefixLen) so the
  *         viewer can locate and highlight it in the PDF.
  *
@@ -32,13 +34,12 @@ const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 const MUTUAL_K   = parseInt(process.env.CLUSTER_MUTUAL_K || '10', 10);
 
 // Model roles the frontend may configure. Keys are the .env variable names;
-// descriptions surface in the Models tab. KG_MODEL / REASONING_MODEL are
-// reserved for the LightRAG integration and may be unset.
+// descriptions surface in the Models tab.
 export const MODEL_ROLES = {
   METADATA_MODEL:         'Title/author/abstract fallback when GROBID is down (extract.py)',
   EXTRACTION_MODEL:       'Other extraction tasks (extract.py)',
   QUERY_CLASSIFIER_MODEL: 'Query classification (parse_user_query.js)',
-  KG_MODEL:               'Knowledge-graph construction (LightRAG, upcoming)',
+  KG_MODEL:               'Knowledge-graph construction (kg-gen, kg_graph.py)',
   REASONING_MODEL:        'Answer synthesis over retrieved chunks (/api/chat)',
 };
 
@@ -172,6 +173,20 @@ collectionCorpusRouter.get('/graph', wrap(async (req, res) => {
     throw httpError(404, 'No knowledge graph — run the build-graph stage first');
   }
   res.json(req.collection.knowledgeGraph);
+}));
+
+// kg-gen's standalone page. Sent as text, not a static file: collections are
+// per-user, and an iframe src can't carry the auth header this route needs.
+collectionCorpusRouter.get('/graph/view', wrap(async (req, res) => {
+  // Not on req.collection — loadOwnedCollection omits it (see collections.js).
+  const { knowledgeGraphHtml } = await prisma.collection.findUniqueOrThrow({
+    where:  { id: req.collection.id },
+    select: { knowledgeGraphHtml: true },
+  });
+  if (!knowledgeGraphHtml) {
+    throw httpError(404, 'No knowledge graph — run the build-graph stage first');
+  }
+  res.type('html').send(knowledgeGraphHtml);
 }));
 
 collectionCorpusRouter.get('/chunks/:chunkId', wrap(async (req, res) => {

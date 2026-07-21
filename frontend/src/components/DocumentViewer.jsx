@@ -120,7 +120,7 @@ function PdfPage({ pdf, pageNum, size, highlightIds, onPageEl }) {
 
 export default function DocumentViewer({
   collectionId, collections, onSelectCollection, onCreateCollection,
-  onDeleteCollection, onPipelineDone, controlsEl, active, target,
+  onDeleteCollection, onPipelineDone, onBusyChange, controlsEl, active, target,
 }) {
   const [docs, setDocs] = useState(null);
   const [error, setError] = useState(null);
@@ -167,6 +167,7 @@ export default function DocumentViewer({
   // collection. Extraction is the slow stage — minutes for large PDFs.
   async function runFullPipeline() {
     setJobStatus('running pipeline… (extraction can take minutes)');
+    onBusyChange?.(true);   // locks app navigation until the run settles
     try {
       const { stages } = await runPipeline(collectionId);
       const failedStage = Object.entries(stages).find(([, stage]) => !stage.ok);
@@ -178,6 +179,8 @@ export default function DocumentViewer({
       if (!failedStage) onPipelineDone?.();
     } catch (err) {
       setJobStatus(`pipeline failed: ${err.message}`);
+    } finally {
+      onBusyChange?.(false);
     }
   }
 

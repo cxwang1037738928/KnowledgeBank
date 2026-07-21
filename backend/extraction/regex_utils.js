@@ -4,7 +4,6 @@
  *
  * Consumers:
  *   generate_categories.js       — STOPWORDS / tokenise / REF_HEADINGS / normHeading
- *   sapphire/build_graph.js      — REF_HEADINGS / normHeading
  *
  * Academic-only patterns (DOI matching, JATS stripping) live with their sole
  * consumers in sapphire/ (doi_regex.js, search_doi.js).
@@ -12,8 +11,8 @@
  * Several patterns deliberately mirror Python counterparts (sapphire/extract.py
  * / sapphire/heuristic_utils.py) — Python cannot import from this file, so the
  * two copies must be kept in sync by hand:
- *   normHeading   ↔ extract.py _norm_heading / heuristic.py _norm_heading
- *   REF_HEADINGS  ↔ extract.py _REF_SECTION_HEADINGS / heuristic.py _REF_HEADINGS
+ *   normHeading   ↔ extract.py / heuristic.py / kg_graph.py _norm_heading
+ *   REF_HEADINGS  ↔ extract.py _REF_SECTION_HEADINGS / heuristic.py / kg_graph.py _REF_HEADINGS
  *   tokenise      ↔ heuristic_utils.py tokenise (same stopword list)
  */
 

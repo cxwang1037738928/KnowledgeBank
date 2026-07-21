@@ -178,11 +178,13 @@ export async function ingestCategories(collection) {
   }
 }
 
-/** graph.json → Collection.knowledgeGraph. */
+/** graph.json + kg_view.html → Collection.knowledgeGraph/.knowledgeGraphHtml. */
 export async function ingestGraph(collection) {
   const graph = await readScratchJson(collection.id, 'graph.json');
+  const html = await fs.readFile(
+    path.join(scratchDir(collection.id), 'kg_view.html'), 'utf-8');
   await prisma.collection.update({
     where: { id: collection.id },
-    data: { knowledgeGraph: graph, corpusUpdatedAt: new Date() },
+    data: { knowledgeGraph: graph, knowledgeGraphHtml: html, corpusUpdatedAt: new Date() },
   });
 }

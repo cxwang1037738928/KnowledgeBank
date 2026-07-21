@@ -13,8 +13,9 @@
  *   3. embed      — chunk + MiniLM encode → Chunk rows
  *   4. categorize — clusters → Collection.categories/.docVectors + Chunk.category
  *   5. heuristic  — BM25 + PageRank top-k: printed to the server console
- *                   only (not persisted); its scratch file feeds stage 6
- *   6. graph      — document/section/citation graph → Collection.knowledgeGraph
+ *                   only (not persisted)
+ *   6. graph      — kg-gen entity/relation graph over the extracted text →
+ *                   Collection.knowledgeGraph + .knowledgeGraphHtml
  */
 
 import 'dotenv/config';
@@ -27,7 +28,6 @@ import { annotateDois }       from '../extraction/sapphire/doi_regex.js';
 import { enrichDoclings }     from '../extraction/sapphire/search_doi.js';
 import { embedAll }           from '../extraction/embed.js';
 import { generateCategories } from '../extraction/generate_categories.js';
-import { buildGraph }         from '../extraction/sapphire/build_graph.js';
 import { processDocument }    from '../parser/cleaning/enhance_pdf.js';
 import { prisma } from '../db.js';
 import {
@@ -42,6 +42,7 @@ const __dirname  = path.dirname(fileURLToPath(import.meta.url));
 const ROOT       = path.resolve(__dirname, '..', '..');
 const EXTRACT_PY   = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'extract.py');
 const HEURISTIC_PY = path.join(ROOT, 'backend', 'extraction', 'sapphire', 'heuristic.py');
+const KG_GRAPH_PY  = path.join(ROOT, 'backend', 'extraction', 'kg_graph.py');
 const PYTHON     = process.env.PYTHON || 'python';
 // Enhancement reports are keyed by docId (content hash), so one global dir is
 // shared by all collections — the same PDF gets the same report everywhere.
@@ -62,7 +63,14 @@ function spawnAsync(cmd, args, collectionId) {
   return new Promise((resolve, reject) => {
     const proc = spawn(cmd, args, {
       cwd: ROOT,
-      env: { ...process.env, DATA_DIR: scratchDir(collectionId), ENHANCED_DIR },
+      env: {
+        ...process.env,
+        DATA_DIR: scratchDir(collectionId),
+        ENHANCED_DIR,
+        // Don't drop .pyc files into backend/ — under `npm run dev:all` a new
+        // file there restarts the watch server mid-run (see scripts/dev.mjs).
+        PYTHONDONTWRITEBYTECODE: '1',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
@@ -151,22 +159,22 @@ export const STAGES = {
     await exportCategories(collection);
     await spawnAsync(PYTHON, [HEURISTIC_PY, '--k', String(k)], collection.id);
     const output = await readScratchJson(collection.id, 'heuristic_output.json');
-    // Not persisted for now — printed here; the scratch file feeds build-graph.
+    // Not persisted for now — printed here only.
     console.log(`[heuristic] collection ${collection.id} output:\n${JSON.stringify(output, null, 2)}`);
     return { k: output.k, topK: output.topK, edges: output.edges.length };
   },
 
   async graph(collection) {
     await exportDoclings(collection);
-    const graph = await buildGraph(scratchDir(collection.id));
+    await spawnAsync(PYTHON, [KG_GRAPH_PY], collection.id);
     await ingestGraph(collection);
+    const graph = await readScratchJson(collection.id, 'graph.json');
     return {
-      nodes:        graph.nodes.length,
-      edges:        graph.edges.length,
-      docNodes:     graph.nodes.filter(node => node.type === 'document').length,
-      sectionNodes: graph.nodes.filter(node => node.type === 'section').length,
-      citeEdges:    graph.edges.filter(edge => edge.type === 'cites').length,
-      sectionEdges: graph.edges.filter(edge => edge.type === 'has_section').length,
+      model:     graph.model,
+      entities:  graph.entities.length,
+      edges:     graph.edges.length,
+      relations: graph.relations.length,
+      docs:      graph.sourceDocIds.length,
     };
   },
 };

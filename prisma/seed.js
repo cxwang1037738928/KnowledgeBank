@@ -1,5 +1,6 @@
 /**
- * seed.js — creates the admin account (admin@gmail.com / admin123).
+ * seed.js — creates the admin account (admin@gmail.com / admin123) and the
+ * demo account (demo@gmail.com / demo123) shown on the login screen.
  * Run: npm run db:seed (idempotent — upserts by email).
  */
 
@@ -8,14 +9,23 @@ import bcrypt from 'bcryptjs';
 
 const prisma = new PrismaClient();
 
+const ACCOUNTS = [
+  { email: 'admin@gmail.com', password: 'admin123', isAdmin: true },
+  { email: 'demo@gmail.com',  password: 'demo123',  isAdmin: false },
+];
+
 async function main() {
-  const password = await bcrypt.hash('admin123', 10);
-  const admin = await prisma.user.upsert({
-    where: { email: 'admin@gmail.com' },
-    update: { isAdmin: true },
-    create: { email: 'admin@gmail.com', password, isAdmin: true },
-  });
-  console.log(`[seed] admin user ready (id=${admin.id}, email=${admin.email})`);
+  for (const account of ACCOUNTS) {
+    const password = await bcrypt.hash(account.password, 10);
+    // Reset the password on every run so a rotated demo credential in this
+    // file always matches what the login screen advertises.
+    const user = await prisma.user.upsert({
+      where:  { email: account.email },
+      update: { password, isAdmin: account.isAdmin },
+      create: { email: account.email, password, isAdmin: account.isAdmin },
+    });
+    console.log(`[seed] user ready (id=${user.id}, email=${user.email})`);
+  }
 }
 
 main()

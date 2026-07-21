@@ -170,12 +170,34 @@ if (!REASONING_MODEL) {
 
 // ── Backend + frontend ───────────────────────────────────────────────────────
 
-log(`backend  → http://localhost:${PORT}   (DATA_DIR=${DATA_DIR})`);
-// --watch-path=backend, not --watch: plain --watch watches the whole module
-// graph (node_modules included), and on NTFS the atime updates from merely
-// LOADING those files on a cold morning read as changes → restart storm.
-// Watching only backend/ keeps edit-restart for our code and nothing else.
-run('api', '36', process.execPath, ['--watch-path=backend', 'backend/server.js'], { DATA_DIR });
+// Watch the JS server dirs individually, NOT all of backend/ — and pointedly
+// NOT backend/extraction, where the pipeline's Python lives. A pipeline run
+// spawns python, which reads those .py files; on NTFS a read bumps the file's
+// atime, which libuv reports as a change, restarting the server mid-run and
+// killing the (multi-minute) /pipeline/run request with ECONNRESET. Excluding
+// extraction/ keeps the watcher blind to that churn (and to any __pycache__).
+// Trade-off: editing a JS module under backend/extraction/ (embed.js,
+// generate_categories.js, chunker.js, sapphire/*.js) needs a manual restart.
+const WATCH_PATHS = [
+  'backend/server.js', 'backend/db.js', 'backend/prompts.js',
+  'backend/middleware', 'backend/parser', 'backend/pipeline',
+  'backend/retriever', 'backend/routes',
+];
+// NO_WATCH=1 runs the backend without --watch at all. The scoped watch above
+// stops the pipeline's OWN files from triggering restarts, but the server's
+// watched .js still go atime-stale after ~1h, and a long run's event-loop
+// starvation lets libuv fire those stale-atime reads as changes — the same
+// "cold start" restart storm warmAtimes fights, now hitting a run instead of
+// boot. There's no way to tell node --watch to ignore atime, so for a long
+// pipeline run, launch with NO_WATCH=1 (backend hot-reload off) to guarantee
+// the run isn't interrupted; edit-and-restart the backend by hand meanwhile.
+const NO_WATCH = process.env.NO_WATCH === '1' || process.env.NO_WATCH === 'true';
+const apiArgs = NO_WATCH
+  ? ['backend/server.js']
+  : [...WATCH_PATHS.map((p) => `--watch-path=${p}`), 'backend/server.js'];
+
+log(`backend  → http://localhost:${PORT}   (DATA_DIR=${DATA_DIR}${NO_WATCH ? ', no-watch' : ''})`);
+run('api', '36', process.execPath, apiArgs, { DATA_DIR });
 
 log('frontend → http://localhost:5173');
 run('web', '32', 'npm', ['--prefix', 'frontend', 'run', 'dev']);

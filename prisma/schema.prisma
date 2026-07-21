@@ -34,7 +34,11 @@ model Collection {
   categories      Json? // categorize output: {threshold, generatedAt, categories}
   docVectors      Json? // title+abstract vectors backing the embedding map
   embeddingsMeta  Json? // {model, dimensions, created, updated, totalDocs}
-  knowledgeGraph  Json? // build_graph output: {createdAt, nodes, edges}
+  // kg_graph.py (kg-gen) output: {createdAt, model, sourceDocIds, entities,
+  // edges, relations, entityClusters, edgeClusters}
+  knowledgeGraph     Json?
+  // kg-gen's standalone interactive page, served to the graph tab's iframe
+  knowledgeGraphHtml String?
   corpusUpdatedAt DateTime? // bumped on pipeline ingest — retrieval cache key
   userId          Int
   user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)

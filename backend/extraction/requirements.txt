@@ -2,3 +2,6 @@ docling>=2.0.0
 docling-core>=2.0.0
 requests>=2.31.0
 networkx>=3.0
+# kg_graph.py. Install with --only-binary=:all: — litellm (via dspy) otherwise
+# builds from source and needs a Rust toolchain.
+kg-gen>=0.4.0

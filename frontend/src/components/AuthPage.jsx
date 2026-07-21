@@ -34,7 +34,7 @@ export default function AuthPage({ onAuth }) {
         <h1 className="wordmark">OpenCrawl</h1>
         <p className="auth-sub">Log in, or register a new account.</p>
         <p className="auth-demo-hint">
-          Try the demo with the credentials admin@gmail.com and password: admin123!
+          Try the demo with the username demo@gmail.com and password: demo123
         </p>
 
         <label className="auth-field">

@@ -11,7 +11,9 @@ citation graphs):
 | `search_doi.js`      | Crossref enrichment (title/authors/abstract/refs/citedBy) |
 | `heuristic.py`       | BM25 + PageRank-over-citations top-k ranking |
 | `heuristic_utils.py` | scoring / reference-matching primitives |
-| `build_graph.js`     | document/section/citation knowledge graph |
+
+The knowledge graph is no longer academic-specific: `kg_graph.py` (kg-gen)
+builds it from plain text and lives one level up in `extraction/`.
 
 Crawler-agnostic stages (chunking, embedding, clustering, shared regexes)
 live one level up in `extraction/` and are reused by ruby and topaz.

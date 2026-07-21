@@ -5,6 +5,7 @@ import DocumentViewer from './components/DocumentViewer.jsx';
 import EmbeddingSpace from './components/EmbeddingSpace.jsx';
 import KnowledgeGraph from './components/KnowledgeGraph.jsx';
 import ModelsPanel from './components/ModelsPanel.jsx';
+import PipelineOverlay from './components/PipelineOverlay.jsx';
 import { useCrawler, CRAWLERS } from './lib/theme.js';
 import {
   getToken, getMe, clearToken, getCollections, createCollection,
@@ -72,12 +73,13 @@ function ComingSoon({ crawler }) {
 }
 
 /** Sidebar chat history: each chat carries its collection's colored orb. */
-function ChatList({ chats, selectedChatId, onSelect, onNew, onDelete }) {
+function ChatList({ chats, selectedChatId, onSelect, onNew, onDelete, disabled }) {
   return (
-    <div className="chat-list">
+    <div className={`chat-list ${disabled ? 'is-locked' : ''}`} aria-disabled={disabled}>
       <div className="control-label chat-list-head">
         Chats
-        <button className="chat-new" onClick={onNew} title="New chat on the selected collection">+</button>
+        <button className="chat-new" onClick={onNew} disabled={disabled}
+                title="New chat on the selected collection">+</button>
       </div>
       {chats.map((chat) => (
         <div
@@ -118,6 +120,10 @@ export default function App() {
   const [chats, setChats] = useState([]);
   const [selectedChatId, setSelectedChatId] = useState(null);
   const [tab, setTab] = useState('chat');
+  // A pipeline run is one long request tied to the mounted Documents tab, so
+  // while it's in flight we lock navigation (switching collection/chat/tab
+  // would unmount it and orphan the request). DocumentViewer drives this.
+  const [pipelineBusy, setPipelineBusy] = useState(false);
   const [controlsEl, setControlsEl] = useState(null);
   const [docTarget, setDocTarget] = useState(null);   // { docId, chunkId, quotes, citing, query, nonce }
   // Bumped when a pipeline run finishes so the embedding-space and
@@ -141,6 +147,15 @@ export default function App() {
       .catch(() => clearToken())
       .finally(() => setAuthChecked(true));
   }, []);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Warn before a full page unload (reload / close) while a run is in flight —
+  // leaving abandons it. In-app navigation is blocked separately, below.
+  useEffect(() => {
+    if (!pipelineBusy) return;
+    const warn = (event) => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [pipelineBusy]);
 
   async function loadOwnerData() {
     try {
@@ -252,7 +267,6 @@ export default function App() {
       <aside className="sidebar">
         <div className="sidebar-header">
           <h1 className="wordmark">OpenCrawl</h1>
-          <div className="wordmark-sub">{CRAWLERS[crawler].name.toLowerCase()} · {CRAWLERS[crawler].tagline}</div>
         </div>
 
         <nav className="tab-rail" aria-label="Views">
@@ -261,6 +275,7 @@ export default function App() {
               key={tabDef.id}
               className={`tab-btn ${tab === tabDef.id ? 'active' : ''}`}
               onClick={() => setTab(tabDef.id)}
+              disabled={pipelineBusy}
             >
               {ICONS[tabDef.id]}
               {tabDef.label}
@@ -276,6 +291,7 @@ export default function App() {
           onSelect={(chat) => { selectChat(chat); setTab('chat'); }}
           onNew={newChat}
           onDelete={removeChat}
+          disabled={pipelineBusy}
         />
 
         <hr className="sidebar-divider" />
@@ -285,7 +301,7 @@ export default function App() {
 
         <div className="sidebar-footer">
           <span className="footer-user" title={user.email}>{user.email}</span>
-          <button className="footer-logout" onClick={logout}>log out</button>
+          <button className="footer-logout" onClick={logout} disabled={pipelineBusy}>log out</button>
         </div>
       </aside>
 
@@ -297,6 +313,7 @@ export default function App() {
               key={crawlerId}
               className={`crawler-btn ${crawler === crawlerId ? 'active' : ''}`}
               onClick={() => setCrawler(crawlerId)}
+              disabled={pipelineBusy}
               title={`${crawlerInfo.name} — ${crawlerInfo.tagline}${crawlerInfo.ready ? '' : ' (coming soon)'}`}
             >
               {GEM(crawlerInfo.accent)}
@@ -337,6 +354,7 @@ export default function App() {
                   onCreateCollection={newCollection}
                   onDeleteCollection={removeCollection}
                   onPipelineDone={() => setCorpusVersion((version) => version + 1)}
+                  onBusyChange={setPipelineBusy}
                   controlsEl={controlsEl}
                   active={tab === 'docs'}
                   target={docTarget}
@@ -371,6 +389,12 @@ export default function App() {
           </>
         )}
       </main>
+
+      {pipelineBusy && (
+        <PipelineOverlay
+          collectionName={collections.find((c) => c.id === selectedCollectionId)?.name}
+        />
+      )}
     </div>
   );
 }

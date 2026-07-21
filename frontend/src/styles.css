@@ -87,13 +87,6 @@ body {
   color: var(--ink);
 }
 
-.wordmark-sub {
-  color: var(--ink-muted);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  margin-top: 3px;
-}
-
 .tab-rail {
   display: flex;
   flex-direction: column;
@@ -1165,6 +1158,57 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   line-height: 1.45;
 }
 
+/* ── Pipeline run: navigation lock + overlay ─────────────────────────────── */
+
+/* Nav controls disabled while a run is in flight. */
+.tab-btn:disabled,
+.crawler-btn:disabled,
+.chat-new:disabled,
+.footer-logout:disabled { opacity: 0.4; cursor: default; pointer-events: none; }
+
+.chat-list.is-locked { opacity: 0.5; pointer-events: none; }
+
+.pipeline-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(3, 6, 15, 0.72);
+  backdrop-filter: blur(2px);
+}
+
+.pipeline-overlay-card {
+  max-width: 440px;
+  margin: 20px;
+  padding: 28px 30px;
+  text-align: center;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 14px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.5);
+}
+
+.pipeline-overlay-card h2 { margin: 4px 0 8px; color: var(--ink); font-size: 18px; }
+.pipeline-overlay-card p { margin: 6px 0; color: var(--ink-secondary); line-height: 1.5; }
+.pipeline-overlay-card strong { color: var(--ink); }
+.pipeline-overlay-note { font-size: 12.5px; color: var(--ink-muted) !important; }
+
+.pipeline-spinner {
+  width: 34px;
+  height: 34px;
+  margin: 0 auto 14px;
+  border: 3px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: pipeline-spin 0.8s linear infinite;
+}
+
+@keyframes pipeline-spin { to { transform: rotate(360deg); } }
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
+  /* Keep the spinner readable as motion without spinning. */
+  .pipeline-spinner { animation: none !important; border-top-color: var(--accent); }
 }

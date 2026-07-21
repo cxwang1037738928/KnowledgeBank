@@ -68,4 +68,4 @@ await fs.appendFile(
   `[${timestamp}] test_heuristic           : ${elapsed}s\n`,
   'utf-8',
 );
-console.log(`\nDone in ${elapsed}s. Run test_build_graph.js next.`);
+console.log(`\nDone in ${elapsed}s. Run test_kg_graph.js next.`);
