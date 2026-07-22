@@ -35,7 +35,7 @@ model Collection {
   docVectors      Json? // title+abstract vectors backing the embedding map
   embeddingsMeta  Json? // {model, dimensions, created, updated, totalDocs}
   // kg_graph.py (kg-gen) output: {createdAt, model, sourceDocIds, entities,
-  // edges, relations, entityClusters, edgeClusters}
+  // edges, relations, chunksProcessed, chunksFailed}
   knowledgeGraph     Json?
   // kg-gen's standalone interactive page, served to the graph tab's iframe
   knowledgeGraphHtml String?

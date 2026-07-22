@@ -1,7 +1,6 @@
 /**
  * clean_pdf.js — PDF ingestion: validate → hash-derived docId → persist to
- * data/documents.json → enqueue for processing (BullMQ, optional).
- * Crawler-agnostic: any PDF enters the pipeline through here.
+ * data/documents.json. Crawler-agnostic: any PDF enters the pipeline here.
  */
 
 import 'dotenv/config';
@@ -9,7 +8,6 @@ import fs from 'fs/promises';
 import { createReadStream } from 'fs';
 import crypto from 'crypto';
 import path from 'path';
-import { Queue } from 'bullmq';
 import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 
 // ---------------------------------------------------------------------------
@@ -19,15 +17,6 @@ import pdfParse from 'pdf-parse/lib/pdf-parse.js';
 const MAX_FILE_SIZE = parseInt(process.env.MAX_PDF_SIZE_MB || '50', 10) * 1024 * 1024;
 const DOCUMENTS_DIR = path.resolve(process.env.DOCUMENTS_DIR || './documents');
 const META_PATH = path.resolve(process.env.DOCUMENTS_META_PATH || './data/documents.json');
-
-const REDIS_CONN = {
-  host: process.env.REDIS_HOST || '127.0.0.1',
-  port: parseInt(process.env.REDIS_PORT || '6379', 10),
-  ...(process.env.REDIS_PASSWORD ? { password: process.env.REDIS_PASSWORD } : {}),
-  // Don't retry — fail fast so the catch block in ingestDocument can close the
-  // queue before ioredis spams ECONNREFUSED errors across all subsequent docs.
-  retryStrategy: () => null,
-};
 
 // Status values a document moves through
 export const STATUS = {
@@ -57,19 +46,6 @@ async function writeMeta(store) {
   const tempPath = `${META_PATH}.tmp`;
   await fs.writeFile(tempPath, JSON.stringify(store, null, 2), 'utf-8');
   await fs.rename(tempPath, META_PATH);
-}
-
-// ---------------------------------------------------------------------------
-// Task queue
-// ---------------------------------------------------------------------------
-
-let _queue = null;
-
-function getPDFQueue() {
-  if (!_queue) {
-    _queue = new Queue('pdf-processing', { connection: REDIS_CONN });
-  }
-  return _queue;
 }
 
 // ---------------------------------------------------------------------------
@@ -179,11 +155,11 @@ export async function extractPDFMeta(filePath) {
 
 /**
  * Ingest one PDF: validate → docId from SHA-256 (stable across re-uploads) →
- * persist to documents.json → enqueue.
+ * persist to documents.json.
  * @param {string} filePath - absolute path to the PDF
  * @returns {Promise<{ docId: string, status: string } | { error: string }>}
  */
-export async function ingestDocument(filePath, { enqueue = true } = {}) {
+export async function ingestDocument(filePath) {
   const validation = await validatePDF(filePath);
   if (!validation.valid) {
     return { error: validation.error };
@@ -216,23 +192,12 @@ export async function ingestDocument(filePath, { enqueue = true } = {}) {
   store.documents[docId] = record;
   await writeMeta(store);
 
-  // enqueue:false lets tests drive the pipeline directly
-  if (enqueue) {
-    try {
-      const queue = getPDFQueue();
-      await queue.add('parse', { docId, filePath }, { jobId: docId, removeOnComplete: 100, removeOnFail: 200 });
-    } catch (err) {
-      console.warn(`[clean_pdf] Could not enqueue doc_id="${docId}": ${err.message}. Is Redis running?`);
-      if (_queue) { await _queue.close().catch(() => {}); _queue = null; }
-    }
-  }
-
   return { docId, status: STATUS.PENDING };
 }
 
 /**
- * Updates the status of a document in documents.json.
- * Used by the queue worker as it moves through processing stages.
+ * Updates the status of a document in documents.json as it moves through
+ * processing stages.
  *
  * @param {string} docId
  * @param {string} status - one of STATUS.*

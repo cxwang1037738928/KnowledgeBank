@@ -71,26 +71,38 @@ DOCLINGS_PATH   = DATA_DIR / "doclings.json"
 CATEGORIES_PATH = DATA_DIR / "categories.json"
 OUTPUT_PATH     = DATA_DIR / "heuristic_output.json"
 
-K              = 2      # top-k documents to select
-ALPHA          = 0.25   # weight of the BM25 component vs. PageRank
-NOVELTY_WEIGHT = 0.2    # how much a document's rare vocabulary boosts its final ranking score
+# Every tunable below is an env override (see .env, HEURISTIC_* block). The
+# literal here is the default and must stay in sync with .env — Python is
+# spawned by the pipeline with the env inherited, but a bare `python
+# heuristic.py` gets no .env at all and falls back to these.
+K              = int(os.environ.get("HEURISTIC_K", "2"))                   # top-k documents to select
+ALPHA          = float(os.environ.get("HEURISTIC_ALPHA", "0.25"))          # weight of the BM25 component vs. PageRank
+NOVELTY_WEIGHT = float(os.environ.get("HEURISTIC_NOVELTY_WEIGHT", "0.2"))  # how much rare vocabulary boosts the final score
 
-BM25_K1        = 1.5    # term-frequency saturation
-BM25_B         = 0.75   # length normalization strength
+BM25_K1        = float(os.environ.get("HEURISTIC_BM25_K1", "1.5"))         # term-frequency saturation
+BM25_B         = float(os.environ.get("HEURISTIC_BM25_B", "0.75"))         # length normalization strength
 
-CHUNK_WORDS         = 180   # window size (tokens) for chunk-level scoring —
-                            # matches the embedding pipeline's CHUNK_SIZE
-TOP_M_CHUNKS        = 5     # how many best chunks define representativeness
-KEYWORDS_N          = int(os.environ.get("KEYWORDS_N", "20"))
+CHUNK_WORDS         = int(os.environ.get("HEURISTIC_CHUNK_WORDS", "180"))  # window size (tokens) for chunk-level
+                                                                          # scoring — matches the pipeline's CHUNK_SIZE
+TOP_M_CHUNKS        = int(os.environ.get("HEURISTIC_TOP_M_CHUNKS", "5"))   # how many best chunks define representativeness
+KEYWORDS_N          = int(os.environ.get("HEURISTIC_KEYWORDS_N", "20"))    # fallback keywords for uncategorized docs
 
-_REF_HEADINGS = frozenset({"references", "bibliography", "works cited", "literature cited", "citations"})
+# Bibliography headings, shared with extract.py / kg_graph.py / regex_utils.js —
+# one env var so the four copies can't drift apart.
+_REF_HEADINGS = frozenset(
+    heading.strip().lower()
+    for heading in os.environ.get(
+        "PIPELINE_REF_HEADINGS",
+        "references,bibliography,works cited,literature cited,citations").split(",")
+    if heading.strip()
+)
 
-MIN_KEY_LENGTH      = 4   # skip title/author match keys shorter than this, short author last names causes over matching
-MIN_CONTAINED_TITLE = 15  # proper title containment (one inside the other) only
-                          # counts when the contained title has at least this many
-                          # chars — blocks short generic titles ('networks') from
-                          # matching every longer title that mentions the word
-PAGERANK_DAMPING = 0.85
+MIN_KEY_LENGTH      = int(os.environ.get("HEURISTIC_MIN_KEY_LENGTH", "4"))        # skip title/author match keys shorter
+                                                                                 # than this; short surnames over-match
+MIN_CONTAINED_TITLE = int(os.environ.get("HEURISTIC_MIN_CONTAINED_TITLE", "15"))  # proper title containment (one inside
+                          # the other) only counts when the contained title has at least this many chars — blocks short
+                          # generic titles ('networks') from matching every longer title that mentions the word
+PAGERANK_DAMPING = float(os.environ.get("HEURISTIC_PAGERANK_DAMPING", "0.85"))
 
 
 # ---------------------------------------------------------------------------

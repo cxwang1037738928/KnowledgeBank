@@ -2,7 +2,7 @@
  * generate_categories.js
  *
  * Clusters documents by cosine similarity of their title+abstract embeddings
- * (single-linkage gated by mutual-kNN — see CLUSTER_MUTUAL_K), then indexes
+ * (single-linkage gated by mutual-kNN — see CATEGORIES_MUTUAL_K), then indexes
  * each cluster with a compact, deterministic summary — no LLM.
  *
  * Title+abstract vectors capture topic better than averaged full-text chunk
@@ -47,12 +47,15 @@ const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 // Same corpus model embed.js uses — these vectors and the chunk vectors are
 // compared against the same browser-side query vectors.
 const EMBED_MODEL = process.env.SAPPHIRE_EMBEDDING_MODEL || 'Xenova/all-MiniLM-L12-v2';
-const BATCH_SIZE  = 32;
-const KEYWORDS_N  = parseInt(process.env.KEYWORDS_N || '20', 10);
+// Texts encoded per forward pass — raise for speed, lower for peak memory.
+const BATCH_SIZE  = parseInt(process.env.CATEGORIES_BATCH_SIZE || '32', 10);
+const KEYWORDS_N  = parseInt(process.env.CATEGORIES_KEYWORDS_N || '20', 10);
 // Mutual-kNN gate: a pair may merge only if each doc is in the other's top
 // MUTUAL_K nearest neighbours (plus the similarity threshold). Guards
 // single-linkage against transitive chaining on large corpora.
-const MUTUAL_K    = parseInt(process.env.CLUSTER_MUTUAL_K || '10', 10);
+const MUTUAL_K    = parseInt(process.env.CATEGORIES_MUTUAL_K || '10', 10);
+// Words of body text embedded when a doc has neither title nor abstract.
+const FALLBACK_WORDS = parseInt(process.env.CATEGORIES_FALLBACK_WORDS || '200', 10);
 
 // ---------------------------------------------------------------------------
 // Embedding
@@ -83,8 +86,8 @@ function metaText(entry) {
   const title    = (entry.metadata?.title    || '').trim();
   const abstract = (entry.metadata?.abstract || '').trim();
   if (title || abstract) return [title, abstract].filter(Boolean).join('\n');
-  console.warn(`[generate_categories]   no title/abstract: ${entry.filename} — falling back to first 200 words of body text`);
-  return (entry.text || '').split(/\s+/).slice(0, 200).join(' ');
+  console.warn(`[generate_categories]   no title/abstract: ${entry.filename} — falling back to first ${FALLBACK_WORDS} words of body text`);
+  return (entry.text || '').split(/\s+/).slice(0, FALLBACK_WORDS).join(' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +314,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const thresholdArgIdx = process.argv.indexOf('--threshold');
   const threshold = thresholdArgIdx !== -1
     ? parseFloat(process.argv[thresholdArgIdx + 1])
-    : parseFloat(process.env.CLUSTER_SIMILARITY || '0.75');
+    : parseFloat(process.env.CATEGORIES_SIMILARITY || '0.75');
 
   generateCategories(threshold).catch(err => {
     console.error('[generate_categories]', err.message);

@@ -31,10 +31,11 @@ import { embedTexts } from './embedder.js';
 import { prisma } from '../db.js';
 
 const OLLAMA_URL     = process.env.OLLAMA_URL || 'http://localhost:11434';
-const KEYWORD_BOOST  = 1.05;   // per matched category keyword, multiplicative
+// per matched category keyword, multiplicative
+const KEYWORD_BOOST  = parseFloat(process.env.RETRIEVER_KEYWORD_BOOST || '1.05');
 const LEXICAL_WEIGHT = parseFloat(process.env.RETRIEVER_LEXICAL_WEIGHT || '0.3');
-const BM25_K1        = 1.5;
-const BM25_B         = 0.75;
+const BM25_K1        = parseFloat(process.env.RETRIEVER_BM25_K1 || '1.5');   // term-frequency saturation
+const BM25_B         = parseFloat(process.env.RETRIEVER_BM25_B  || '0.75');  // length normalization strength
 const DEFAULT_TOP_K  = parseInt(process.env.RETRIEVER_TOP_K || '8', 10);
 // Relevance floor: keep only chunks scoring within this fraction of the best
 // one. Without it every query returns exactly topK chunks, so a question with
@@ -326,8 +327,10 @@ export async function answer(messages, chunks) {
 
 const CITE_MARKER   = /\[\s*\d+(?:\s*,\s*\d+)*\s*\]/g;
 const QUOTED_SPAN   = /["“”']([^"“”']{25,})["“”']/g;
-const VERBATIM_RUN  = 8;     // words of literal overlap that pin a QUOTE to a chunk
-const CLAIM_WINDOW  = 400;   // chars each side of a marker searched for its quote
+// words of literal overlap that pin a QUOTE to a chunk
+const VERBATIM_RUN  = parseInt(process.env.RETRIEVER_VERBATIM_RUN || '8', 10);
+// chars each side of a marker searched for its quote
+const CLAIM_WINDOW  = parseInt(process.env.RETRIEVER_CLAIM_WINDOW || '400', 10);
 // A paraphrase (no quote marks) is grounded when EITHER signal clears its bar:
 //   - MIN_OVERLAP: fraction of the claim's content words present literally in a
 //     chunk. Catches claims that reuse the source's vocabulary.
@@ -340,7 +343,7 @@ const CLAIM_WINDOW  = 400;   // chars each side of a marker searched for its quo
 // but the true one reuses corpus words and clears MIN_OVERLAP. A claim is
 // flagged [!] only when it fails both. GROUNDING_SIM is deliberately high so
 // topical-but-unsupported claims still fall through.
-const MIN_OVERLAP   = 0.5;
+const MIN_OVERLAP   = parseFloat(process.env.RETRIEVER_MIN_OVERLAP || '0.5');
 const GROUNDING_SIM = parseFloat(process.env.RETRIEVER_GROUNDING_SIM || '0.6');
 
 // Space-free comparison, same trick as the PDF viewer: immune to how each side

@@ -75,6 +75,11 @@ OLLAMA_URL       = os.environ.get("OLLAMA_URL",       "http://localhost:11434")
 EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "ministral:3b")
 METADATA_MODEL   = os.environ.get("METADATA_MODEL",   "ministral:3b")
 METADATA_WORDS   = int(os.environ.get("METADATA_WORDS", "800"))
+# Last-resort abstract: first N words of body text when nothing else yielded one.
+ABSTRACT_FALLBACK_WORDS = int(os.environ.get("EXTRACT_ABSTRACT_FALLBACK_WORDS", "200"))
+# First-page region scanned for a creation date. Body text is full of in-text
+# citation years, so the scan is capped to the front matter.
+CREATED_SCAN_CHARS = int(os.environ.get("EXTRACT_CREATED_SCAN_CHARS", "3000"))
 
 # ---------------------------------------------------------------------------
 # Prompts — every LLM prompt lives in /prompts/prompts.json, one entry per
@@ -233,9 +238,15 @@ def _extract_tables(doc) -> list[dict]:
 # References — shared constants
 # ---------------------------------------------------------------------------
 
-_REF_SECTION_HEADINGS = frozenset({
-    "references", "bibliography", "works cited", "literature cited", "citations",
-})
+# Shared with heuristic.py / kg_graph.py / regex_utils.js via one env var so the
+# four copies can't drift apart.
+_REF_SECTION_HEADINGS = frozenset(
+    heading.strip().lower()
+    for heading in os.environ.get(
+        "PIPELINE_REF_HEADINGS",
+        "references,bibliography,works cited,literature cited,citations").split(",")
+    if heading.strip()
+)
 
 _CODE_FENCE = re.compile(r'^```(?:json)?\s*|\s*```$', re.MULTILINE)
 
@@ -890,15 +901,15 @@ def convert_document(doc_meta: dict) -> dict:
     # citation matching is by containment, and a snippet posing as a title
     # would fabricate edges.
     if not abstract:
-        body_snippet = " ".join(full_text.split()[:200])
+        body_snippet = " ".join(full_text.split()[:ABSTRACT_FALLBACK_WORDS])
         if body_snippet:
             abstract = body_snippet
-            print("[extract]   no abstract found — using first 200 words of body text",
-                  file=sys.stderr)
+            print(f"[extract]   no abstract found — using first "
+                  f"{ABSTRACT_FALLBACK_WORDS} words of body text", file=sys.stderr)
 
     # Created date: GROBID TEI date, else first-page scan (NOT the whole body
     # — in-text citation years would date every paper by its oldest reference).
-    created = grobid_meta.get("created") or _scan_created(full_text[:3000])
+    created = grobid_meta.get("created") or _scan_created(full_text[:CREATED_SCAN_CHARS])
 
     metadata = {"title": title, "authors": authors, "abstract": abstract,
                 "created": created}

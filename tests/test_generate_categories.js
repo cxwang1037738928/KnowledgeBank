@@ -30,7 +30,7 @@ const { generateCategories } = await import('../backend/extraction/generate_cate
 const thresholdArgIdx = process.argv.indexOf('--threshold');
 const threshold = thresholdArgIdx !== -1
   ? parseFloat(process.argv[thresholdArgIdx + 1])
-  : parseFloat(process.env.CLUSTER_SIMILARITY || '0.75');
+  : parseFloat(process.env.CATEGORIES_SIMILARITY || '0.75');
 
 const start = Date.now();
 console.log('[test_generate_categories] Clustering at threshold=' + threshold + ' ...\n');

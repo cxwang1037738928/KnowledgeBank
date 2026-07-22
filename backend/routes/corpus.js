@@ -31,7 +31,7 @@ const ROOT     = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const ENV_PATH = path.join(ROOT, '.env');
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
-const MUTUAL_K   = parseInt(process.env.CLUSTER_MUTUAL_K || '10', 10);
+const MUTUAL_K   = parseInt(process.env.CATEGORIES_MUTUAL_K || '10', 10);
 
 // Model roles the frontend may configure. Keys are the .env variable names;
 // descriptions surface in the Models tab.
@@ -154,7 +154,7 @@ collectionCorpusRouter.get('/embedding-map', wrap(async (req, res) => {
     mapCacheByCollection.set(req.collection.id, {
       generatedAt: docVectors.generatedAt,
       mutualK: MUTUAL_K,
-      defaultThreshold: parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
+      defaultThreshold: parseFloat(process.env.CATEGORIES_SIMILARITY || '0.75'),
       points: docVectors.docs.map((doc, docIdx) => ({
         docId:    doc.docId,
         filename: doc.filename,

@@ -13,7 +13,7 @@ citation graphs):
 | `heuristic_utils.py` | scoring / reference-matching primitives |
 
 The knowledge graph is no longer academic-specific: `kg_graph.py` (kg-gen)
-builds it from plain text and lives one level up in `extraction/`.
+builds it from the embed stage's chunks and lives one level up in `extraction/`.
 
 Crawler-agnostic stages (chunking, embedding, clustering, shared regexes)
 live one level up in `extraction/` and are reused by ruby and topaz.

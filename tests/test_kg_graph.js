@@ -1,13 +1,14 @@
 /**
  * test_kg_graph.js — pipeline stage 6: kg-gen knowledge graph
  *
- * Spawns kg_graph.py to build the entity/relation graph over the extracted
- * text. Outputs go to tests/test-output/.
+ * Spawns kg_graph.py to build the entity/relation graph over the embed
+ * stage's chunks (one kg-gen call per chunk). Outputs go to tests/test-output/.
  *
  * Run:  node tests/test_kg_graph.js
  *
- * Prerequisite: tests/test-output/doclings.json (produced by test_extract.js)
- * Also needs Ollama running with KG_MODEL pulled.
+ * Prerequisite: tests/test-output/embeddings.json (produced by test_embed.js);
+ * tests/test-output/heuristic_output.json (test_heuristic.js) narrows it to
+ * the top-ranked docs. Also needs Ollama running with KG_MODEL pulled.
  *
  * Outputs:
  *   tests/test-output/graph.json
@@ -47,14 +48,15 @@ const viewHtml = await fs.stat(path.join(TEST_DATA, 'kg_view.html'));
 console.log('\n[test_kg_graph] Graph summary:');
 console.log(`  ${graph.entities.length} entities, ${graph.relations.length} relations, ` +
             `${graph.edges.length} relation types`);
-console.log(`  over ${graph.sourceDocIds.length} document(s)`);
+console.log(`  over ${graph.sourceDocIds.length} document(s), ` +
+            `${graph.chunksProcessed} chunk(s), ${graph.chunksFailed} failed`);
 console.log(`  kg_view.html: ${viewHtml.size} bytes`);
 for (const [subject, predicate, object] of graph.relations.slice(0, 5)) {
   console.log(`    ${subject} —[${predicate}]→ ${object}`);
 }
 if (graph.relations.length === 0) {
   console.warn('  WARNING: zero relations — the model returned no triples. Usual causes:');
-  console.warn('           Ollama down, KG_MODEL not pulled, or KG_CHARS_PER_DOC too small.');
+  console.warn('           Ollama down, KG_MODEL not pulled, or every chunk failed validation.');
 }
 
 const elapsed   = ((Date.now() - start) / 1000).toFixed(2);

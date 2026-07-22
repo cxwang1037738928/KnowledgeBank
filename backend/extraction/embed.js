@@ -25,7 +25,8 @@ const DATA_DIR       = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 const MODEL      = process.env.SAPPHIRE_EMBEDDING_MODEL || 'Xenova/all-MiniLM-L12-v2';
 const CHUNK_SIZE    = parseInt(process.env.CHUNK_SIZE    || '180', 10);
 const CHUNK_OVERLAP = parseInt(process.env.CHUNK_OVERLAP || '30',  10);
-const BATCH_SIZE    = 32;
+// Chunks encoded per forward pass — raise for speed, lower for peak memory.
+const BATCH_SIZE    = parseInt(process.env.EMBED_BATCH_SIZE || '32', 10);
 
 // ---------------------------------------------------------------------------
 // Embedder (lazy singleton)

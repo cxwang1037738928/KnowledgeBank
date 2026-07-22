@@ -57,7 +57,7 @@ for (const filename of pdfs) {
   console.log(`=== ${filename} ===`);
 
   // 1. Ingest
-  const ingestResult = await ingestDocument(filePath, { enqueue: false });
+  const ingestResult = await ingestDocument(filePath);
 
   let docId;
   if (ingestResult.error) {

@@ -18,13 +18,14 @@ const PDFJS_ROOT = path.dirname(fileURLToPath(import.meta.resolve('pdfjs-dist/pa
 const STANDARD_FONT_DATA_URL = path.join(PDFJS_ROOT, 'standard_fonts').replace(/\\/g, '/') + '/';
 const CMAP_URL = path.join(PDFJS_ROOT, 'cmaps').replace(/\\/g, '/') + '/';
 
-const DEFAULT_DPI = parseInt(process.env.RASTER_DPI || '300', 10);
+const DEFAULT_DPI = parseInt(process.env.ENHANCE_RASTER_DPI || '300', 10);
 const ENHANCED_DIR = path.resolve(process.env.ENHANCED_DIR || './data/enhanced');
 
 // Chars per square point (page area in PDF points) above which a page is
 // considered to have a real digital text layer rather than sparse/no text.
 // Empirical cutoff — tune against your corpus rather than trusting blindly.
-const TEXT_DENSITY_THRESHOLD = 0.0008;
+const TEXT_DENSITY_THRESHOLD = parseFloat(
+  process.env.ENHANCE_TEXT_DENSITY_THRESHOLD || '0.0008');
 
 export const PAGE_TYPE = {
   DIGITAL: 'digital',

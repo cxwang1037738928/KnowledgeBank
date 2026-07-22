@@ -12,17 +12,24 @@
  * / sapphire/heuristic_utils.py) — Python cannot import from this file, so the
  * two copies must be kept in sync by hand:
  *   normHeading   ↔ extract.py / heuristic.py / kg_graph.py _norm_heading
- *   REF_HEADINGS  ↔ extract.py _REF_SECTION_HEADINGS / heuristic.py / kg_graph.py _REF_HEADINGS
  *   tokenise      ↔ heuristic_utils.py tokenise (same stopword list)
+ * REF_HEADINGS is the exception: it now comes from PIPELINE_REF_HEADINGS, which
+ * the Python side reads too, so that list has a single definition.
  */
+
+import 'dotenv/config';
 
 // ---------------------------------------------------------------------------
 // Section headings
 // ---------------------------------------------------------------------------
 
-export const REF_HEADINGS = new Set([
-  'references', 'bibliography', 'works cited', 'literature cited', 'citations',
-]);
+export const REF_HEADINGS = new Set(
+  (process.env.PIPELINE_REF_HEADINGS
+    || 'references,bibliography,works cited,literature cited,citations')
+    .split(',')
+    .map((heading) => heading.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 /**
  * Normalize a section heading for matching: lowercase, strip leading

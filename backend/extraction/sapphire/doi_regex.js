@@ -43,7 +43,7 @@ const DATA_DIR      = path.resolve(ROOT, process.env.DATA_DIR || 'data');
 // How much of the document head to search. The paper's own DOI appears on
 // the first page (header, footer, or copyright block); anything deeper is
 // increasingly likely to be a cited work's DOI.
-const HEAD_CHARS = 5000;
+const HEAD_CHARS = parseInt(process.env.DOI_HEAD_CHARS || '5000', 10);
 
 /**
  * Annotate every doclings.json entry with metadata.doi (null when no DOI is

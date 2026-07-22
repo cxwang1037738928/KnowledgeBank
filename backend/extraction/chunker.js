@@ -22,13 +22,17 @@
  * of every chunk is silently thrown away at embed time.
  */
 
+import 'dotenv/config';
+
 const DEFAULTS = {
   chunkSize: process.env.CHUNK_SIZE ? parseInt(process.env.CHUNK_SIZE) : 180,
   // 30 matches embed.js's fallback — the two defaults silently disagreed
   // (20 vs 30), masked only because .env sets CHUNK_OVERLAP explicitly.
   overlap:   process.env.CHUNK_OVERLAP ? parseInt(process.env.CHUNK_OVERLAP) : 30,
-  minSectionMerge: 60,
-  maxTableWords: 300
+  // Sections shorter than this (words) are merged into their neighbour.
+  minSectionMerge: parseInt(process.env.CHUNKER_MIN_SECTION_MERGE || '60', 10),
+  // A table chunk is truncated past this many words.
+  maxTableWords:   parseInt(process.env.CHUNKER_MAX_TABLE_WORDS  || '300', 10),
 };
 
 // ---------------------------------------------------------------------------

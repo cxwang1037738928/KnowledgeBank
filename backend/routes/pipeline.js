@@ -14,8 +14,8 @@
  *   4. categorize — clusters → Collection.categories/.docVectors + Chunk.category
  *   5. heuristic  — BM25 + PageRank top-k: printed to the server console
  *                   only (not persisted)
- *   6. graph      — kg-gen entity/relation graph over the extracted text →
- *                   Collection.knowledgeGraph + .knowledgeGraphHtml
+ *   6. graph      — kg-gen entity/relation graph over the embed stage's
+ *                   chunks → Collection.knowledgeGraph + .knowledgeGraphHtml
  */
 
 import 'dotenv/config';
@@ -154,7 +154,7 @@ export const STAGES = {
     };
   },
 
-  async heuristic(collection, { k = 2 } = {}) {
+  async heuristic(collection, { k = parseInt(process.env.HEURISTIC_K || '2', 10) } = {}) {
     await exportDoclings(collection);
     await exportCategories(collection);
     await spawnAsync(PYTHON, [HEURISTIC_PY, '--k', String(k)], collection.id);
@@ -165,16 +165,20 @@ export const STAGES = {
   },
 
   async graph(collection) {
-    await exportDoclings(collection);
+    // kg_graph.py consumes the embed stage's chunks (one kg-gen call per
+    // chunk), so the graph depends on embed: extract → embed → … → graph.
+    await exportEmbeddings(collection);
     await spawnAsync(PYTHON, [KG_GRAPH_PY], collection.id);
     await ingestGraph(collection);
     const graph = await readScratchJson(collection.id, 'graph.json');
     return {
-      model:     graph.model,
-      entities:  graph.entities.length,
-      edges:     graph.edges.length,
-      relations: graph.relations.length,
-      docs:      graph.sourceDocIds.length,
+      model:        graph.model,
+      entities:     graph.entities.length,
+      edges:        graph.edges.length,
+      relations:    graph.relations.length,
+      docs:         graph.sourceDocIds.length,
+      chunks:       graph.chunksProcessed,
+      chunksFailed: graph.chunksFailed,
     };
   },
 };
@@ -233,7 +237,7 @@ pipelineRouter.post('/categorize', wrap(async (req, res) => {
 
 // POST /heuristic { k? }
 pipelineRouter.post('/heuristic', wrap(async (req, res) => {
-  const k = parseInt(req.body?.k ?? '2', 10);
+  const k = parseInt(req.body?.k ?? process.env.HEURISTIC_K ?? '2', 10);
   if (!Number.isInteger(k) || k < 1) throw httpError(400, '"k" must be a positive integer');
   res.json(await STAGES.heuristic(req.collection, { k }));
 }));
@@ -247,8 +251,8 @@ pipelineRouter.post('/build-graph', wrap(async (req, res) => {
 // stops the run and the response shows how far it got.
 pipelineRouter.post('/run', wrap(async (req, res) => {
   const {
-    threshold = parseFloat(process.env.CLUSTER_SIMILARITY || '0.75'),
-    k         = 2,
+    threshold = parseFloat(process.env.CATEGORIES_SIMILARITY || '0.75'),
+    k         = parseInt(process.env.HEURISTIC_K || '2', 10),
     force     = false,
   } = req.body ?? {};
 
