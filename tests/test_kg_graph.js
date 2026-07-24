@@ -73,7 +73,8 @@ console.log('\n[test_kg_graph] Graph summary:');
 console.log(`  ${graph.entities.length} entities, ${graph.relations.length} relations, ` +
             `${graph.edges.length} relation types`);
 console.log(`  over ${graph.sourceDocIds.length} document(s), ` +
-            `${graph.chunksProcessed} chunk(s), ${graph.chunksFailed} failed`);
+            `${graph.chunksProcessed} chunk(s) in ${graph.calls} call(s), ` +
+            `${graph.callsFailed} call(s) failed`);
 console.log(`  kg_view.html: ${viewHtml.size} bytes`);
 // Sample triples: relations are sorted in graph.json, so these five are always
 // the same ones for a given graph — an eyeball check that entities read like
@@ -84,9 +85,10 @@ for (const [subject, predicate, object] of graph.relations.slice(0, 5)) {
   console.log(`    ${subject} —[${predicate}]→ ${object}`);
 }
 // Warn rather than throw: an empty graph is a real result the run should still
-// report (and chunksFailed above tells you which of these it was), not a crash
-// after a run this long. Non-zero chunksFailed with non-zero relations is
-// normal — kg_graph.py skips chunks the model never returns valid triples for.
+// report (and callsFailed above tells you which of these it was), not a crash
+// after a run this long. Non-zero callsFailed with non-zero relations is
+// normal — kg_graph.py skips calls the model never returns valid triples for,
+// though each one now costs every chunk that was packed into it.
 if (graph.relations.length === 0) {
   console.warn('  WARNING: zero relations — the model returned no triples. Usual causes:');
   console.warn('           Ollama down, KG_MODEL not pulled, or every chunk failed validation.');

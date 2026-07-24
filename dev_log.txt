@@ -1,0 +1,141 @@
+================================================================================
+OpenCrawl — development log
+================================================================================
+
+--------------------------------------------------------------------------------
+2026-07-23 — Knowledge-graph stage: test run on 4 documents (kg-gen / Ollama)
+--------------------------------------------------------------------------------
+Context: validation run of the reworked kg_graph.py (6 KB packing budget,
+split-on-failure, per-call incremental flush, title-entity filter). Ran the
+stage standalone against a curated scratch corpus, model = ministral-3:3b
+(local Ollama), num_ctx = 8192, KG_CALL_MAX_CHARS = 6000.
+
+Documents (147 body chunks total, bibliography chunks excluded):
+    Organophosphorus chemistry: from model to application    6 chunks ->  2 calls
+    Fast unfolding of communities in large networks         47 chunks ->  8 calls
+    Finding community structure in very large networks      ~48 chunks ->  8 calls
+    Attention Is All You Need                               45 chunks ->  7 calls
+
+TIME SPENT
+    Total wall clock ................ 153.9 min  (2.56 h)
+    Avg per kg-gen call ............. ~6.2 min
+    (CPU-bound: ~5 of 27 model layers on the 4 GB GPU at num_ctx=8192;
+     decode ~8 tok/s dominates. Prefill ~35% of time, decode ~65%.)
+
+PROMPTS SENT (LLM requests to Ollama)
+    kg-gen calls (packed batches) ... 25
+    Model requests .................. ~62
+        = 25 calls x 2 stages (entities, then relations)  = 50 base
+        + split-on-failure retries and kg-gen's internal relation fallback
+    Failed calls (after retries) .... 0 / 25
+
+TOKEN COST (measured from Ollama server.log, run window)
+    Prompt (input) tokens ........... 113,224
+    Output (generated) tokens ....... 55,499
+    TOTAL ........................... 168,723
+    Avg per model request ........... 1,826 prompt + 895 output
+    Avg per kg-gen call (2 requests). ~5,500 tokens
+    Rule of thumb ................... ~1 token per source character
+                                       (source text is sent ~2x: once for the
+                                        entity pass, again for the relation pass)
+
+GRAPH PRODUCED
+    Entities ........................ 765
+    Relations ....................... 575
+    graph.json ...................... 139 KB
+    kg_view.html .................... 1.1 MB (interactive; needs internet for d3 CDN)
+    Quality: 96% entities grounded in source; 0 title leaks; ~0 genuine
+    cross-document edges; minor noise (case-variant duplicate entities,
+    a few citation strings as entities, 1 self-loop).
+
+NOTE: these are LOCAL tokens (compute/time on Ollama), not a paid-API bill.
+The binding constraint is decode throughput on CPU, not token count.
+================================================================================
+
+--------------------------------------------------------------------------------
+2026-07-23 — Alternative approach: per-cluster schema + GLiNER/GLiREL extraction
+--------------------------------------------------------------------------------
+Context: test of the proposed pipeline — generate a tailored extraction schema
+per category cluster (TF-IDF keywords + medoid-document chunks -> LLM), then do
+schema-driven entity extraction with GLiNER and relation extraction with GLiREL.
+Same 4 documents / 147 chunks as the kg-gen run above, for a direct comparison.
+Both graphs stored in Postgres as demo-user (demo@gmail.com) collections:
+    collection 15 = "KG Test — kg-gen (open-ended LLM)"
+    collection 16 = "KG Test — schema-driven (GLiNER+GLiREL)"
+
+TIME SPENT (schema-driven pipeline)
+    Schema generation (3 clusters, Ollama) . 58 s   (naive first pass: 86 s)
+    Model load (GLiNER + GLiREL, one-time) . 25 s
+    Extraction (147 chunks) ................ 182 s
+    ------------------------------------------------
+    Total ................................. ~265 s   (4.4 min)
+  vs kg-gen above ......................... 9,234 s  (153.9 min)  -> ~35x faster
+  (extraction alone, load excluded: 207 s vs 9,234 s -> ~45x)
+
+GRAPH COMPARISON (identical 4-doc input)
+                              kg-gen (LLM)     schema-driven (GLiNER+GLiREL)
+    entities .............   765              275
+    relations ............   575              86
+    distinct rel. types ..   441              4   (!)
+    entity grounding .....   96%              100%
+    self-loops ...........   1                2
+    wall clock ...........   153.9 min        4.4 min
+    entities shared (ci) .   65 of 275 overlap between the two graphs
+
+FINDINGS
+  1. Speed: ~35-45x faster. Encoder models, no autoregressive decode — the CPU
+     bottleneck that dominated the kg-gen run is gone. This is the headline win.
+  2. Entities (GLiNER): clean. 100% grounded (spans are literal substrings),
+     tailored types honoured (language-model, catalyst, algorithm, ...), and
+     case-insensitive dedup removed the variant fragmentation kg-gen showed.
+  3. Relations (GLiREL): the weak link.
+       - Schema NOT honoured: 3 clusters defined ~17 relation types each, but
+         only 4 generic ones ever fired (based on / evaluated on / outperforms
+         / part of). Fine-grained/argumentation relations did not take.
+       - Precision mixed: correct edges ("4-layer transformer -evaluated on->
+         Penn Treebank") sit next to nonsense ("BerkeleyParser -outperforms->
+         beam size"), because GLiREL relates any entity pair in range.
+       - Recall much lower: 86 vs 575 relations.
+       - Out-of-domain collapse: chemistry cluster produced 5 entities, 0
+         relations — GLiREL generalises poorly to that domain.
+  4. Schema generation caveat: naive LLM prompting proposed INSTANCE-level
+     labels as "types" (e.g. entity type '1,2,3-tris(chlorophenyl)cyclopropen-
+     ylium bromide'; relation 'derived_from_classical_hirao_reaction'). Prompt
+     steering toward general categories fixed it. Schema quality needs tuning,
+     as expected — that IS the crux of this approach.
+
+READ: the entity half of the approach is a clear win (fast, grounded, tailored).
+The relation half with GLiREL is not yet adequate for a relation-centric /
+argumentation graph: it ignores the tailored relation schema, mixes in spurious
+edges, and fails on off-distribution domains. Next lever would be a stronger /
+fine-tuned relation extractor, or constraining relations to grounded entity
+pairs before classification.
+
+CORRECTION (after actually reading the graphs — the above under-sold the problem):
+  "Entity half is a clear win / 100% grounded" was MISLEADING. 100% grounding
+  only meant the span appears in the source; it does NOT mean a useful node.
+  The metric that matters is CONNECTIVITY, which was not measured above:
+
+                              kg-gen        schema-driven
+    entities in >=1 relation  52%           15%
+    ISOLATED nodes            48%           85%   (233 of 275!)
+    junk-fragment labels      3%            7%
+
+  The schema-driven graph is mostly a scatter of disconnected nodes, and the
+  isolated ones are nonsense fragments: '118 million nodes', '128 nodes',
+  '6 communities', 'Q = 0 . 745', 'Table 1', and 3 near-duplicate isolated
+  nodes for one dataset ('WMT 2014 English-to-German translation task' /
+  '... English-German dataset' / '... Englishto-German ...').
+
+  ROOT CAUSE: GLiNER and GLiREL are an uncoordinated pair with mismatched
+  recall. GLiNER greedily tags every span matching a type (the tailored schema
+  made this worse — a 'network'/'metric' type invites tagging quantities like
+  '118 million nodes'), while GLiREL relates almost none of them, orphaning 85%.
+  kg-gen extracts relations OVER its own entities in one pass, so its nodes are
+  chosen with edges in mind -> far more connected and coherent.
+
+  REVISED VERDICT: speed still favours schema-driven (35-45x). GRAPH QUALITY
+  favours kg-gen (more connected, less nonsense). To make the schema-driven
+  graph usable: post-filter isolated nodes + quantity/table-ref spans before
+  saving, and/or replace GLiREL with a higher-recall relation extractor.
+================================================================================
